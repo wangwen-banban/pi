@@ -1,0 +1,59 @@
+{
+  "maxConcurrent": 4,
+  "maxRecentJobs": 8,
+  "router": {
+    "enabled": true,
+    "model": "openai-codex/gpt-5.4-mini",
+    "effort": "low",
+    "maxConversationChars": 24000,
+    "maxSummaryChars": 6000
+  },
+  "context": {
+    "maxFullChars": 40000,
+    "maxSelectedChars": 12000
+  },
+  "routes": {
+    "simple": {
+      "models": [
+        "openai-codex/gpt-5.4-mini",
+        "openai-codex/gpt-5.3-codex-spark",
+        "$current"
+      ],
+      "effort": "low",
+      "context": "isolated"
+    },
+    "medium": {
+      "models": [
+        "openai-codex/gpt-5.4-mini",
+        "openai-codex/gpt-5.4",
+        "$current"
+      ],
+      "effort": "medium",
+      "context": "selected"
+    },
+    "complex": {
+      "models": [
+        "openai-codex/gpt-5.6-sol",
+        "openai-codex/gpt-5.5",
+        "$current"
+      ],
+      "effort": "max",
+      "context": "summary"
+    },
+    "critical": {
+      "models": [
+        "openai-codex/gpt-5.6-sol",
+        "$current"
+      ],
+      "effort": "max",
+      "context": "summary"
+    }
+  },
+  "hooks": {
+    "started": [],
+    "progress": [],
+    "completed": [],
+    "failed": [],
+    "stopped": []
+  }
+}

@@ -1,0 +1,12 @@
+# Sessions and runtime data (too large, no migration value)
+sessions/
+subagent-runs/
+
+# Cache (auto-rebuilt)
+cache/
+
+# Backup files
+*.bak-*
+
+# OS files
+.DS_Store
