@@ -54,37 +54,114 @@ function compat(): Promise<any> {
   return compatPromise;
 }
 
+/** Errors that should trigger a retry (typically happen before content starts streaming) */
+const RETRYABLE_PATTERNS = [
+  "Model access is denied",
+  "aws-marketplace",
+  "IAM user or service role is not authorized",
+  "ViewSubscriptions",
+  "rate limit",
+  "overloaded",
+  "529",
+  "503",
+];
+
+/** Errors where the stream delivered content but closed improperly — just heal the stop */
+const HEALABLE_PATTERNS = [
+  "stream ended without a stop reason",
+  "stream ended before message_stop",
+];
+
+function matchesAny(msg: string | undefined, patterns: string[]): boolean {
+  if (!msg) return false;
+  return patterns.some((p) => msg.includes(p));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function retryDelay(attempt: number): number {
+  // Exponential backoff: 2s, 4s, 8s, 16s, 32s (with jitter)
+  const base = Math.min(2_000 * 2 ** attempt, 32_000);
+  return base * (0.75 + Math.random() * 0.5);
+}
+
 /**
- * Wraps an AssistantMessageEventStream to heal the "Anthropic stream ended
- * without a stop reason" error from alibaba idealab proxy. When such an
- * error event is received, we patch the output and forward it as a
- * successful "done" event instead.
+ * Wraps alibaba relay stream calls with:
+ * 1. Retry logic (up to maxRetries) for transient errors (IAM, rate-limit, etc.)
+ * 2. Stream healing for "ended without stop reason" errors
+ *
+ * Returns a wrapper stream immediately; retries happen transparently inside.
  */
-function healStreamErrors(
-  innerStream: AssistantMessageEventStream,
+function streamWithRetry(
+  makeStream: () => Promise<AssistantMessageEventStream>,
   createStream: () => AssistantMessageEventStream,
+  maxRetries: number = 5,
 ): AssistantMessageEventStream {
   const wrapper = createStream();
   (async () => {
-    try {
-      for await (const event of innerStream) {
-        if (
-          event.type === "error" &&
-          (event.error?.errorMessage?.includes("stream ended without a stop reason") ||
-           event.error?.errorMessage?.includes("stream ended before message_stop"))
-        ) {
-          // Heal: convert error to successful completion
-          const output = event.error;
-          output.stopReason = "end_turn";
-          delete output.errorMessage;
-          wrapper.push({ type: "done", reason: "end_turn", message: output });
-        } else {
+    let lastError: any;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      let contentStarted = false;
+      try {
+        const inner = await makeStream();
+        for await (const event of inner) {
+          const errMsg = event.error?.errorMessage ?? event.error?.message ?? "";
+
+          // --- Retryable error (typically before content) ---
+          if (event.type === "error" && !contentStarted && matchesAny(errMsg, RETRYABLE_PATTERNS)) {
+            lastError = event;
+            const delay = retryDelay(attempt);
+            // console.error(`[alibaba-relay] Retryable error (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${Math.round(delay)}ms: ${errMsg}`);
+            await sleep(delay);
+            break; // break inner loop → retry
+          }
+
+          // --- Healable stream error (content was delivered, just fix stop) ---
+          if (event.type === "error" && matchesAny(errMsg, HEALABLE_PATTERNS)) {
+            const output = event.error;
+            output.stopReason = "end_turn";
+            delete output.errorMessage;
+            wrapper.push({ type: "done", reason: "end_turn", message: output });
+            return;
+          }
+
+          // --- Non-retryable error ---
+          if (event.type === "error") {
+            wrapper.push(event);
+            return;
+          }
+
+          // --- Normal event: forward and track content ---
+          if (event.type !== "done") {
+            contentStarted = true;
+          }
           wrapper.push(event);
+
+          // Success
+          if (event.type === "done") return;
         }
+
+        // If we exhausted the inner stream without done/error (shouldn't happen normally)
+        // This means we broke out for retry — continue the for loop
+      } catch (err: any) {
+        // makeStream() itself threw (e.g. network error)
+        const errMsg = err?.message ?? String(err);
+        if (attempt < maxRetries && matchesAny(errMsg, RETRYABLE_PATTERNS)) {
+          lastError = err;
+          await sleep(retryDelay(attempt));
+          continue;
+        }
+        wrapper.push({ type: "error", reason: "error", error: err });
+        return;
       }
-    } catch (err) {
-      // If iteration itself throws, forward as error
-      wrapper.push({ type: "error", reason: "error", error: err });
+    }
+    // All retries exhausted
+    if (lastError) {
+      wrapper.push(lastError);
+    } else {
+      wrapper.push({ type: "error", reason: "error", error: { errorMessage: `Retry exhausted after ${maxRetries + 1} attempts` } });
     }
   })();
   return wrapper;
@@ -202,8 +279,11 @@ export default function providerRouting(pi: ExtensionAPI) {
       const { createAssistantMessageEventStream } = await import(
         `${PI_ROOT}/node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js`
       );
-      const innerStream = await provider.streamSimple(model, filteredContext, { ...options, env, fetch: directFetch });
-      return healStreamErrors(innerStream, createAssistantMessageEventStream);
+      return streamWithRetry(
+        () => provider.streamSimple(model, filteredContext, { ...options, env, fetch: directFetch }),
+        createAssistantMessageEventStream,
+        5, // max 5 retries
+      );
     },
   });
 
