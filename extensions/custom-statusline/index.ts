@@ -27,15 +27,41 @@ function readProxyMode(provider: string): string {
 	}
 }
 
-function readCodexRemaining(): number | null {
+interface CodexQuota {
+	remaining: number | null;
+	/** Unix timestamp in seconds. */
+	resetsAt?: number;
+}
+
+function readCodexQuota(): CodexQuota {
 	try {
-		const data = JSON.parse(readFileSync(CODEX_WEEKLY_CACHE, "utf8")) as { remainingPercent?: unknown };
-		return typeof data.remainingPercent === "number" && Number.isFinite(data.remainingPercent)
-			? Math.max(0, Math.min(100, data.remainingPercent))
-			: null;
+		const data = JSON.parse(readFileSync(CODEX_WEEKLY_CACHE, "utf8")) as {
+			remainingPercent?: unknown;
+			resetsAt?: unknown;
+		};
+		return {
+			remaining: typeof data.remainingPercent === "number" && Number.isFinite(data.remainingPercent)
+				? Math.max(0, Math.min(100, data.remainingPercent))
+				: null,
+			resetsAt: typeof data.resetsAt === "number" && Number.isFinite(data.resetsAt)
+				? data.resetsAt
+				: undefined,
+		};
 	} catch {
-		return null;
+		return { remaining: null };
 	}
+}
+
+function formatResetCountdown(resetsAt: number | undefined, nowMs = Date.now()): string | null {
+	if (!resetsAt) return null;
+	const seconds = Math.max(0, Math.floor(resetsAt - nowMs / 1000));
+	if (seconds === 0) return "now";
+	const days = Math.floor(seconds / 86_400);
+	const hours = Math.floor((seconds % 86_400) / 3_600);
+	const minutes = Math.floor((seconds % 3_600) / 60);
+	if (days > 0) return `${days}d ${hours}h`;
+	if (hours > 0) return `${hours}h ${minutes}m`;
+	return `${Math.max(1, minutes)}m`;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -89,7 +115,9 @@ export default function (pi: ExtensionAPI) {
 					const contextRemainingTokens = contextUsage?.tokens == null || contextTotal == null
 						? null
 						: Math.max(0, contextTotal - contextUsage.tokens);
-					const codexRemaining = readCodexRemaining();
+					const codexQuota = readCodexQuota();
+					const codexRemaining = codexQuota.remaining;
+					const codexReset = formatResetCountdown(codexQuota.resetsAt);
 					const barWidth = Math.min(10, Math.max(4, Math.floor(width * 0.055)));
 					const capacity = (label: string, remaining: number | null) => {
 						const valueColor = remaining == null
@@ -104,7 +132,8 @@ export default function (pi: ExtensionAPI) {
 						const value = remaining == null ? "N/A" : `${Math.round(remaining)}%`;
 						return `${theme.fg("muted", label)} ${theme.fg(valueColor, value)} ${cells}`;
 					};
-					const quotaBar = capacity("CODEX WEEK", codexRemaining);
+					const quotaBar = capacity("CODEX WEEK", codexRemaining) +
+						(codexReset ? ` ${theme.fg("dim", `RESET ${codexReset}`)}` : "");
 					const contextBar = capacity("CTX", contextRemaining);
 					const contextAmounts = contextTotal == null
 						? theme.fg("dim", "N/A")
