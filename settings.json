@@ -3,9 +3,15 @@
   "theme": "dark",
   "defaultProvider": "claude-relay-alibaba",
   "defaultModel": "claude-opus-5",
-  "defaultThinkingLevel": "high",
+  "defaultThinkingLevel": "xhigh",
   "skills": [
     "~/.code-helper/skills"
   ],
-  "hideThinkingBlock": false
+  "hideThinkingBlock": false,
+  "planMode": {
+    "allowReadOnlyBash": true,
+    "judge": "on",
+    "judgeModel": "",
+    "extraReadOnlyCommands": []
+  }
 }
