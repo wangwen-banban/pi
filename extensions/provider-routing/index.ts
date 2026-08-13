@@ -146,23 +146,37 @@ function streamWithRetry(
         // If we exhausted the inner stream without done/error (shouldn't happen normally)
         // This means we broke out for retry — continue the for loop
       } catch (err: any) {
-        // makeStream() itself threw (e.g. network error)
+        // makeStream() itself threw (e.g. HTTP 400, network error)
         const errMsg = err?.message ?? String(err);
         if (attempt < maxRetries && matchesAny(errMsg, RETRYABLE_PATTERNS)) {
           lastError = err;
           await sleep(retryDelay(attempt));
           continue;
         }
-        wrapper.push({ type: "error", reason: "error", error: err });
+        // Wrap raw Error into a format pi-ai's stream consumer can display.
+        const errorOutput = {
+          stopReason: "error",
+          errorMessage: errMsg,
+          httpStatus: err?.status,
+          content: [],
+        };
+        wrapper.push({ type: "error", reason: "error", error: errorOutput });
         return;
       }
     }
-    // All retries exhausted
-    if (lastError) {
-      wrapper.push(lastError);
-    } else {
-      wrapper.push({ type: "error", reason: "error", error: { errorMessage: `Retry exhausted after ${maxRetries + 1} attempts` } });
-    }
+    // All retries exhausted — surface the last error to the user.
+    const exhaust = lastError?.error ?? lastError;
+    const exhaustMsg =
+      exhaust?.errorMessage ?? exhaust?.message ?? `Retry exhausted after ${maxRetries + 1} attempts`;
+    wrapper.push({
+      type: "error",
+      reason: "error",
+      error: {
+        stopReason: "error",
+        errorMessage: `[alibaba-relay] ${exhaustMsg}`,
+        content: [],
+      },
+    });
   })();
   return wrapper;
 }
