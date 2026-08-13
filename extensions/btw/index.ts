@@ -20,7 +20,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { openBtwPanel } from "./panel.ts";
-import { createBtwSession, renderParentSnapshot } from "./session.ts";
+import { createBtwSession, persistBtwSession, renderParentSnapshot } from "./session.ts";
 
 const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 
@@ -91,7 +91,15 @@ export default function btw(pi: ExtensionAPI) {
 			});
 
 			if (result.keep && settings.allowKeep) {
-				ctx.ui.notify("保存 BTW 会话尚未实现（phase 2）", "warning");
+				try {
+					const path = await persistBtwSession(handle.session, {
+						cwd: ctx.cwd,
+						name: result.keepName,
+					});
+					ctx.ui.notify(`BTW 已保存到 /resume：${path}`, "info");
+				} catch (e: any) {
+					ctx.ui.notify(`BTW 保存失败：${String(e?.message ?? e).slice(0, 160)}`, "error");
+				}
 			} else if (result.turns > 0) {
 				ctx.ui.notify(`BTW 已关闭并丢弃（${result.turns} 轮）`, "info");
 			}

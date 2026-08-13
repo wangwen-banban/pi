@@ -170,6 +170,48 @@ export async function createBtwSession(opts: CreateBtwOptions): Promise<BtwSessi
 	return { session, dispose };
 }
 
+/**
+ * Persist the visible BTW transcript as a standalone pi session.
+ *
+ * Hidden parent-snapshot/boundary entries are intentionally omitted: a kept
+ * conversation should resume as its own thread, not re-import main-thread
+ * instructions. Tool-result messages are retained so assistant tool calls stay
+ * structurally valid when resumed.
+ */
+export async function persistBtwSession(
+	session: any,
+	opts: { cwd: string; name?: string },
+): Promise<string> {
+	const pi = await importPi();
+	const { SessionManager } = pi;
+	if (!SessionManager?.create) throw new Error("SessionManager.create is unavailable");
+
+	const saved = SessionManager.create(opts.cwd);
+	const model = session?.model;
+	if (model?.provider && model?.id) {
+		saved.appendModelChange(model.provider, model.id);
+	}
+	if (session?.thinkingLevel) {
+		saved.appendThinkingLevelChange(session.thinkingLevel);
+	}
+
+	let count = 0;
+	for (const message of session?.messages ?? []) {
+		if (!message || !["user", "assistant", "toolResult"].includes(message.role)) continue;
+		// Never persist provider failures as valid assistant turns.
+		if (message.role === "assistant" && message.stopReason === "error") continue;
+		saved.appendMessage(structuredClone(message));
+		count++;
+	}
+	if (count === 0) throw new Error("BTW transcript is empty");
+
+	const fallbackName = `BTW ${new Date().toLocaleString("zh-CN", { hour12: false })}`;
+	saved.appendSessionInfo(opts.name?.trim() || fallbackName);
+	const path = saved.getSessionFile();
+	if (!path) throw new Error("failed to create persisted session file");
+	return path;
+}
+
 /** Extract concatenated assistant text from the latest message. */
 export function latestAssistantText(session: any): string {
 	const msgs = session?.messages ?? [];

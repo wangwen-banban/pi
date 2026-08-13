@@ -17,6 +17,8 @@ import {
 export interface BtwPanelResult {
 	/** True if the user asked to keep (persist) the conversation. */
 	keep: boolean;
+	/** Optional session name supplied via `/keep <name>`. */
+	keepName?: string;
 	/** Number of user turns taken. */
 	turns: number;
 }
@@ -86,6 +88,7 @@ export async function openBtwPanel(opts: OpenPanelOptions): Promise<BtwPanelResu
 			let scrollBack = 0; // lines scrolled up from the bottom
 			let turns = 0;
 			let keep = false;
+			let keepName: string | undefined;
 			let closing = false;
 
 			const editorTheme: EditorTheme = {
@@ -147,7 +150,7 @@ export async function openBtwPanel(opts: OpenPanelOptions): Promise<BtwPanelResu
 				} catch {
 					/* ignore */
 				}
-				done({ keep, turns });
+				done({ keep, keepName, turns });
 			}
 
 			async function send(text: string) {
@@ -172,9 +175,10 @@ export async function openBtwPanel(opts: OpenPanelOptions): Promise<BtwPanelResu
 					refresh();
 					return;
 				}
-				if (trimmed === "/keep" && allowKeep) {
+				if ((trimmed === "/keep" || trimmed.startsWith("/keep ")) && allowKeep) {
 					keep = true;
-					statusText = "will be saved on close";
+					keepName = trimmed.slice("/keep".length).trim() || undefined;
+					statusText = keepName ? `will save as: ${keepName}` : "will be saved on close";
 					refresh();
 					return;
 				}
