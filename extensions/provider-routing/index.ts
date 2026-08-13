@@ -306,16 +306,45 @@ export default function providerRouting(pi: ExtensionAPI) {
         ...context,
         tools: context.tools?.filter((t: any) => t.name !== "web_search"),
       };
-      // Inject identity headers + skip TLS verification for internal endpoint
-      const directFetch: typeof fetch = (input, init) => {
+      // Inject identity headers + skip TLS verification for internal endpoint.
+      // Also detect alibaba's non-standard SSE error format (HTTP 200 + error JSON)
+      // and convert it to a proper thrown error so it surfaces to the user.
+      const directFetch: typeof fetch = async (input, init) => {
         const headers = new Headers((init as any)?.headers);
         headers.set("x-claude-code-session-id", alibabaSessionId);
         headers.set("user-agent", "claude-code/1.0");
-        return undiciFetch(input as any, {
+        const resp = await (undiciFetch as Function)(input, {
           ...(init as any),
           headers,
           dispatcher: directDispatcher,
-        } as any) as any;
+        });
+        // Alibaba sometimes returns HTTP 200 with SSE body containing only:
+        //   data: {"error":{"message":"...","type":"..."},"type":"error"}
+        //   data: [DONE]
+        // The Anthropic SDK can't parse this → it becomes "stream ended without
+        // a stop reason" → user sees nothing. Detect and throw immediately.
+        if (resp.body) {
+          const [readable1, readable2] = resp.body.tee();
+          const reader = readable1.getReader();
+          const { value: firstChunk } = await reader.read();
+          reader.releaseLock();
+          if (firstChunk) {
+            const peek = new TextDecoder().decode(firstChunk).slice(0, 512);
+            const errMatch = peek.match(/data:\s*\{"error":\{"message":"([^"]+)"/);
+            if (errMatch) {
+              readable1.cancel?.();
+              readable2.cancel?.();
+              throw new Error(`[alibaba] ${errMatch[1]}`);
+            }
+          }
+          // Return a new Response with the un-consumed stream.
+          return new Response(readable2, {
+            status: resp.status,
+            statusText: resp.statusText,
+            headers: resp.headers,
+          }) as any;
+        }
+        return resp as any;
       };
       const { createAssistantMessageEventStream } = await import(
         `${PI_ROOT}/node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js`
