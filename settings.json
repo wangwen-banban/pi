@@ -3,5 +3,9 @@
   "theme": "dark",
   "defaultProvider": "claude-relay",
   "defaultModel": "claude-opus-4-6[1m]",
-  "defaultThinkingLevel": "high"
+  "defaultThinkingLevel": "high",
+  "skills": [
+    "~/.code-helper/skills"
+  ],
+  "hideThinkingBlock": false
 }

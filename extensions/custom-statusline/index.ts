@@ -92,17 +92,17 @@ export default function (pi: ExtensionAPI) {
 					const codexRemaining = readCodexRemaining();
 					const barWidth = Math.min(10, Math.max(4, Math.floor(width * 0.055)));
 					const capacity = (label: string, remaining: number | null) => {
-						const color = remaining == null
+						const valueColor = remaining == null
 							? "dim"
 							: remaining <= 10
 								? "error"
 								: remaining <= 25
 									? "warning"
-									: "success";
+									: "accent";
 						const filled = remaining == null ? 0 : Math.round((remaining / 100) * barWidth);
-						const cells = theme.fg(color, "█".repeat(filled)) + theme.fg("dim", "░".repeat(barWidth - filled));
+						const cells = theme.fg(valueColor, "━".repeat(filled)) + theme.fg("dim", "─".repeat(barWidth - filled));
 						const value = remaining == null ? "N/A" : `${Math.round(remaining)}%`;
-						return `${theme.fg(color, `${label} ${value}`)} ${cells}`;
+						return `${theme.fg("muted", label)} ${theme.fg(valueColor, value)} ${cells}`;
 					};
 					const quotaBar = capacity("CODEX WEEK", codexRemaining);
 					const contextBar = capacity("CTX", contextRemaining);
@@ -143,16 +143,9 @@ export default function (pi: ExtensionAPI) {
 
 		// Set animated working indicator
 		ctx.ui.setWorkingIndicator({
-			frames: [
-				ctx.ui.theme.fg("dim", "⠋"),
-				ctx.ui.theme.fg("dim", "⠙"),
-				ctx.ui.theme.fg("dim", "⠹"),
-				ctx.ui.theme.fg("accent", "⠸"),
-				ctx.ui.theme.fg("accent", "⠼"),
-				ctx.ui.theme.fg("accent", "⠴"),
-				ctx.ui.theme.fg("dim", "⠦"),
-				ctx.ui.theme.fg("dim", "⠧"),
-			],
+			frames: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"].map((frame) =>
+				ctx.ui.theme.fg("dim", frame),
+			),
 			intervalMs: 80,
 		});
 	});
@@ -162,7 +155,23 @@ export default function (pi: ExtensionAPI) {
 		streaming = true;
 	});
 
-	pi.on("turn_end", async () => {
-		streaming = false;
+	pi.on("message_update", async (event, ctx) => {
+		const type = event.assistantMessageEvent.type;
+		if (type === "thinking_start" || type === "thinking_delta") {
+			ctx.ui.setWorkingMessage("Thinking…");
+		} else if (
+			type === "text_start" ||
+			type === "text_delta" ||
+			type === "toolcall_start" ||
+			type === "toolcall_delta"
+		) {
+			ctx.ui.setWorkingMessage(undefined);
+		}
 	});
+
+	pi.on("turn_end", async (_event, ctx) => {
+		streaming = false;
+		ctx.ui.setWorkingMessage(undefined);
+	});
+
 }

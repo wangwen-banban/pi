@@ -101,6 +101,14 @@ export default function providerRouting(pi: ExtensionAPI) {
         contextWindow: alibaba.contextWindow ?? 1_000_000,
         maxTokens: alibaba.maxTokens ?? 64_000,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        thinkingLevelMap: {
+          minimal: "low",
+          low: "low",
+          medium: "medium",
+          high: "high",
+          xhigh: "xhigh",
+          max: "max",
+        },
         compat: {
           supportsPromptCaching: false,
           sendSessionAffinityHeaders: false,
@@ -116,6 +124,14 @@ export default function providerRouting(pi: ExtensionAPI) {
         contextWindow: alibaba.contextWindow ?? 1_000_000,
         maxTokens: alibaba.maxTokens ?? 64_000,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        thinkingLevelMap: {
+          minimal: "low",
+          low: "low",
+          medium: "medium",
+          high: "high",
+          xhigh: "xhigh",
+          max: "max",
+        },
         compat: {
           supportsPromptCaching: false,
           sendSessionAffinityHeaders: false,
@@ -130,6 +146,11 @@ export default function providerRouting(pi: ExtensionAPI) {
     ): Promise<AssistantMessageEventStream> => {
       const provider = (await compat()).getApiProvider("anthropic-messages");
       const env = withRouteEnv(options?.env, alibaba);
+      // Filter out web_search tool — alibaba idealab rejects it (confuses with Anthropic built-in server tool)
+      const filteredContext: Context = {
+        ...context,
+        tools: context.tools?.filter((t: any) => t.name !== "web_search"),
+      };
       // Inject identity headers + skip TLS verification for internal endpoint
       const directFetch: typeof fetch = (input, init) => {
         const headers = new Headers((init as any)?.headers);
@@ -141,7 +162,7 @@ export default function providerRouting(pi: ExtensionAPI) {
           dispatcher: directDispatcher,
         } as any) as any;
       };
-      return provider.streamSimple(model, context, { ...options, env, fetch: directFetch });
+      return provider.streamSimple(model, filteredContext, { ...options, env, fetch: directFetch });
     },
   });
 
@@ -208,6 +229,13 @@ export default function providerRouting(pi: ExtensionAPI) {
         transport: "sse",
       });
     },
+  });
+
+  // Codex defaults to xhigh whenever selected. Other providers keep their own level.
+  pi.on("model_select", async (event) => {
+    if (event.model.provider === "openai-codex" && pi.getThinkingLevel() !== "xhigh") {
+      pi.setThinkingLevel("xhigh");
+    }
   });
 
   pi.on("session_shutdown", async () => {
