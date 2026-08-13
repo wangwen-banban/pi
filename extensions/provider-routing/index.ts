@@ -120,11 +120,22 @@ function streamWithRetry(
 
           // --- Healable stream error (content was delivered, just fix stop) ---
           if (event.type === "error" && matchesAny(errMsg, HEALABLE_PATTERNS)) {
+            // Only heal if content was actually streamed; otherwise the user
+            // would see a blank response with no error.
             const output = event.error;
-            output.stopReason = "end_turn";
-            delete output.errorMessage;
-            wrapper.push({ type: "done", reason: "end_turn", message: output });
-            return;
+            const hasContent = contentStarted && (output?.content ?? []).some(
+              (c: any) => (c.type === "text" && c.text?.trim()) || c.type === "toolCall",
+            );
+            if (hasContent) {
+              output.stopReason = "end_turn";
+              delete output.errorMessage;
+              wrapper.push({ type: "done", reason: "end_turn", message: output });
+              return;
+            }
+            // No content delivered → treat as retryable (alibaba proxy flaked)
+            lastError = event;
+            await sleep(retryDelay(attempt));
+            break; // retry
           }
 
           // --- Non-retryable error ---
