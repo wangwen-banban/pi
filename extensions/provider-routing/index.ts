@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+
 const PI_ROOT = "/Users/wenwang/.nvm/versions/node/v22.22.2/lib/node_modules/@earendil-works/pi-coding-agent";
 const PI_AI_COMPAT = `${PI_ROOT}/node_modules/@earendil-works/pi-ai/dist/compat.js`;
 const ROUTING_PATH = join(homedir(), ".pi", "agent", "provider-routing.json");
@@ -51,6 +52,69 @@ let compatPromise: Promise<any> | undefined;
 function compat(): Promise<any> {
   compatPromise ??= import(PI_AI_COMPAT);
   return compatPromise;
+}
+
+/**
+ * Wraps an SSE response body stream and injects a synthetic `message_delta`
+ * with `stop_reason: "end_turn"` before `message_stop` if the upstream proxy
+ * didn't send one. This prevents the pi-ai Anthropic parser from throwing
+ * "Anthropic stream ended without a stop reason".
+ */
+function healAnthropicSSE(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let sawMessageDeltaWithStop = false;
+
+  const SYNTHETIC_DELTA =
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}\n\n';
+
+  const transform = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true });
+
+      // Process complete SSE events (separated by \n\n)
+      let boundary: number;
+      while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+        const eventText = buffer.slice(0, boundary + 2);
+        buffer = buffer.slice(boundary + 2);
+
+        // Track if we've seen message_delta with stop_reason
+        if (eventText.includes('"message_delta"') && eventText.includes('"stop_reason"')) {
+          sawMessageDeltaWithStop = true;
+        }
+
+        // Before forwarding message_stop, inject synthetic delta if missing
+        if (eventText.includes('"message_stop"') && !sawMessageDeltaWithStop) {
+          controller.enqueue(encoder.encode(SYNTHETIC_DELTA));
+          sawMessageDeltaWithStop = true;
+        }
+
+        controller.enqueue(encoder.encode(eventText));
+      }
+    },
+    flush(controller) {
+      // If there's remaining data in buffer, flush it
+      if (buffer.length > 0) {
+        // Check if we still need to inject the delta
+        if (buffer.includes('"message_stop"') && !sawMessageDeltaWithStop) {
+          controller.enqueue(encoder.encode(SYNTHETIC_DELTA));
+        }
+        controller.enqueue(encoder.encode(buffer));
+        buffer = "";
+      }
+      // If stream ended without message_stop but also without stop_reason,
+      // inject both events to prevent errors
+      if (!sawMessageDeltaWithStop) {
+        controller.enqueue(encoder.encode(SYNTHETIC_DELTA));
+        controller.enqueue(
+          encoder.encode('event: message_stop\ndata: {"type":"message_stop"}\n\n'),
+        );
+      }
+    },
+  });
+
+  return body.pipeThrough(transform);
 }
 
 export default function providerRouting(pi: ExtensionAPI) {
@@ -152,15 +216,24 @@ export default function providerRouting(pi: ExtensionAPI) {
         tools: context.tools?.filter((t: any) => t.name !== "web_search"),
       };
       // Inject identity headers + skip TLS verification for internal endpoint
-      const directFetch: typeof fetch = (input, init) => {
+      const directFetch: typeof fetch = async (input, init) => {
         const headers = new Headers((init as any)?.headers);
         headers.set("x-claude-code-session-id", alibabaSessionId);
         headers.set("user-agent", "claude-code/1.0");
-        return undiciFetch(input as any, {
+        const response = await undiciFetch(input as any, {
           ...(init as any),
           headers,
           dispatcher: directDispatcher,
-        } as any) as any;
+        } as any) as any as Response;
+        // Wrap response body to heal missing message_delta with stop_reason
+        // Alibaba idealab proxy often closes stream without sending message_delta
+        if (!response.body) return response;
+        const healed = healAnthropicSSE(response.body);
+        return new Response(healed, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
       };
       return provider.streamSimple(model, filteredContext, { ...options, env, fetch: directFetch });
     },
