@@ -103,68 +103,107 @@ function streamWithRetry(
   (async () => {
     let lastError: any;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      let contentStarted = false;
+      // Buffer events per attempt. Only flush to wrapper once we confirm
+      // the attempt has real content. This prevents "working" indicator
+      // flickering across retries and garbled event sequences.
+      const buffer: any[] = [];
+      let hasRealContent = false;
+      let flushed = false;
+
+      function flushBuffer() {
+        if (flushed) return;
+        flushed = true;
+        for (const ev of buffer) wrapper.push(ev);
+        buffer.length = 0;
+      }
+
       try {
         const inner = await makeStream();
+        let shouldRetry = false;
+
         for await (const event of inner) {
           const errMsg = event.error?.errorMessage ?? event.error?.message ?? "";
 
-          // --- Retryable error (typically before content) ---
-          if (event.type === "error" && !contentStarted && matchesAny(errMsg, RETRYABLE_PATTERNS)) {
+          // --- Retryable error (before content flushed) ---
+          if (event.type === "error" && !flushed && matchesAny(errMsg, RETRYABLE_PATTERNS)) {
             lastError = event;
-            const delay = retryDelay(attempt);
-            // console.error(`[alibaba-relay] Retryable error (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${Math.round(delay)}ms: ${errMsg}`);
-            await sleep(delay);
-            break; // break inner loop → retry
+            await sleep(retryDelay(attempt));
+            shouldRetry = true;
+            break;
           }
 
-          // --- Healable stream error (content was delivered, just fix stop) ---
+          // --- Healable stream error ---
           if (event.type === "error" && matchesAny(errMsg, HEALABLE_PATTERNS)) {
-            // Only heal if content was actually streamed; otherwise the user
-            // would see a blank response with no error.
             const output = event.error;
-            const hasContent = contentStarted && (output?.content ?? []).some(
+            const contentDelivered = hasRealContent && (output?.content ?? []).some(
               (c: any) => (c.type === "text" && c.text?.trim()) || c.type === "toolCall",
             );
-            if (hasContent) {
+            if (contentDelivered) {
+              // Content was sent → heal and finish.
+              flushBuffer();
               output.stopReason = "end_turn";
               delete output.errorMessage;
               wrapper.push({ type: "done", reason: "end_turn", message: output });
               return;
             }
-            // No content delivered → treat as retryable (alibaba proxy flaked)
+            // Empty stream → retry.
             lastError = event;
             await sleep(retryDelay(attempt));
-            break; // retry
+            shouldRetry = true;
+            break;
           }
 
-          // --- Non-retryable error ---
+          // --- Non-retryable error → surface immediately ---
           if (event.type === "error") {
+            flushBuffer();
             wrapper.push(event);
             return;
           }
 
-          // --- Normal event: forward and track content ---
-          if (event.type !== "done") {
-            contentStarted = true;
+          // --- Normal event ---
+          // Detect real content: text deltas or tool calls.
+          if (!hasRealContent && event.type !== "done") {
+            const msg = event.message ?? event;
+            const content = msg?.content ?? [];
+            if (content.some((c: any) =>
+              (c.type === "text" && c.text?.trim()) || c.type === "toolCall",
+            )) {
+              hasRealContent = true;
+            }
           }
-          wrapper.push(event);
 
-          // Success
-          if (event.type === "done") return;
+          // Once we have real content, flush everything (enables streaming UX).
+          if (hasRealContent && !flushed) {
+            flushBuffer();
+          }
+
+          if (flushed) {
+            wrapper.push(event);
+          } else {
+            buffer.push(event);
+          }
+
+          if (event.type === "done") {
+            if (!flushed) flushBuffer(); // edge: done without content (unusual but valid)
+            return;
+          }
         }
 
-        // If we exhausted the inner stream without done/error (shouldn't happen normally)
-        // This means we broke out for retry — continue the for loop
+        if (shouldRetry) continue;
+        // Stream completed without done/error and without breaking for retry.
+        // This shouldn't happen normally but treat as retryable.
+        if (!flushed) {
+          lastError = { error: { errorMessage: "Stream ended unexpectedly without events" } };
+          await sleep(retryDelay(attempt));
+          continue;
+        }
       } catch (err: any) {
-        // makeStream() itself threw (e.g. HTTP 400, network error)
         const errMsg = err?.message ?? String(err);
         if (attempt < maxRetries && matchesAny(errMsg, RETRYABLE_PATTERNS)) {
           lastError = err;
           await sleep(retryDelay(attempt));
           continue;
         }
-        // Wrap raw Error into a format pi-ai's stream consumer can display.
         const errorOutput = {
           stopReason: "error",
           errorMessage: errMsg,
@@ -175,7 +214,7 @@ function streamWithRetry(
         return;
       }
     }
-    // All retries exhausted — surface the last error to the user.
+    // All retries exhausted.
     const exhaust = lastError?.error ?? lastError;
     const exhaustMsg =
       exhaust?.errorMessage ?? exhaust?.message ?? `Retry exhausted after ${maxRetries + 1} attempts`;
