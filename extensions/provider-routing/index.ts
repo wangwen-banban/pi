@@ -321,24 +321,38 @@ export default function providerRouting(pi: ExtensionAPI) {
         // Alibaba sometimes returns HTTP 200 with SSE body containing only:
         //   data: {"error":{"message":"...","type":"..."},"type":"error"}
         //   data: [DONE]
-        // The Anthropic SDK can't parse this → it becomes "stream ended without
-        // a stop reason" → user sees nothing. Detect and throw immediately.
+        // The Anthropic SDK can't parse this → "stream ended without a stop
+        // reason" → user sees nothing. Peek the first chunk to detect this.
+        //
+        // NOTE: We intentionally avoid body.tee() which is unreliable with
+        // undici's ReadableStream on large streaming responses. Instead we
+        // read the first chunk, check it, and manually reconstruct the stream.
         if (resp.body) {
-          const [readable1, readable2] = resp.body.tee();
-          const reader = readable1.getReader();
-          const { value: firstChunk } = await reader.read();
-          reader.releaseLock();
-          if (firstChunk) {
-            const peek = new TextDecoder().decode(firstChunk).slice(0, 512);
-            const errMatch = peek.match(/data:\s*\{"error":\{"message":"([^"]+)"/);
-            if (errMatch) {
-              readable1.cancel?.();
-              readable2.cancel?.();
-              throw new Error(`[alibaba] ${errMatch[1]}`);
-            }
+          const reader = resp.body.getReader();
+          const { value: firstChunk, done } = await reader.read();
+          if (done || !firstChunk) {
+            reader.releaseLock();
+            return resp as any;
           }
-          // Return a new Response with the un-consumed stream.
-          return new Response(readable2, {
+          const peek = new TextDecoder().decode(firstChunk).slice(0, 512);
+          const errMatch = peek.match(/data:\s*\{"error":\{"message":"([^"]+)"/);
+          if (errMatch) {
+            reader.releaseLock();
+            throw new Error(`[alibaba] ${errMatch[1]}`);
+          }
+          // Reassemble: put the peeked chunk back in front of the rest.
+          const reconstructed = new ReadableStream({
+            start(controller) {
+              controller.enqueue(firstChunk);
+            },
+            async pull(controller) {
+              const { value, done: d } = await reader.read();
+              if (d) { controller.close(); return; }
+              controller.enqueue(value);
+            },
+            cancel() { reader.releaseLock(); },
+          });
+          return new Response(reconstructed, {
             status: resp.status,
             statusText: resp.statusText,
             headers: resp.headers,
