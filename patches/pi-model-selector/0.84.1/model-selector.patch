@@ -1,0 +1,274 @@
+--- a/dist/modes/interactive/components/model-selector.js
++++ b/dist/modes/interactive/components/model-selector.js
+@@ -1,5 +1,5 @@
+ import { modelsAreEqual } from "@earendil-works/pi-ai";
+-import { Container, fuzzyFilter, getKeybindings, Input, Spacer, Text, } from "@earendil-works/pi-tui";
++import { Container, fuzzyFilter, getKeybindings, Input, Key, matchesKey, Spacer, Text, } from "@earendil-works/pi-tui";
+ import { getModelSelectorSearchText } from "../model-search.js";
+ import { theme } from "../theme/theme.js";
+ import { DynamicBorder } from "./dynamic-border.js";
+@@ -23,6 +23,8 @@
+     scopedModelItems = [];
+     activeModels = [];
+     filteredModels = [];
++    visibleRows = [];
++    expandedProviders = new Set();
+     selectedIndex = 0;
+     currentModel;
+     settingsManager;
+@@ -71,10 +73,9 @@
+             this.searchInput.setValue(initialSearchInput);
+         }
+         this.searchInput.onSubmit = () => {
+-            // Enter on search input selects the first filtered item
+-            if (this.filteredModels[this.selectedIndex]) {
+-                this.handleSelect(this.filteredModels[this.selectedIndex].model);
+-            }
++            const row = this.visibleRows[this.selectedIndex];
++            if (row?.type === "provider") this.toggleProvider(row.provider);
++            else if (row?.type === "model") this.handleSelect(row.item.model);
+         };
+         this.addChild(this.searchInput);
+         this.addChild(new Spacer(1));
+@@ -110,10 +111,11 @@
+             model: scoped.model,
+         }));
+         this.activeModels = this.scope === "scoped" ? this.scopedModelItems : this.allModels;
++        if (this.currentModel) {
++            this.expandedProviders.add(this.currentModel.provider);
++        }
+         this.filteredModels = this.activeModels;
+-        const currentIndex = this.filteredModels.findIndex((item) => modelsAreEqual(this.currentModel, item.model));
+-        this.selectedIndex =
+-            currentIndex >= 0 ? currentIndex : Math.min(this.selectedIndex, Math.max(0, this.filteredModels.length - 1));
++        this.rebuildTree();
+     }
+     async refreshModels() {
+         const timeoutMs = 15_000;
+@@ -171,19 +173,58 @@
+         this.refreshAbortController.abort();
+     }
+     sortModels(models) {
+-        const sorted = [...models];
+-        // Sort: current model first, then by provider
+-        sorted.sort((a, b) => {
+-            const aIsCurrent = modelsAreEqual(this.currentModel, a.model);
+-            const bIsCurrent = modelsAreEqual(this.currentModel, b.model);
+-            if (aIsCurrent && !bIsCurrent)
+-                return -1;
+-            if (!aIsCurrent && bIsCurrent)
+-                return 1;
+-            return a.provider.localeCompare(b.provider);
+-        });
+-        return sorted;
++        return [...models].sort((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id));
+     }
++    getProviderLabel(provider) {
++        const labels = {
++            "github-copilot": "GitHub",
++            "openai-codex": "Codex",
++            anthropic: "Anthropic",
++            openai: "OpenAI",
++            google: "Google",
++            "google-gemini-cli": "Gemini CLI",
++            "google-antigravity": "Google Antigravity",
++        };
++        return labels[provider] ?? provider
++            .split("-")
++            .map((part) => part ? part[0].toUpperCase() + part.slice(1) : part)
++            .join(" ");
++    }
++    getRowKey(row) {
++        return row.type === "provider" ? `provider:${row.provider}` : `model:${row.provider}/${row.item.id}`;
++    }
++    rebuildTree(preferredKey) {
++        const oldRow = this.visibleRows[this.selectedIndex];
++        const selectedKey = preferredKey ?? (oldRow ? this.getRowKey(oldRow) : undefined);
++        const query = this.searchInput?.getValue().trim() ?? "";
++        const groups = new Map();
++        for (const item of this.filteredModels) {
++            const items = groups.get(item.provider) ?? [];
++            items.push(item);
++            groups.set(item.provider, items);
++        }
++        const rows = [];
++        for (const provider of [...groups.keys()].sort((a, b) => a.localeCompare(b))) {
++            const models = groups.get(provider);
++            rows.push({ type: "provider", provider, count: models.length });
++            if (query || this.expandedProviders.has(provider)) {
++                for (const item of models) rows.push({ type: "model", provider, item });
++            }
++        }
++        this.visibleRows = rows;
++        let nextIndex = selectedKey ? rows.findIndex((row) => this.getRowKey(row) === selectedKey) : -1;
++        if (nextIndex < 0 && this.currentModel) {
++            nextIndex = rows.findIndex((row) => row.type === "model" && modelsAreEqual(this.currentModel, row.item.model));
++        }
++        this.selectedIndex = nextIndex >= 0 ? nextIndex : Math.min(this.selectedIndex, Math.max(0, rows.length - 1));
++    }
++    toggleProvider(provider, expanded) {
++        const shouldExpand = expanded ?? !this.expandedProviders.has(provider);
++        if (shouldExpand) this.expandedProviders.add(provider);
++        else this.expandedProviders.delete(provider);
++        this.rebuildTree(`provider:${provider}`);
++        this.updateList();
++    }
+     getScopeText() {
+         const allText = this.scope === "all" ? theme.fg("accent", "all") : theme.fg("muted", "all");
+         const scopedText = this.scope === "scoped" ? theme.fg("accent", "scoped") : theme.fg("muted", "scoped");
+@@ -205,63 +246,62 @@
+         }
+     }
+     filterModels(query) {
++        const previousQuery = this.lastQuery ?? "";
+         this.filteredModels = query
+             ? fuzzyFilter(this.activeModels, query, ({ id, provider, model }) => getModelSelectorSearchText({ id, provider, name: model.name }))
+             : this.activeModels;
+-        // When filtering by a query, move the selector to the top row so the best
+-        // match is highlighted. When the query is cleared, keep the current position
+-        // clamped to the (restored) list length.
+-        this.selectedIndex = query ? 0 : Math.min(this.selectedIndex, Math.max(0, this.filteredModels.length - 1));
++        this.lastQuery = query;
++        this.rebuildTree();
++        if (query && query !== previousQuery) this.selectedIndex = this.visibleRows.findIndex((row) => row.type === "model");
++        if (this.selectedIndex < 0) this.selectedIndex = 0;
+         this.updateList();
+     }
+     updateList() {
+         this.listContainer.clear();
+-        const maxVisible = 10;
+-        const startIndex = Math.max(0, Math.min(this.selectedIndex - Math.floor(maxVisible / 2), this.filteredModels.length - maxVisible));
+-        const endIndex = Math.min(startIndex + maxVisible, this.filteredModels.length);
+-        // Show visible slice of filtered models
++        const maxVisible = 12;
++        const startIndex = Math.max(0, Math.min(this.selectedIndex - Math.floor(maxVisible / 2), this.visibleRows.length - maxVisible));
++        const endIndex = Math.min(startIndex + maxVisible, this.visibleRows.length);
+         for (let i = startIndex; i < endIndex; i++) {
+-            const item = this.filteredModels[i];
+-            if (!item)
+-                continue;
++            const row = this.visibleRows[i];
++            if (!row) continue;
+             const isSelected = i === this.selectedIndex;
+-            const isCurrent = modelsAreEqual(this.currentModel, item.model);
+-            let line = "";
+-            if (isSelected) {
+-                const prefix = theme.fg("accent", "→ ");
+-                const modelText = `${item.id}`;
+-                const providerBadge = theme.fg("muted", `[${item.provider}]`);
+-                const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
+-                line = `${prefix + theme.fg("accent", modelText)} ${providerBadge}${checkmark}`;
++            const cursor = isSelected ? theme.fg("accent", "→ ") : "  ";
++            if (row.type === "provider") {
++                const expanded = Boolean(this.searchInput.getValue().trim()) || this.expandedProviders.has(row.provider);
++                const branch = expanded ? "▾ " : "▸ ";
++                const label = this.getProviderLabel(row.provider);
++                const providerText = `${branch}${label}`;
++                const id = label.toLowerCase() === row.provider.toLowerCase() ? "" : ` [${row.provider}]`;
++                const count = ` · ${row.count} model${row.count === 1 ? "" : "s"}`;
++                let line = cursor + (isSelected ? theme.fg("accent", providerText) : theme.fg("text", providerText));
++                line += theme.fg("muted", id + count);
++                this.listContainer.addChild(new Text(line, 0, 0));
++                continue;
+             }
+-            else {
+-                const modelText = `  ${item.id}`;
+-                const providerBadge = theme.fg("muted", `[${item.provider}]`);
+-                const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
+-                line = `${modelText} ${providerBadge}${checkmark}`;
+-            }
++            const isCurrent = modelsAreEqual(this.currentModel, row.item.model);
++            const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
++            const modelText = `  └─ ${row.item.id}`;
++            const line = cursor + (isSelected ? theme.fg("accent", modelText) : modelText) + checkmark;
+             this.listContainer.addChild(new Text(line, 0, 0));
+         }
+-        // Add scroll indicator if needed
+-        if (startIndex > 0 || endIndex < this.filteredModels.length) {
+-            const scrollInfo = theme.fg("muted", `  (${this.selectedIndex + 1}/${this.filteredModels.length})`);
+-            this.listContainer.addChild(new Text(scrollInfo, 0, 0));
++        if (startIndex > 0 || endIndex < this.visibleRows.length) {
++            this.listContainer.addChild(new Text(theme.fg("muted", `  (${this.selectedIndex + 1}/${this.visibleRows.length})`), 0, 0));
+         }
+-        // Show error message or "no results" if empty
+         if (this.errorMessage) {
+-            // Show error in red
+-            const errorLines = this.errorMessage.split("\n");
+-            for (const line of errorLines) {
+-                this.listContainer.addChild(new Text(theme.fg("error", line), 0, 0));
+-            }
++            for (const line of this.errorMessage.split("\n")) this.listContainer.addChild(new Text(theme.fg("error", line), 0, 0));
+         }
+-        else if (this.filteredModels.length === 0) {
++        else if (this.visibleRows.length === 0) {
+             this.listContainer.addChild(new Text(theme.fg("muted", "  No matching models"), 0, 0));
+         }
+         else {
+-            const selected = this.filteredModels[this.selectedIndex];
++            const selected = this.visibleRows[this.selectedIndex];
+             this.listContainer.addChild(new Spacer(1));
+-            this.listContainer.addChild(new Text(theme.fg("muted", `  Model Name: ${selected.model.name}`), 0, 0));
++            if (selected?.type === "model") {
++                this.listContainer.addChild(new Text(theme.fg("muted", `  Model Name: ${selected.item.model.name}`), 0, 0));
++            }
++            else {
++                this.listContainer.addChild(new Text(theme.fg("muted", "  Enter/→ expand · ← collapse · ↑↓ navigate"), 0, 0));
++            }
+         }
+         if (this.refreshStatusMessage) {
+             this.listContainer.addChild(new Spacer(1));
+@@ -280,33 +320,39 @@
+             }
+             return;
+         }
+-        // Up arrow - wrap to bottom when at top
++        const queryActive = Boolean(this.searchInput.getValue().trim());
++        const row = this.visibleRows[this.selectedIndex];
+         if (kb.matches(keyData, "tui.select.up")) {
+-            if (this.filteredModels.length === 0)
+-                return;
+-            this.selectedIndex = this.selectedIndex === 0 ? this.filteredModels.length - 1 : this.selectedIndex - 1;
++            if (this.visibleRows.length === 0) return;
++            this.selectedIndex = this.selectedIndex === 0 ? this.visibleRows.length - 1 : this.selectedIndex - 1;
+             this.updateList();
+         }
+-        // Down arrow - wrap to top when at bottom
+         else if (kb.matches(keyData, "tui.select.down")) {
+-            if (this.filteredModels.length === 0)
+-                return;
+-            this.selectedIndex = this.selectedIndex === this.filteredModels.length - 1 ? 0 : this.selectedIndex + 1;
++            if (this.visibleRows.length === 0) return;
++            this.selectedIndex = this.selectedIndex === this.visibleRows.length - 1 ? 0 : this.selectedIndex + 1;
+             this.updateList();
+         }
+-        // Enter
+-        else if (kb.matches(keyData, "tui.select.confirm")) {
+-            const selectedModel = this.filteredModels[this.selectedIndex];
+-            if (selectedModel) {
+-                this.handleSelect(selectedModel.model);
++        else if (!queryActive && matchesKey(keyData, Key.right)) {
++            if (row?.type === "provider") this.toggleProvider(row.provider, true);
++        }
++        else if (!queryActive && matchesKey(keyData, Key.left)) {
++            if (row?.type === "provider") {
++                this.toggleProvider(row.provider, false);
+             }
++            else if (row?.type === "model") {
++                this.expandedProviders.delete(row.provider);
++                this.rebuildTree(`provider:${row.provider}`);
++                this.updateList();
++            }
+         }
+-        // Escape or Ctrl+C
++        else if (kb.matches(keyData, "tui.select.confirm")) {
++            if (row?.type === "provider") this.toggleProvider(row.provider);
++            else if (row?.type === "model") this.handleSelect(row.item.model);
++        }
+         else if (kb.matches(keyData, "tui.select.cancel")) {
+             this.dispose();
+             this.onCancelCallback();
+         }
+-        // Pass everything else to search input
+         else {
+             this.searchInput.handleInput(keyData);
+             this.filterModels(this.searchInput.getValue());

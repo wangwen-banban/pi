@@ -54,6 +54,9 @@ git clone git@github.com:wangwen-banban/pi.git ~/.pi/agent
 # Ensure helper scripts are executable
 chmod +x ~/.pi/agent/scripts/*.sh
 
+# Restore the provider-first, model-second selector package patch
+~/.pi/agent/scripts/apply-model-selector-patch.sh
+
 # Start pi
 pi
 ```
@@ -78,6 +81,25 @@ chmod 600 ~/.pi/agent/auth.json
 6. Run `/model` and select a model under `openai-codex-second`.
 
 After both accounts are authorized, switch accounts through `/model`; repeated logout/login is not required. The footer and `/weekly` use the quota belonging to the currently selected provider.
+
+## Two-Level Model Selector
+
+The `/model` UI is a package-level patch: select a provider first, then expand it to select a concrete model. It is versioned under:
+
+```text
+patches/pi-model-selector/0.84.1/model-selector.patch
+```
+
+Install or verify it with:
+
+```bash
+~/.pi/agent/scripts/apply-model-selector-patch.sh
+~/.pi/agent/scripts/apply-model-selector-patch.sh --check
+```
+
+The installer locates the global pi package without assuming a fixed nvm path. It only patches the exact supported official version/hash, applies changes in a temporary file, validates JavaScript syntax and the final hash, and safely refuses unknown or modified installations.
+
+An npm update may replace the patched vendor file. Run `--check` after updating pi. If the installed version is newer than `0.84.1`, do not force-copy the old JavaScript file; generate and validate a patch for the new version instead.
 
 ## Plan Mode
 
@@ -128,6 +150,17 @@ Current extensions load `pi-ai` through pi's virtual module API rather than a ha
 ### `Cannot find module 'undici'`
 
 The current provider transport treats `undici` as optional and uses its Node-core fallback when unavailable. If this error still appears, an old copy of `extensions/provider-routing/index.ts` is being loaded; update the repository and restart pi.
+
+### `/model` returns to a flat model list after updating pi
+
+An npm update replaced the patched package file. Re-run:
+
+```bash
+~/.pi/agent/scripts/apply-model-selector-patch.sh --check || \
+  ~/.pi/agent/scripts/apply-model-selector-patch.sh
+```
+
+If the script reports an unsupported version or unknown hash, it has intentionally left the installation untouched; update the versioned patch before applying anything.
 
 ### Existing clone after security history rewrite
 
