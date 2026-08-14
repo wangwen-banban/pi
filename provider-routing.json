@@ -19,6 +19,14 @@
       "requestModelId": "claude-opus-5",
       "contextWindow": 1000000,
       "maxTokens": 64000
+    },
+    "big-data-claude": {
+      "mode": "direct",
+      "baseUrl": "https://llm-chat-api-pre.alibaba-inc.com/anthropic",
+      "modelId": "claude-opus-5",
+      "requestModelId": "claude-opus-5",
+      "contextWindow": 1000000,
+      "maxTokens": 64000
     }
   }
 }

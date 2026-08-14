@@ -81,6 +81,20 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Extract error message from alibaba's non-standard SSE error formats:
+ *   Format 1: data: {"error":{"message":"..."},"type":"error"}
+ *   Format 2: data: {"type":"error","error":{"type":"api_error","message":"..."}}
+ */
+function extractAlibabaSSEError(text: string): string | null {
+  // Try both formats
+  const m1 = text.match(/data:\s*\{"error":\{"message":"((?:[^"\\]|\\.)*)"/);
+  const m2 = text.match(/data:\s*\{"type":\s*"error",\s*"error":\s*\{[^}]*"message":\s*"((?:[^"\\]|\\.)*)"/);
+  const raw = (m1 ?? m2)?.[1];
+  if (!raw) return null;
+  try { return JSON.parse('"' + raw + '"'); } catch { return raw; }
+}
+
 function retryDelay(attempt: number): number {
   // Exponential backoff: 2s, 4s, 8s, 16s, 32s (with jitter)
   const base = Math.min(2_000 * 2 ** attempt, 32_000);
@@ -363,14 +377,7 @@ export default function providerRouting(pi: ExtensionAPI) {
             return resp as any;
           }
           const peek = new TextDecoder().decode(firstChunk).slice(0, 512);
-          // Extract alibaba error message. Their format wraps the real message
-          // in nested JSON, so we use a broader capture and then parse it.
-          const extractAlibabaError = (text: string): string | null => {
-            const m = text.match(/data:\s*\{"error":\{"message":"((?:[^"\\]|\\.)*)"/);
-            if (!m) return null;
-            try { return JSON.parse('"' + m[1] + '"'); } catch { return m[1]; }
-          };
-          const firstErr = extractAlibabaError(peek);
+          const firstErr = extractAlibabaSSEError(peek);
           if (firstErr) {
             reader.releaseLock();
             throw new Error(`[alibaba] ${firstErr}`);
@@ -387,7 +394,7 @@ export default function providerRouting(pi: ExtensionAPI) {
               if (d) { controller.close(); return; }
               // Check every chunk for alibaba inline errors
               const text = new TextDecoder().decode(value);
-              const midErr = extractAlibabaError(text);
+              const midErr = extractAlibabaSSEError(text);
               if (midErr) {
                 // Signal error on the stream. The downstream Anthropic SDK / pi-ai
                 // SSE parser will catch this as an iteration error and surface it.
@@ -414,6 +421,126 @@ export default function providerRouting(pi: ExtensionAPI) {
         () => provider.streamSimple(model, filteredContext, { ...options, env, fetch: directFetch }),
         createAssistantMessageEventStream,
         5, // max 5 retries
+      );
+    },
+  });
+
+  // --- big-data-claude provider ---
+  const bigData = routeFor("big-data-claude");
+  for (const key of ["baseUrl", "modelId", "requestModelId"] as const) {
+    if (!bigData[key]) throw new Error(`Missing big-data-claude.${key} in ${ROUTING_PATH}`);
+  }
+  const bigDataSessionId = crypto.randomUUID();
+
+  pi.registerProvider("big-data-claude", {
+    api: "anthropic-messages",
+    baseUrl: bigData.baseUrl,
+    headers: {
+      "x-claude-code-session-id": bigDataSessionId,
+      "user-agent": "claude-code/1.0",
+    },
+    models: [
+      {
+        id: "claude-opus-5",
+        name: "Claude Opus 5 (Big Data)",
+        api: "anthropic-messages",
+        reasoning: true,
+        input: ["text", "image"],
+        contextWindow: bigData.contextWindow ?? 1_000_000,
+        maxTokens: bigData.maxTokens ?? 64_000,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        thinkingLevelMap: {
+          minimal: "low",
+          low: "low",
+          medium: "medium",
+          high: "high",
+          xhigh: "xhigh",
+          max: "max",
+        },
+        compat: {
+          supportsPromptCaching: false,
+          sendSessionAffinityHeaders: false,
+          forceAdaptiveThinking: true,
+        },
+      },
+    ],
+    streamSimple: async (
+      model: Model<any>,
+      context: Context,
+      options?: SimpleStreamOptions,
+    ): Promise<AssistantMessageEventStream> => {
+      const provider = (await compat()).getApiProvider("anthropic-messages");
+      const env = withRouteEnv(options?.env, bigData);
+      const filteredContext: Context = {
+        ...context,
+        tools: context.tools?.filter((t: any) => t.name !== "web_search"),
+      };
+      const directFetch: typeof fetch = async (input, init) => {
+        const headers = new Headers((init as any)?.headers);
+        headers.set("x-claude-code-session-id", bigDataSessionId);
+        headers.set("user-agent", "claude-code/1.0");
+
+        // Fix thinking format
+        if ((init as any)?.body && typeof (init as any).body === "string") {
+          try {
+            const reqBody = JSON.parse((init as any).body);
+            if (reqBody.thinking?.type === "enabled") {
+              const budget = reqBody.thinking.budget_tokens ?? reqBody.max_tokens ?? 8000;
+              const effort = budget >= 32000 ? "max" : budget >= 16000 ? "xhigh" : budget >= 8000 ? "high" : budget >= 4000 ? "medium" : "low";
+              reqBody.thinking = { type: "adaptive" };
+              reqBody.output_config = { effort };
+              (init as any) = { ...(init as any), body: JSON.stringify(reqBody) };
+            }
+          } catch { /* pass through */ }
+        }
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 90_000);
+        let resp: any;
+        try {
+          resp = await (undiciFetch as Function)(input, {
+            ...(init as any),
+            headers,
+            dispatcher: directDispatcher,
+            signal: controller.signal,
+          });
+        } catch (e: any) {
+          clearTimeout(timeout);
+          if (e?.name === "AbortError") throw new Error("[big-data-claude] 请求超时 (90s)");
+          throw e;
+        }
+        clearTimeout(timeout);
+
+        if (resp.body) {
+          const reader = resp.body.getReader();
+          const { value: firstChunk, done } = await reader.read();
+          if (done || !firstChunk) { reader.releaseLock(); return resp as any; }
+          const peek = new TextDecoder().decode(firstChunk).slice(0, 512);
+          const firstErr = extractAlibabaSSEError(peek);
+          if (firstErr) { reader.releaseLock(); throw new Error(`[big-data-claude] ${firstErr}`); }
+          const reconstructed = new ReadableStream({
+            start(c) { c.enqueue(firstChunk); },
+            async pull(c) {
+              const { value, done: d } = await reader.read();
+              if (d) { c.close(); return; }
+              const t = new TextDecoder().decode(value);
+              const midErr = extractAlibabaSSEError(t);
+              if (midErr) { c.error(new Error(`[big-data-claude] ${midErr}`)); reader.releaseLock(); return; }
+              c.enqueue(value);
+            },
+            cancel() { reader.releaseLock(); },
+          });
+          return new Response(reconstructed, { status: resp.status, statusText: resp.statusText, headers: resp.headers }) as any;
+        }
+        return resp as any;
+      };
+      const { createAssistantMessageEventStream } = await import(
+        `${PI_ROOT}/node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js`
+      );
+      return streamWithRetry(
+        () => provider.streamSimple(model, filteredContext, { ...options, env, fetch: directFetch }),
+        createAssistantMessageEventStream,
+        5,
       );
     },
   });
