@@ -10,6 +10,7 @@ import {
 	weeklyUsageFromApi,
 	weeklyUsageFromHeaders,
 } from "./usage.ts";
+import { getCodexCachePath, getCodexProviderId, type CodexProviderId } from "./codex-provider.ts";
 
 const STATUS_KEY = "codex-weekly-usage";
 const REFRESH_INTERVAL_MS = 5 * 60_000;
@@ -18,7 +19,6 @@ const MIN_REFRESH_GAP_MS = 30_000;
 const CACHE_STALE_MS = 30 * 60_000;
 const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
-const CACHE_PATH = path.join(AGENT_DIR, "cache", "codex-weekly-usage.json");
 
 interface CodexIdentity {
 	token: string;
@@ -35,11 +35,11 @@ function getCodexIdentity(token: string): CodexIdentity {
 	return { token, accountId };
 }
 
-function readBearerToken(): Promise<string> {
+function readBearerToken(provider: CodexProviderId): Promise<string> {
 	return new Promise((resolve, reject) => {
 		execFile(
 			"pi",
-			["auth", "print-bearer-token", "--provider", "openai-codex", "--min-expiry", "10m"],
+			["auth", "print-bearer-token", "--provider", provider, "--min-expiry", "10m"],
 			{ encoding: "utf8", timeout: 20_000, maxBuffer: 16 * 1024 },
 			(error, stdout, stderr) => {
 				if (error) {
@@ -57,8 +57,8 @@ function readBearerToken(): Promise<string> {
 	});
 }
 
-async function fetchWeeklyUsage(): Promise<WeeklyUsage> {
-	const identity = getCodexIdentity(await readBearerToken());
+async function fetchWeeklyUsage(provider: CodexProviderId): Promise<WeeklyUsage> {
+	const identity = getCodexIdentity(await readBearerToken(provider));
 	const response = await fetch(USAGE_URL, {
 		headers: {
 			accept: "application/json",
@@ -74,9 +74,14 @@ async function fetchWeeklyUsage(): Promise<WeeklyUsage> {
 	return usage;
 }
 
-function loadCache(): WeeklyUsage | undefined {
+const usageByProvider = new Map<CodexProviderId, WeeklyUsage | undefined>();
+const loadedProviders = new Set<CodexProviderId>();
+const refreshPromiseByProvider = new Map<CodexProviderId, Promise<WeeklyUsage | undefined>>();
+const lastRefreshStartedAtByProvider = new Map<CodexProviderId, number>();
+
+function loadCache(provider: CodexProviderId): WeeklyUsage | undefined {
 	try {
-		const parsed = JSON.parse(fs.readFileSync(CACHE_PATH, "utf8")) as WeeklyUsage;
+		const parsed = JSON.parse(fs.readFileSync(getCodexCachePath(AGENT_DIR, provider), "utf8")) as WeeklyUsage;
 		if (
 			typeof parsed.remainingPercent !== "number" ||
 			typeof parsed.usedPercent !== "number" ||
@@ -91,10 +96,24 @@ function loadCache(): WeeklyUsage | undefined {
 	}
 }
 
-async function saveCache(usage: WeeklyUsage): Promise<void> {
+function getCachedUsage(provider: CodexProviderId): WeeklyUsage | undefined {
+	if (!loadedProviders.has(provider)) {
+		usageByProvider.set(provider, loadCache(provider));
+		loadedProviders.add(provider);
+	}
+	return usageByProvider.get(provider);
+}
+
+function setCachedUsage(provider: CodexProviderId, usage: WeeklyUsage | undefined): void {
+	usageByProvider.set(provider, usage);
+	loadedProviders.add(provider);
+}
+
+async function saveCache(provider: CodexProviderId, usage: WeeklyUsage): Promise<void> {
 	try {
-		await fs.promises.mkdir(path.dirname(CACHE_PATH), { recursive: true, mode: 0o700 });
-		await fs.promises.writeFile(CACHE_PATH, `${JSON.stringify(usage, null, 2)}\n`, {
+		const cachePath = getCodexCachePath(AGENT_DIR, provider);
+		await fs.promises.mkdir(path.dirname(cachePath), { recursive: true, mode: 0o700 });
+		await fs.promises.writeFile(cachePath, `${JSON.stringify(usage, null, 2)}\n`, {
 			encoding: "utf8",
 			mode: 0o600,
 		});
@@ -116,71 +135,107 @@ function statusText(ctx: ExtensionContext, usage: WeeklyUsage | undefined, loadi
 }
 
 export default function weeklyUsageStatus(pi: ExtensionAPI) {
-	let usage: WeeklyUsage | undefined = loadCache();
+	let currentProvider: CodexProviderId | undefined;
 	let currentContext: ExtensionContext | undefined;
-	let refreshPromise: Promise<WeeklyUsage | undefined> | undefined;
-	let lastRefreshStartedAt = 0;
-	let refreshTimer: ReturnType<typeof setInterval> | undefined;
-	let displayTimer: ReturnType<typeof setInterval> | undefined;
 	let active = true;
 
 	const render = (loading = false) => {
 		const ctx = currentContext;
 		if (!ctx || ctx.mode !== "tui") return;
-		ctx.ui.setStatus(STATUS_KEY, statusText(ctx, usage, loading));
+		if (!currentProvider) {
+			ctx.ui.setStatus(STATUS_KEY, undefined);
+			return;
+		}
+		ctx.ui.setStatus(STATUS_KEY, statusText(ctx, getCachedUsage(currentProvider), loading));
 	};
 
-	const acceptUsage = (next: WeeklyUsage) => {
-		usage = next;
-		render();
-		void saveCache(next);
+	const acceptUsage = (provider: CodexProviderId, next: WeeklyUsage) => {
+		setCachedUsage(provider, next);
+		void saveCache(provider, next);
+		if (provider === currentProvider) render();
 	};
 
-	const refresh = async (force = false): Promise<WeeklyUsage | undefined> => {
-		if (!active || !currentContext || currentContext.mode !== "tui") return usage;
-		if (refreshPromise) return refreshPromise;
-		if (!force && Date.now() - lastRefreshStartedAt < MIN_REFRESH_GAP_MS) return usage;
-		lastRefreshStartedAt = Date.now();
-		render(!usage);
-		refreshPromise = fetchWeeklyUsage()
+	const refresh = async (force = false, provider = currentProvider): Promise<WeeklyUsage | undefined> => {
+		if (!active || !currentContext || currentContext.mode !== "tui") return provider ? getCachedUsage(provider) : undefined;
+		if (!provider) {
+			render();
+			return undefined;
+		}
+		const existingPromise = refreshPromiseByProvider.get(provider);
+		if (existingPromise) return existingPromise;
+		const lastRefreshStartedAt = lastRefreshStartedAtByProvider.get(provider) ?? 0;
+		if (!force && Date.now() - lastRefreshStartedAt < MIN_REFRESH_GAP_MS) return getCachedUsage(provider);
+		lastRefreshStartedAtByProvider.set(provider, Date.now());
+		if (provider === currentProvider) render(!getCachedUsage(provider));
+		let promise: Promise<WeeklyUsage | undefined>;
+		promise = fetchWeeklyUsage(provider)
 			.then((next) => {
-				if (active) acceptUsage(next);
+				if (active) acceptUsage(provider, next);
 				return next;
 			})
 			.catch(() => {
-				if (active) render();
+				if (active && provider === currentProvider) render();
 				return undefined;
 			})
 			.finally(() => {
-				refreshPromise = undefined;
+				if (refreshPromiseByProvider.get(provider) === promise) refreshPromiseByProvider.delete(provider);
 			});
-		return refreshPromise;
+		refreshPromiseByProvider.set(provider, promise);
+		return promise;
 	};
 
-	const stopTimers = () => {
+	let refreshTimer: ReturnType<typeof setInterval> | undefined;
+	let displayTimer: ReturnType<typeof setInterval> | undefined;
+	const clearTimers = () => {
 		if (refreshTimer) clearInterval(refreshTimer);
 		if (displayTimer) clearInterval(displayTimer);
 		refreshTimer = undefined;
 		displayTimer = undefined;
 	};
+	const startTimers = () => {
+		if (!refreshTimer) {
+			refreshTimer = setInterval(() => void refresh(), REFRESH_INTERVAL_MS);
+			refreshTimer.unref?.();
+		}
+		if (!displayTimer) {
+			displayTimer = setInterval(() => render(), DISPLAY_INTERVAL_MS);
+			displayTimer.unref?.();
+		}
+	};
 
 	pi.on("session_start", (_event, ctx) => {
-		currentContext = ctx;
 		active = true;
-		stopTimers();
+		clearTimers();
+		currentContext = ctx;
+		currentProvider = getCodexProviderId(ctx.model?.provider);
 		if (ctx.mode !== "tui") return;
-		render(!usage);
-		void refresh(true);
-		refreshTimer = setInterval(() => void refresh(), REFRESH_INTERVAL_MS);
-		displayTimer = setInterval(() => render(), DISPLAY_INTERVAL_MS);
-		refreshTimer.unref?.();
-		displayTimer.unref?.();
+		render(!currentProvider ? false : !getCachedUsage(currentProvider));
+		if (!currentProvider) return;
+		void refresh(true, currentProvider);
+		startTimers();
+	});
+
+	pi.on("model_select", (event, ctx) => {
+		currentContext = ctx;
+		currentProvider = getCodexProviderId(event?.model?.provider ?? ctx.model?.provider);
+		if (ctx.mode !== "tui") return;
+		if (!currentProvider) {
+			clearTimers();
+			render();
+			return;
+		}
+		render(!getCachedUsage(currentProvider));
+		void refresh(true, currentProvider);
+		startTimers();
 	});
 
 	pi.on("after_provider_response", (event, ctx) => {
 		currentContext = ctx;
+		const provider = currentProvider ?? getCodexProviderId(ctx.model?.provider);
+		if (!provider) return;
+		currentProvider = provider;
 		const headerUsage = weeklyUsageFromHeaders(event.headers);
-		if (headerUsage) acceptUsage(headerUsage);
+		if (headerUsage) acceptUsage(provider, headerUsage);
 	});
 
 	pi.on("turn_end", (_event, ctx) => {
@@ -190,16 +245,23 @@ export default function weeklyUsageStatus(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", (_event, ctx) => {
 		active = false;
-		stopTimers();
+		clearTimers();
 		if (ctx.mode === "tui") ctx.ui.setStatus(STATUS_KEY, undefined);
 		currentContext = undefined;
+		currentProvider = undefined;
 	});
 
 	pi.registerCommand("weekly", {
 		description: "Refresh and show remaining Codex weekly quota",
 		handler: async (_args, ctx) => {
 			currentContext = ctx;
-			const next = await refresh(true);
+			const provider = currentProvider ?? getCodexProviderId(ctx.model?.provider);
+			if (!provider) {
+				ctx.ui.notify("No Codex provider is active.", "warning");
+				return;
+			}
+			currentProvider = provider;
+			const next = await refresh(true, provider);
 			if (!next) {
 				ctx.ui.notify("Unable to refresh Codex weekly quota; showing the last cached value.", "warning");
 				return;

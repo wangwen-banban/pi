@@ -1,9 +1,16 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Model, SimpleStreamOptions, Context, AssistantMessageEventStream } from "@earendil-works/pi-ai";
-import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import {
+  bridgeSecondaryCodexStream,
+  canonicalizeSecondaryCodexMessage,
+} from "../codex-multi-account/index.ts";
+import {
+  createRoutedHttpTransport,
+  type RoutedHttpTransportOptions,
+} from "./transport.ts";
 
 
 const PI_ROOT = "/Users/wenwang/.nvm/versions/node/v22.22.2/lib/node_modules/@earendil-works/pi-coding-agent";
@@ -111,9 +118,29 @@ function retryDelay(attempt: number): number {
 function streamWithRetry(
   makeStream: () => Promise<AssistantMessageEventStream>,
   createStream: () => AssistantMessageEventStream,
+  model: Model<any>,
   maxRetries: number = 5,
 ): AssistantMessageEventStream {
   const wrapper = createStream();
+  const errorMessage = (message: string, httpStatus?: number): AssistantMessage => ({
+    role: "assistant",
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "error",
+    errorMessage: message,
+    ...(httpStatus === undefined ? {} : { httpStatus }),
+    timestamp: Date.now(),
+  });
   (async () => {
     let lastError: any;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -177,11 +204,14 @@ function streamWithRetry(
           // --- Normal event ---
           // Detect real content: text deltas or tool calls.
           if (!hasRealContent && event.type !== "done") {
-            const msg = event.message ?? event;
-            const content = msg?.content ?? [];
-            if (content.some((c: any) =>
-              (c.type === "text" && c.text?.trim()) || c.type === "toolCall",
-            )) {
+            const msg = event.partial ?? event.message ?? event.error;
+            const content = Array.isArray(msg?.content) ? msg.content : [];
+            if (
+              (event.type === "text_delta" && typeof event.delta === "string" && event.delta.trim()) ||
+              content.some((c: any) =>
+                (c.type === "text" && c.text?.trim()) || c.type === "toolCall"
+              )
+            ) {
               hasRealContent = true;
             }
           }
@@ -218,13 +248,7 @@ function streamWithRetry(
           await sleep(retryDelay(attempt));
           continue;
         }
-        const errorOutput = {
-          stopReason: "error",
-          errorMessage: errMsg,
-          httpStatus: err?.status,
-          content: [],
-        };
-        wrapper.push({ type: "error", reason: "error", error: errorOutput });
+        wrapper.push({ type: "error", reason: "error", error: errorMessage(errMsg, err?.status) });
         return;
       }
     }
@@ -235,33 +259,20 @@ function streamWithRetry(
     wrapper.push({
       type: "error",
       reason: "error",
-      error: {
-        stopReason: "error",
-        errorMessage: `[alibaba-relay] ${exhaustMsg}`,
-        content: [],
-      },
+      error: errorMessage(`[alibaba-relay] ${exhaustMsg}`),
     });
   })();
   return wrapper;
 }
 
-export default function providerRouting(pi: ExtensionAPI) {
-  const requireFromPi = createRequire(`${PI_ROOT}/dist/cli.js`);
-  const { Agent, ProxyAgent, fetch: undiciFetch } = requireFromPi("undici") as {
-    Agent: new () => { close(): Promise<void> };
-    ProxyAgent: new (uri: string) => { close(): Promise<void> };
-    fetch: typeof fetch;
-  };
-  const directDispatcher = new Agent();
-  const proxyDispatchers = new Map<string, { close(): Promise<void> }>();
-  const proxyDispatcherFor = (url: string) => {
-    let dispatcher = proxyDispatchers.get(url);
-    if (!dispatcher) {
-      dispatcher = new ProxyAgent(url);
-      proxyDispatchers.set(url, dispatcher);
-    }
-    return dispatcher;
-  };
+export function registerProviderRouting(
+  pi: ExtensionAPI,
+  transportOptions: RoutedHttpTransportOptions = {},
+) {
+  // undici is an optional optimization, not a load-time dependency. The
+  // Node-core fallback keeps explicit direct/proxy routes working when pi
+  // bundles undici or does not expose it through Node's package resolver.
+  const transport = createRoutedHttpTransport(transportOptions);
   const relay = routeFor("claude-relay");
   for (const key of ["baseUrl", "modelId", "requestModelId"] as const) {
     if (!relay[key]) throw new Error(`Missing claude-relay.${key} in ${ROUTING_PATH}`);
@@ -348,12 +359,11 @@ export default function providerRouting(pi: ExtensionAPI) {
         const timeout = setTimeout(() => controller.abort(), 90_000);
         let resp: any;
         try {
-          resp = await (undiciFetch as Function)(input, {
+          resp = await transport.fetch(input as any, {
             ...(init as any),
             headers,
-            dispatcher: directDispatcher,
             signal: controller.signal,
-          });
+          }, { rejectUnauthorized: false });
         } catch (e: any) {
           clearTimeout(timeout);
           if (e?.name === "AbortError") throw new Error("[alibaba] 请求超时 (90s)");
@@ -420,6 +430,7 @@ export default function providerRouting(pi: ExtensionAPI) {
       return streamWithRetry(
         () => provider.streamSimple(model, filteredContext, { ...options, env, fetch: directFetch }),
         createAssistantMessageEventStream,
+        model,
         5, // max 5 retries
       );
     },
@@ -521,12 +532,11 @@ export default function providerRouting(pi: ExtensionAPI) {
         const timeout = setTimeout(() => controller.abort(), 90_000);
         let resp: any;
         try {
-          resp = await (undiciFetch as Function)(input, {
+          resp = await transport.fetch(input as any, {
             ...(init as any),
             headers,
-            dispatcher: directDispatcher,
             signal: controller.signal,
-          });
+          }, { rejectUnauthorized: false });
         } catch (e: any) {
           clearTimeout(timeout);
           if (e?.name === "AbortError") throw new Error("[big-data-claude] 请求超时 (90s)");
@@ -563,6 +573,7 @@ export default function providerRouting(pi: ExtensionAPI) {
       return streamWithRetry(
         () => provider.streamSimple(model, filteredContext, { ...options, env, fetch: directFetch }),
         createAssistantMessageEventStream,
+        model,
         5,
       );
     },
@@ -598,54 +609,73 @@ export default function providerRouting(pi: ExtensionAPI) {
       const env = withRouteEnv(options?.env, relay);
       const requestModel = { ...model, id: relay.requestModelId! };
       const directFetch: typeof fetch = (input, init) =>
-        undiciFetch(input as any, { ...(init as any), dispatcher: directDispatcher } as any) as any;
+        transport.fetch(input as any, init as any) as any;
       return provider.streamSimple(requestModel, context, { ...options, env, fetch: directFetch });
     },
   });
+
+  const streamCodexWithPrimaryRoute = async (
+    model: Model<any>,
+    context: Context,
+    options?: SimpleStreamOptions,
+  ): Promise<AssistantMessageEventStream> => {
+    const provider = (await compat()).getApiProvider("openai-codex-responses");
+    const route = routeFor("openai-codex");
+    const env = withRouteEnv(options?.env, route);
+    if (route.mode !== "proxy") {
+      return provider.streamSimple(model, context, { ...options, env });
+    }
+
+    const routedFetch: typeof fetch = (input, init) =>
+      transport.fetch(input as any, init as any, { proxyUrl: route.proxyUrl! }) as any;
+    // Force HTTP/SSE for deterministic proxy routing. The upstream Codex
+    // adapter otherwise prefers WebSocket, whose proxy path is runtime-specific.
+    return provider.streamSimple(model, context, {
+      ...options,
+      env,
+      fetch: routedFetch,
+      transport: "sse",
+    });
+  };
 
   // Override only the transport of the built-in Codex provider. OAuth, model
   // discovery, payload shaping, and response parsing remain provided by pi-ai.
   pi.registerProvider("openai-codex", {
     api: "openai-codex-responses",
-    streamSimple: async (
-      model: Model<any>,
-      context: Context,
-      options?: SimpleStreamOptions,
-    ): Promise<AssistantMessageEventStream> => {
-      const provider = (await compat()).getApiProvider("openai-codex-responses");
-      const route = routeFor("openai-codex");
-      const env = withRouteEnv(options?.env, route);
-      if (route.mode !== "proxy") {
-        return provider.streamSimple(model, context, { ...options, env });
-      }
+    streamSimple: streamCodexWithPrimaryRoute,
+  });
 
-      const dispatcher = proxyDispatcherFor(route.proxyUrl!);
-      const routedFetch: typeof fetch = (input, init) =>
-        undiciFetch(input as any, { ...(init as any), dispatcher } as any) as any;
-      // Force HTTP/SSE for deterministic proxy routing. The upstream Codex
-      // adapter otherwise prefers WebSocket, whose proxy path is runtime-specific.
-      return provider.streamSimple(model, context, {
-        ...options,
-        env,
-        fetch: routedFetch,
-        transport: "sse",
-      });
+  // The second OAuth account uses the exact same Codex protocol and network
+  // route. Canonicalizing internally preserves Codex-specific reasoning/tool
+  // semantics; mapping output back keeps session resume tied to account B.
+  pi.registerProvider("openai-codex-second", {
+    api: "openai-codex-responses",
+    streamSimple: async (model, context, options) => {
+      const canonicalModel = { ...model, provider: "openai-codex" } as Model<any>;
+      const canonicalContext: Context = {
+        ...context,
+        messages: context.messages.map(canonicalizeSecondaryCodexMessage),
+      };
+      const source = await streamCodexWithPrimaryRoute(canonicalModel, canonicalContext, options);
+      const { createAssistantMessageEventStream } = await import(
+        `${PI_ROOT}/node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js`
+      );
+      return bridgeSecondaryCodexStream(source, model, createAssistantMessageEventStream);
     },
   });
 
-  // Codex defaults to xhigh whenever selected. Other providers keep their own level.
+  // Codex defaults to xhigh whenever either account is selected.
   pi.on("model_select", async (event) => {
-    if (event.model.provider === "openai-codex" && pi.getThinkingLevel() !== "xhigh") {
+    if (
+      (event.model.provider === "openai-codex" || event.model.provider === "openai-codex-second") &&
+      pi.getThinkingLevel() !== "xhigh"
+    ) {
       pi.setThinkingLevel("xhigh");
     }
   });
 
   pi.on("session_shutdown", async () => {
-    await Promise.allSettled([
-      directDispatcher.close(),
-      ...Array.from(proxyDispatchers.values(), (dispatcher) => dispatcher.close()),
-    ]);
-    proxyDispatchers.clear();
+    await Promise.allSettled([transport.close()]);
   });
 
   pi.registerCommand("provider-routing", {
@@ -664,10 +694,11 @@ export default function providerRouting(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       ctx.ui.notify("⟳ 正在测试 alibaba relay...", "info");
       try {
+        const apiKey = await ctx.modelRegistry.getApiKeyForProvider("claude-relay-alibaba");
         const headers = new Headers();
         headers.set("Content-Type", "application/json");
         headers.set("anthropic-version", "2023-06-01");
-        headers.set("x-api-key", authData["claude-relay-alibaba"]?.key ?? "");
+        headers.set("x-api-key", apiKey ?? "");
         headers.set("x-claude-code-session-id", alibabaSessionId);
         headers.set("user-agent", "claude-code/1.0");
         const body = JSON.stringify({
@@ -678,15 +709,18 @@ export default function providerRouting(pi: ExtensionAPI) {
         });
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 15_000);
-        const resp = await undiciFetch(alibaba.baseUrl + "/v1/messages" as any, {
-          method: "POST",
-          headers,
-          body,
-          dispatcher: directDispatcher,
-          signal: controller.signal,
-        } as any);
-        clearTimeout(timer);
-        const status = (resp as any).status;
+        let resp: Response;
+        try {
+          resp = await transport.fetch(alibaba.baseUrl + "/v1/messages", {
+            method: "POST",
+            headers,
+            body,
+            signal: controller.signal,
+          }, { rejectUnauthorized: false });
+        } finally {
+          clearTimeout(timer);
+        }
+        const status = resp.status;
         const text = await (resp as any).text();
         if (status === 200 && text.includes("message_start")) {
           ctx.ui.notify(`✅ alibaba relay 正常 (HTTP ${status}, 流式响应圴序)`, "info");
@@ -699,4 +733,8 @@ export default function providerRouting(pi: ExtensionAPI) {
       }
     },
   });
+}
+
+export default function providerRouting(pi: ExtensionAPI) {
+  registerProviderRouting(pi);
 }

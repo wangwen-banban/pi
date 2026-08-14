@@ -11,9 +11,10 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { getCodexCachePath, getCodexProviderId } from "../weekly-usage-status/codex-provider.ts";
 
-const CODEX_WEEKLY_CACHE = join(homedir(), ".pi", "agent", "cache", "codex-weekly-usage.json");
-const ROUTING_PATH = join(homedir(), ".pi", "agent", "provider-routing.json");
+const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+const ROUTING_PATH = join(AGENT_DIR, "provider-routing.json");
 
 function readProxyMode(provider: string): string {
 	try {
@@ -33,9 +34,11 @@ interface CodexQuota {
 	resetsAt?: number;
 }
 
-function readCodexQuota(): CodexQuota {
+function readCodexQuota(provider: unknown): CodexQuota {
+	const codexProvider = getCodexProviderId(provider);
+	if (!codexProvider) return { remaining: null };
 	try {
-		const data = JSON.parse(readFileSync(CODEX_WEEKLY_CACHE, "utf8")) as {
+		const data = JSON.parse(readFileSync(getCodexCachePath(AGENT_DIR, codexProvider), "utf8")) as {
 			remainingPercent?: unknown;
 			resetsAt?: unknown;
 		};
@@ -115,7 +118,7 @@ export default function (pi: ExtensionAPI) {
 					const contextRemainingTokens = contextUsage?.tokens == null || contextTotal == null
 						? null
 						: Math.max(0, contextTotal - contextUsage.tokens);
-					const codexQuota = readCodexQuota();
+					const codexQuota = readCodexQuota(providerId);
 					const codexRemaining = codexQuota.remaining;
 					const codexReset = formatResetCountdown(codexQuota.resetsAt);
 					const barWidth = Math.min(10, Math.max(4, Math.floor(width * 0.055)));

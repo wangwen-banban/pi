@@ -5,6 +5,9 @@ subagent-runs/
 # Cache (auto-rebuilt)
 cache/
 
+# Local credentials (OAuth access/refresh tokens and API keys)
+auth.json
+
 # Backup files
 *.bak-*
 
