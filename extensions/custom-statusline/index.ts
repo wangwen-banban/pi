@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { getCodexCachePath, getCodexProviderId } from "../weekly-usage-status/codex-provider.ts";
+import { createActiveModelState, getRoutingProviderForStatusline } from "./model-state.ts";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 const ROUTING_PATH = join(AGENT_DIR, "provider-routing.json");
@@ -19,7 +20,7 @@ const ROUTING_PATH = join(AGENT_DIR, "provider-routing.json");
 function readProxyMode(provider: string): string {
 	try {
 		const data = JSON.parse(readFileSync(ROUTING_PATH, "utf8")) as { providers?: Record<string, { mode?: string; proxyUrl?: string }> };
-		const entry = data.providers?.[provider];
+		const entry = data.providers?.[getRoutingProviderForStatusline(provider)];
 		if (!entry) return "direct";
 		if (entry.mode === "proxy") return `proxy:${entry.proxyUrl ?? "?"}`.replace(/^proxy:http:\/\//, "proxy:");
 		return entry.mode ?? "direct";
@@ -70,15 +71,19 @@ function formatResetCountdown(resetsAt: number | undefined, nowMs = Date.now()):
 export default function (pi: ExtensionAPI) {
 	let streaming = false;
 	let turnCount = 0;
+	const activeModel = createActiveModelState();
 
 	pi.on("session_start", async (_event, ctx) => {
+		activeModel.set(ctx.model);
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			const unsub = footerData.onBranchChange(() => tui.requestRender());
+			const unbindModelRender = activeModel.bindRender(() => tui.requestRender());
 			const refreshTimer = setInterval(() => tui.requestRender(), 30_000);
 			refreshTimer.unref?.();
 
 			return {
 				dispose() {
+					unbindModelRender();
 					unsub();
 					clearInterval(refreshTimer);
 				},
@@ -105,8 +110,9 @@ export default function (pi: ExtensionAPI) {
 					const branch = footerData.getGitBranch();
 
 					// --- Model info ---
-					const modelId = ctx.model?.id ?? "no-model";
-					const providerId = (ctx.model as any)?.provider ?? "";
+					const model = activeModel.get() ?? ctx.model;
+					const modelId = model?.id ?? "no-model";
+					const providerId = model?.provider ?? "";
 
 					// --- Remaining quota/context bars ---
 					// Both bars mean the same thing: more filled cells = more capacity remaining.
@@ -114,7 +120,7 @@ export default function (pi: ExtensionAPI) {
 					const contextRemaining = contextUsage?.percent == null
 						? null
 						: Math.max(0, Math.min(100, 100 - contextUsage.percent));
-					const contextTotal = contextUsage?.contextWindow ?? ctx.model?.contextWindow ?? null;
+					const contextTotal = contextUsage?.contextWindow ?? model?.contextWindow ?? null;
 					const contextRemainingTokens = contextUsage?.tokens == null || contextTotal == null
 						? null
 						: Math.max(0, contextTotal - contextUsage.tokens);
@@ -180,6 +186,10 @@ export default function (pi: ExtensionAPI) {
 			),
 			intervalMs: 80,
 		});
+	});
+
+	pi.on("model_select", async (event) => {
+		activeModel.set(event.model);
 	});
 
 	pi.on("turn_start", async () => {
