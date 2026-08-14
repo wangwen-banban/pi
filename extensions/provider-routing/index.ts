@@ -313,6 +313,22 @@ export default function providerRouting(pi: ExtensionAPI) {
         const headers = new Headers((init as any)?.headers);
         headers.set("x-claude-code-session-id", alibabaSessionId);
         headers.set("user-agent", "claude-code/1.0");
+
+        // Fix thinking format: alibaba only supports adaptive, not "enabled".
+        // This is a defensive fix in case pi-ai sends the old format.
+        if ((init as any)?.body && typeof (init as any).body === "string") {
+          try {
+            const reqBody = JSON.parse((init as any).body);
+            if (reqBody.thinking?.type === "enabled") {
+              const budget = reqBody.thinking.budget_tokens ?? reqBody.max_tokens ?? 8000;
+              const effort = budget >= 32000 ? "max" : budget >= 16000 ? "xhigh" : budget >= 8000 ? "high" : budget >= 4000 ? "medium" : "low";
+              reqBody.thinking = { type: "adaptive" };
+              reqBody.output_config = { effort };
+              (init as any) = { ...(init as any), body: JSON.stringify(reqBody) };
+            }
+          } catch { /* non-JSON body, pass through */ }
+        }
+
         // 90s timeout: if alibaba hangs without responding, abort.
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 90_000);
@@ -347,12 +363,21 @@ export default function providerRouting(pi: ExtensionAPI) {
             return resp as any;
           }
           const peek = new TextDecoder().decode(firstChunk).slice(0, 512);
-          const errMatch = peek.match(/data:\s*\{"error":\{"message":"([^"]+)"/);
-          if (errMatch) {
+          // Extract alibaba error message. Their format wraps the real message
+          // in nested JSON, so we use a broader capture and then parse it.
+          const extractAlibabaError = (text: string): string | null => {
+            const m = text.match(/data:\s*\{"error":\{"message":"((?:[^"\\]|\\.)*)"/);
+            if (!m) return null;
+            try { return JSON.parse('"' + m[1] + '"'); } catch { return m[1]; }
+          };
+          const firstErr = extractAlibabaError(peek);
+          if (firstErr) {
             reader.releaseLock();
-            throw new Error(`[alibaba] ${errMatch[1]}`);
+            throw new Error(`[alibaba] ${firstErr}`);
           }
           // Reassemble: put the peeked chunk back in front of the rest.
+          // Also monitor ALL subsequent chunks for alibaba's mid-stream error
+          // format (error can appear after initial message_start + thinking blocks).
           const reconstructed = new ReadableStream({
             start(controller) {
               controller.enqueue(firstChunk);
@@ -360,6 +385,16 @@ export default function providerRouting(pi: ExtensionAPI) {
             async pull(controller) {
               const { value, done: d } = await reader.read();
               if (d) { controller.close(); return; }
+              // Check every chunk for alibaba inline errors
+              const text = new TextDecoder().decode(value);
+              const midErr = extractAlibabaError(text);
+              if (midErr) {
+                // Signal error on the stream. The downstream Anthropic SDK / pi-ai
+                // SSE parser will catch this as an iteration error and surface it.
+                controller.error(new Error(`[alibaba] ${midErr}`));
+                reader.releaseLock();
+                return;
+              }
               controller.enqueue(value);
             },
             cancel() { reader.releaseLock(); },
