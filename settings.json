@@ -1,9 +1,9 @@
 {
   "lastChangelogVersion": "0.84.1",
   "theme": "dark",
-  "defaultProvider": "claude-relay",
-  "defaultModel": "claude-opus-4-6[1m]",
-  "defaultThinkingLevel": "high",
+  "defaultProvider": "claude-relay-alibaba",
+  "defaultModel": "claude-opus-5",
+  "defaultThinkingLevel": "xhigh",
   "skills": [
     "~/.code-helper/skills"
   ],

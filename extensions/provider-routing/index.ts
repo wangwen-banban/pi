@@ -313,11 +313,23 @@ export default function providerRouting(pi: ExtensionAPI) {
         const headers = new Headers((init as any)?.headers);
         headers.set("x-claude-code-session-id", alibabaSessionId);
         headers.set("user-agent", "claude-code/1.0");
-        const resp = await (undiciFetch as Function)(input, {
-          ...(init as any),
-          headers,
-          dispatcher: directDispatcher,
-        });
+        // 90s timeout: if alibaba hangs without responding, abort.
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 90_000);
+        let resp: any;
+        try {
+          resp = await (undiciFetch as Function)(input, {
+            ...(init as any),
+            headers,
+            dispatcher: directDispatcher,
+            signal: controller.signal,
+          });
+        } catch (e: any) {
+          clearTimeout(timeout);
+          if (e?.name === "AbortError") throw new Error("[alibaba] 请求超时 (90s)");
+          throw e;
+        }
+        clearTimeout(timeout);
         // Alibaba sometimes returns HTTP 200 with SSE body containing only:
         //   data: {"error":{"message":"...","type":"..."},"type":"error"}
         //   data: [DONE]
@@ -459,6 +471,47 @@ export default function providerRouting(pi: ExtensionAPI) {
         ([provider, route]) => `${provider}: ${route.mode}${route.proxyUrl ? ` (${route.proxyUrl})` : ""}`,
       );
       ctx.ui.notify(`${ROUTING_PATH}\n${lines.join("\n")}`, "info");
+    },
+  });
+
+  pi.registerCommand("check-alibaba", {
+    description: "测试 alibaba relay 连通性",
+    handler: async (_args, ctx) => {
+      ctx.ui.notify("⟳ 正在测试 alibaba relay...", "info");
+      try {
+        const headers = new Headers();
+        headers.set("Content-Type", "application/json");
+        headers.set("anthropic-version", "2023-06-01");
+        headers.set("x-api-key", authData["claude-relay-alibaba"]?.key ?? "");
+        headers.set("x-claude-code-session-id", alibabaSessionId);
+        headers.set("user-agent", "claude-code/1.0");
+        const body = JSON.stringify({
+          model: alibaba.requestModelId,
+          max_tokens: 32,
+          stream: true,
+          messages: [{ role: "user", content: "hi" }],
+        });
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 15_000);
+        const resp = await undiciFetch(alibaba.baseUrl + "/v1/messages" as any, {
+          method: "POST",
+          headers,
+          body,
+          dispatcher: directDispatcher,
+          signal: controller.signal,
+        } as any);
+        clearTimeout(timer);
+        const status = (resp as any).status;
+        const text = await (resp as any).text();
+        if (status === 200 && text.includes("message_start")) {
+          ctx.ui.notify(`✅ alibaba relay 正常 (HTTP ${status}, 流式响应圴序)`, "info");
+        } else {
+          const msg = text.match(/"message":"([^"]{1,120})"/)?.[1] ?? text.slice(0, 200);
+          ctx.ui.notify(`❌ alibaba relay 异常: HTTP ${status} — ${msg}`, "error");
+        }
+      } catch (e: any) {
+        ctx.ui.notify(`❌ alibaba relay 连接失败: ${String(e?.message ?? e).slice(0, 200)}`, "error");
+      }
     },
   });
 }
