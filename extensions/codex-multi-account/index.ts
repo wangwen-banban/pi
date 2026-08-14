@@ -6,9 +6,8 @@ import type {
   Message,
   Model,
 } from "@earendil-works/pi-ai";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 
-const PI_ROOT = "/Users/wenwang/.nvm/versions/node/v22.22.2/lib/node_modules/@earendil-works/pi-coding-agent";
-const PI_AI_ROOT = `${PI_ROOT}/node_modules/@earendil-works/pi-ai/dist`;
 const PRIMARY_PROVIDER = "openai-codex";
 const SECONDARY_PROVIDER = "openai-codex-second";
 
@@ -131,9 +130,8 @@ export const __testing = {
 };
 
 export default async function codexMultiAccount(pi: ExtensionAPI): Promise<void> {
-  const { openaiCodexProvider } = await import(`${PI_AI_ROOT}/providers/openai-codex.js`);
-
-  const primary = openaiCodexProvider();
+  const primary = builtinProviders().find((provider) => provider.id === PRIMARY_PROVIDER);
+  if (!primary) throw new Error("Built-in openai-codex provider is unavailable");
   if (!("oauth" in primary.auth)) throw new Error("Built-in openai-codex OAuth provider is unavailable");
   const primaryOAuth = primary.auth.oauth;
   const primaryModels = await primary.getModels();

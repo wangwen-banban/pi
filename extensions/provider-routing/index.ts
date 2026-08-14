@@ -1,4 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  createAssistantMessageEventStream,
+  getApiProvider,
+} from "@earendil-works/pi-ai";
 import type { Model, SimpleStreamOptions, Context, AssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -13,8 +17,6 @@ import {
 } from "./transport.ts";
 
 
-const PI_ROOT = "/Users/wenwang/.nvm/versions/node/v22.22.2/lib/node_modules/@earendil-works/pi-coding-agent";
-const PI_AI_COMPAT = `${PI_ROOT}/node_modules/@earendil-works/pi-ai/dist/compat.js`;
 const ROUTING_PATH = join(homedir(), ".pi", "agent", "provider-routing.json");
 
 interface RouteEntry {
@@ -53,12 +55,6 @@ function withRouteEnv(base: Record<string, string> | undefined, route: RouteEntr
     env.HTTPS_PROXY = route.proxyUrl!;
   }
   return env;
-}
-
-let compatPromise: Promise<any> | undefined;
-function compat(): Promise<any> {
-  compatPromise ??= import(PI_AI_COMPAT);
-  return compatPromise;
 }
 
 /** Errors that should trigger a retry (typically happen before content starts streaming) */
@@ -324,7 +320,7 @@ export function registerProviderRouting(
       context: Context,
       options?: SimpleStreamOptions,
     ): Promise<AssistantMessageEventStream> => {
-      const provider = (await compat()).getApiProvider("anthropic-messages");
+      const provider = getApiProvider("anthropic-messages");
       const env = withRouteEnv(options?.env, alibaba);
       // Filter out web_search tool — alibaba idealab rejects it (confuses with Anthropic built-in server tool)
       const filteredContext: Context = {
@@ -424,9 +420,6 @@ export function registerProviderRouting(
         }
         return resp as any;
       };
-      const { createAssistantMessageEventStream } = await import(
-        `${PI_ROOT}/node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js`
-      );
       return streamWithRetry(
         () => provider.streamSimple(model, filteredContext, { ...options, env, fetch: directFetch }),
         createAssistantMessageEventStream,
@@ -503,7 +496,7 @@ export function registerProviderRouting(
       context: Context,
       options?: SimpleStreamOptions,
     ): Promise<AssistantMessageEventStream> => {
-      const provider = (await compat()).getApiProvider("anthropic-messages");
+      const provider = getApiProvider("anthropic-messages");
       const env = withRouteEnv(options?.env, bigData);
       const filteredContext: Context = {
         ...context,
@@ -567,9 +560,6 @@ export function registerProviderRouting(
         }
         return resp as any;
       };
-      const { createAssistantMessageEventStream } = await import(
-        `${PI_ROOT}/node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js`
-      );
       return streamWithRetry(
         () => provider.streamSimple(model, filteredContext, { ...options, env, fetch: directFetch }),
         createAssistantMessageEventStream,
@@ -605,7 +595,7 @@ export function registerProviderRouting(
       context: Context,
       options?: SimpleStreamOptions,
     ): Promise<AssistantMessageEventStream> => {
-      const provider = (await compat()).getApiProvider("anthropic-messages");
+      const provider = getApiProvider("anthropic-messages");
       const env = withRouteEnv(options?.env, relay);
       const requestModel = { ...model, id: relay.requestModelId! };
       const directFetch: typeof fetch = (input, init) =>
@@ -619,7 +609,7 @@ export function registerProviderRouting(
     context: Context,
     options?: SimpleStreamOptions,
   ): Promise<AssistantMessageEventStream> => {
-    const provider = (await compat()).getApiProvider("openai-codex-responses");
+    const provider = getApiProvider("openai-codex-responses");
     const route = routeFor("openai-codex");
     const env = withRouteEnv(options?.env, route);
     if (route.mode !== "proxy") {
@@ -657,9 +647,6 @@ export function registerProviderRouting(
         messages: context.messages.map(canonicalizeSecondaryCodexMessage),
       };
       const source = await streamCodexWithPrimaryRoute(canonicalModel, canonicalContext, options);
-      const { createAssistantMessageEventStream } = await import(
-        `${PI_ROOT}/node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js`
-      );
       return bridgeSecondaryCodexStream(source, model, createAssistantMessageEventStream);
     },
   });

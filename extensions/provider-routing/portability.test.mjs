@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import http from "node:http";
 import { describe, it } from "node:test";
 
-import { registerProviderRouting } from "./index.ts";
 import { createRoutedHttpTransport } from "./transport.ts";
 
 function missingUndici() {
@@ -22,48 +23,34 @@ function close(server) {
   });
 }
 
-describe("provider-routing undici portability", () => {
-  it("loads and registers every route when undici cannot be resolved", async () => {
-    const providers = [];
-    const commands = [];
-    const eventHandlers = new Map();
-    let resolverCalls = 0;
-    const pi = {
-      registerProvider(id, provider) {
-        providers.push({ id, provider });
-      },
-      registerCommand(name, command) {
-        commands.push({ name, command });
-      },
-      on(name, handler) {
-        eventHandlers.set(name, handler);
-      },
-      getThinkingLevel() {
-        return "medium";
-      },
-    };
+describe("provider-routing module and transport portability", () => {
+  it("loads through pi virtual modules without fixed npm/nvm paths", () => {
+    const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+    assert.match(source, /from "@earendil-works\/pi-ai"/);
+    assert.doesNotMatch(source, /PI_ROOT|PI_AI_COMPAT|\/Users\/[^/]+\/\.nvm/);
+    assert.doesNotMatch(source, /node_modules\/@earendil-works\/pi-ai\/dist/);
 
-    assert.doesNotThrow(() => registerProviderRouting(pi, {
-      loadUndici() {
-        resolverCalls += 1;
-        return missingUndici();
-      },
-    }));
-
-    assert.equal(resolverCalls, 1);
-    assert.deepEqual(
-      providers.map(({ id }) => id).sort(),
+    const result = spawnSync(
+      "pi",
       [
-        "big-data-claude",
-        "claude-relay",
-        "claude-relay-alibaba",
-        "openai-codex",
+        "--provider",
         "openai-codex-second",
+        "--model",
+        "gpt-5.6-sol",
+        "--no-session",
+        "-p",
+        "Reply exactly PROVIDER-ROUTING-LOAD-OK",
       ],
+      { encoding: "utf8", timeout: 120_000 },
     );
-    assert.ok(commands.some((command) => command.name === "check-alibaba"));
-    assert.equal(typeof eventHandlers.get("session_shutdown"), "function");
-    await eventHandlers.get("session_shutdown")();
+    const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+    assert.notEqual(result.error?.code, "ENOENT", "pi executable must be available");
+    assert.doesNotMatch(output, /Failed to load extension|Cannot find module/);
+    assert.ok(
+      output.includes("PROVIDER-ROUTING-LOAD-OK") ||
+        output.includes("No API key found for openai-codex-second"),
+      `provider routing did not load correctly:\n${output.slice(0, 500)}`,
+    );
   });
 
   it("uses CONNECT for HTTPS routes such as openai-codex on the Node fallback", async (t) => {

@@ -1,20 +1,18 @@
 # Pi Agent Configuration
 
-Personal [Pi](https://github.com/earendil-works/pi-coding-agent) agent configuration with custom extensions, provider routing, and workflow enhancements.
+Personal [pi](https://github.com/badlogic/pi-mono) configuration with multi-provider routing, plan mode, sub-agents, multi-account Codex OAuth, BTW side conversations, web search, and a custom status line.
 
-## Features
-
-### 🔀 Multi-Provider Routing
-
-Per-provider proxy configuration — different providers use different network paths.
+## Provider Routing
 
 | Provider | Mode | Description |
 |----------|------|-------------|
-| `claude-relay` | Direct | Claude 中转站（原 code-helper） |
-| `claude-relay-alibaba` | Direct | Claude 中转站（Alibaba idealab，支持 opus-5） |
-| `openai-codex` | Proxy | OpenAI Codex，走 `127.0.0.1:10808` |
+| `claude-relay` | Direct | Claude relay |
+| `claude-relay-alibaba` | Direct | Alibaba ideaLAB relay, including Opus 5 |
+| `big-data-claude` | Direct | Big Data Claude relay |
+| `openai-codex` | Configurable | Primary Codex OAuth account |
+| `openai-codex-second` | Follows primary | Secondary Codex OAuth account; shares the primary route |
 
-Edit `provider-routing.json` to change proxy port or mode:
+Edit `provider-routing.json` to change the primary Codex route:
 
 ```json
 {
@@ -27,93 +25,110 @@ Edit `provider-routing.json` to change proxy port or mode:
 }
 ```
 
-### 📋 Plan Mode
+`openai-codex-second` automatically follows this direct/proxy setting. Its OAuth credentials and quota cache remain independent from the primary account.
 
-Claude Code–style plan mode with tool-enforced workflow control:
-
-- Model calls `enter_plan_mode` → write tools (bash/edit/write) **blocked**
-- Model uses `ask_user` → interactive TUI option cards + free-form "Other" input
-- Model calls `exit_plan_mode` → plan rendered for user approval/rejection/feedback
-- User approves → write tools unblocked → implementation begins
-
-Manual toggle: `/plan`, `/plan off`, `/plan <reason>`
-
-### 🤖 Smart Sub-agents
-
-Automatic task delegation with model routing:
-
-| Complexity | Model | Thinking |
-|-----------|-------|----------|
-| simple | gpt-5.4-mini | medium |
-| medium | gpt-5.5 | medium |
-| complex | gpt-5.6-sol | max |
-| critical | gpt-5.6-sol | max |
-
-Sub-agent completions are delivered as **follow-up messages** (not steering interrupts), preserving the parent task's continuity.
-
-### 📊 Custom Status Line
-
-Two-line footer with real-time information:
-
-```
-● ⚡DIRECT THINK high T3 ↑12.5k ↓3.2k       claude-relay/claude-opus-4-6[1m] ⎇ main
-CODEX WEEK 72% ███████░░░   CTX 84% ████████░░ 840k/1.00M remaining
-```
-
-- Provider network mode indicator (⚡DIRECT / ⇄ proxy:…)
-- Thinking level display
-- Token usage (input/output/cache)
-- Codex weekly quota remaining (progress bar)
-- Context window remaining (progress bar + absolute values)
-
-### 🌐 Codex Web Search
-
-Web search tool for current/time-sensitive information lookup.
-
-### 📈 Weekly Usage Status
-
-Tracks and displays OpenAI Codex weekly quota consumption.
-
-## Extensions
+## Main Extensions
 
 | Extension | Purpose |
 |-----------|---------|
-| `provider-routing` | Multi-provider proxy/direct routing + Claude relay registration |
-| `plan-mode` | Plan-first workflow with interactive approval |
-| `smart-subagents` | Concurrent task delegation with auto-routing |
-| `custom-statusline` | Enhanced two-line footer with progress bars |
-| `codex-web-search` | Live web search capability |
-| `weekly-usage-status` | Codex quota tracking |
+| `provider-routing` | Multi-provider direct/proxy transport, relay registration, retries, SSE error reporting |
+| `codex-multi-account` | Independent OAuth identity for `openai-codex-second` |
+| `plan-mode` | Tool-enforced read-only planning with interactive approval |
+| `smart-subagents` | Concurrent task delegation with model routing |
+| `btw` | Disposable multi-turn side conversations with optional `/keep` persistence |
+| `custom-statusline` | Provider, thinking, token, context, and Codex quota status |
+| `codex-web-search` | Live web search |
+| `weekly-usage-status` | Per-account Codex weekly quota tracking |
 
-## Files
+The provider transport uses pi's official virtual modules. It does not depend on a fixed nvm/npm installation path. If `undici` is unavailable, it falls back to a Node-core HTTP(S) transport supporting direct requests, HTTP(S) proxies, CONNECT tunnels, streaming, aborts, and relay TLS compatibility.
 
-| File | Purpose |
-|------|---------|
-| `auth.json` | Provider credentials (⚠️ sensitive) |
-| `provider-routing.json` | Per-provider network mode and endpoints |
-| `subagents.json` | Sub-agent model routing table |
-| `models-store.json` | Cached model catalog |
-| `settings.json` | Pi settings |
-| `AGENTS.md` | Global agent behavior instructions |
-
-## Setup on New Machine
+## Setup on a New Machine
 
 ```bash
-# Clone
-git clone git@github.com:wangwen-banban/pi.git ~/.pi/agent
-
-# Install Pi
+# Install pi
 npm install -g @earendil-works/pi-coding-agent
 
-# Done — reload or restart Pi
+# Clone this configuration
+git clone git@github.com:wangwen-banban/pi.git ~/.pi/agent
+
+# Ensure helper scripts are executable
+chmod +x ~/.pi/agent/scripts/*.sh
+
+# Start pi
+pi
 ```
 
-## Security
+`auth.json` is intentionally excluded from Git and will not be present after cloning.
 
-⚠️ This repo contains API keys in `auth.json`. **Keep it private.**
-
-If credentials are rotated, update `auth.json` and push:
+- For Codex accounts, use `/login` to authorize on the new machine.
+- For custom API providers, recreate the API keys locally or transfer `auth.json` through a secure channel.
+- Keep local credential permissions restricted:
 
 ```bash
-cd ~/.pi/agent && git add -A && git commit -m "rotate keys" && git push
+chmod 600 ~/.pi/agent/auth.json
 ```
+
+## Second Codex Account
+
+1. Run `/reload` after updating the configuration.
+2. Run `/login`.
+3. Select `openai-codex-second`.
+4. Prefer **Device Code** authentication.
+5. Open the authorization URL in an incognito window or a separate browser profile logged into account B.
+6. Run `/model` and select a model under `openai-codex-second`.
+
+After both accounts are authorized, switch accounts through `/model`; repeated logout/login is not required. The footer and `/weekly` use the quota belonging to the currently selected provider.
+
+## Plan Mode
+
+- `enter_plan_mode` blocks write tools.
+- `ask_user` displays interactive choices.
+- `exit_plan_mode` presents a plan for approval.
+- Approval restores write access.
+
+Manual commands: `/plan`, `/plan off`, `/plan <reason>`.
+
+## Credential Security
+
+- `auth.json` is local-only, ignored by Git, and must remain mode `600`.
+- Never force-add `auth.json` with `git add -f`.
+- Never paste complete API keys, OAuth access tokens, or refresh tokens into chat, issues, screenshots, logs, or documentation.
+- Before committing, inspect staged content with `git diff --cached`.
+- If a credential may have leaked, revoke or rotate it at the provider first, then update the local credential. Deleting a file or rewriting Git history does **not** invalidate an old token.
+- If credentials entered Git history, remove them from all history and force-push, but still rotate every affected credential.
+- For Codex OAuth exposure, revoke relevant sessions/authorization in account security settings and run `/login` again.
+
+Use explicit paths when committing:
+
+```bash
+cd ~/.pi/agent
+git status --short
+git add <files-or-directories-to-commit>
+git diff --cached
+git commit -m "update: describe change"
+git push origin main
+```
+
+Avoid an unchecked `git add -A`.
+
+## Troubleshooting
+
+### `Cannot find module .../pi-ai/dist/...`
+
+Update the repository and restart pi:
+
+```bash
+cd ~/.pi/agent
+git pull --rebase origin main
+pi
+```
+
+Current extensions load `pi-ai` through pi's virtual module API rather than a hardcoded `~/.nvm/.../node_modules` path.
+
+### `Cannot find module 'undici'`
+
+The current provider transport treats `undici` as optional and uses its Node-core fallback when unavailable. If this error still appears, an old copy of `extensions/provider-routing/index.ts` is being loaded; update the repository and restart pi.
+
+### Existing clone after security history rewrite
+
+The repository history was rewritten to remove `auth.json`. For an old clone, the safest migration is a fresh clone. Preserve local-only configuration and credentials separately; never copy them back into Git tracking.
