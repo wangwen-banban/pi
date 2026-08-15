@@ -17,6 +17,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Key, Markdown, Spacer, Text, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { getPiInvocation } from "./pi-invocation.ts";
 import {
 	DEFAULT_CONFIG,
 	THINKING_LEVELS,
@@ -407,17 +408,6 @@ function buildContextPacket(
 		`## Parent context (${route.contextMode})`,
 		inheritedContext,
 	].join("\n");
-}
-
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
-	const execName = path.basename(process.execPath).toLowerCase();
-	if (!/^(node|bun)(\.exe)?$/.test(execName)) return { command: process.execPath, args };
-	return { command: "pi", args };
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {

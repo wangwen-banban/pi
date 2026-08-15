@@ -8,6 +8,7 @@ Global pi extension for asynchronous, automatically routed sub-agents.
 - Selects an authenticated model and supported thinking level from `~/.pi/agent/subagents.json`.
 - Chooses `isolated`, `selected`, `summary`, or `full` parent-context inheritance.
 - Runs each worker in an isolated `pi --mode json --no-session --no-extensions` process.
+- Works identically from native Pi and PI WEB sessions: embedded PI WEB runtimes resolve the standalone `pi` CLI instead of accidentally re-executing the hosting `sessiond.js`.
 - Shares the parent's working directory while keeping conversation context isolated.
 - Delivers completion immediately through lifecycle events and a visible `steer` message instead of polling. It enters at the next safe agent-loop boundary without aborting an in-flight response or tool call.
 - Shows the effective model, thinking level, context mode, permission, and status in the TUI; completed rows disappear after 60 seconds.
@@ -173,6 +174,21 @@ While the parent is generating:
 - `Enter` submits the editor text as a steering message for the current turn.
 - `Tab` submits non-empty editor text as a follow-up queued for the next turn.
 - When pi is idle, `Tab` keeps its normal completion/indent behavior.
+
+## PI WEB compatibility
+
+PI WEB embeds the Pi SDK inside its session daemon, so `process.argv[1]` points to
+`pi-web/dist/server/sessiond.js`, not the Pi CLI. PI WEB marks that environment
+with `PI_WEB_SESSION=1`; the worker launcher uses this marker to invoke the
+standalone `pi` command from `PATH`. The child still inherits the configured
+`PI_CODING_AGENT_DIR`, authentication, model registry, working directory, and
+worker arguments, matching native Pi dispatch behavior without starting or
+connecting to another PI WEB daemon.
+
+After changing this extension, run the **`/reload` command** inside the PI WEB
+session. That command clears Pi's extension cache and rebuilds the runtime; the
+sidebar **Reload Session** action only reopens the session JSONL and may reuse a
+cached extension factory. The session daemon itself does not need to restart.
 
 ## Reload
 
