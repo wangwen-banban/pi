@@ -57,6 +57,9 @@ chmod +x ~/.pi/agent/scripts/*.sh
 # Restore the provider-first, model-second selector package patch
 ~/.pi/agent/scripts/apply-model-selector-patch.sh
 
+# Install and start the loopback-only PI WEB user services
+~/.pi/agent/scripts/setup-pi-web.sh
+
 # Start pi
 pi
 ```
@@ -100,6 +103,69 @@ Install or verify it with:
 The installer locates the global pi package without assuming a fixed nvm path. It only patches the exact supported official version/hash, applies changes in a temporary file, validates JavaScript syntax and the final hash, and safely refuses unknown or modified installations.
 
 An npm update may replace the patched vendor file. Run `--check` after updating pi. If the installed version is newer than `0.84.1`, do not force-copy the old JavaScript file; generate and validate a patch for the new version instead.
+
+## Remote Control with PI WEB
+
+[`@jmfederico/pi-web@1.202608.1`](https://github.com/jmfederico/pi-web) runs as an independent browser service compatible with Pi `0.84.1`. It is installed globally, not loaded as a Pi Extension, so it does not add `/pi-web` or extra extension code to normal Pi processes.
+
+The configured scope is intentionally small:
+
+- keep sessions alive and show replies, tool calls, status and errors in real time;
+- send steering/follow-up messages, stop work and answer `ask_user` prompts;
+- switch models and thinking levels;
+- browse only explicitly registered project folders, inspect Git status/diffs and use an emergency project terminal;
+- disable agent-created sessions, tracked subsessions, environment facts, Workspace Tasks, Relays and update plugins;
+- allow no external filesystem roots;
+- bind only to `127.0.0.1:8504`.
+
+The Files and Terminal views can modify project data. Only add trusted project folders; do not register the whole home directory or `/`.
+
+### Install or repair
+
+```bash
+~/.pi/agent/scripts/setup-pi-web.sh
+```
+
+Verify without changing anything:
+
+```bash
+~/.pi/agent/scripts/setup-pi-web.sh --check
+```
+
+Open locally at <http://127.0.0.1:8504>. Use **Actions → Add Project**, enter one project directory, select its workspace, then start or resume a session.
+
+Useful commands:
+
+```bash
+pi-web status
+pi-web doctor
+pi-web version
+pi-web logs
+pi-web restart
+```
+
+### Private phone access with Tailscale
+
+1. Install [Tailscale for macOS](https://tailscale.com/download/mac) and sign in.
+2. Install Tailscale on the phone and sign in to the same Tailnet.
+3. Run on the Mac:
+
+```bash
+~/.pi/agent/scripts/setup-pi-web-tailscale.sh
+```
+
+4. Open the private HTTPS URL printed by Tailscale on the phone. Test once over cellular data with Wi-Fi disabled.
+
+Check or disable it later:
+
+```bash
+~/.pi/agent/scripts/setup-pi-web-tailscale.sh --check
+~/.pi/agent/scripts/setup-pi-web-tailscale.sh --off
+```
+
+PI WEB has no general application-password layer. Tailnet identity and ACLs are the access boundary: enable MFA, allow only trusted devices/users, never expose port `8504` through the router, and never replace Serve with public `tailscale funnel`.
+
+Keep the home Mac awake, let PI WEB and Tailscale start after reboot, and retain SSH/Tailscale SSH as a backup repair path. Runtime config, state, logs and Tailscale identity remain local under `~/.config/pi-web/`, `~/.pi-web/` and Tailscale; none are committed.
 
 ## Plan Mode
 
