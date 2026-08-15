@@ -104,6 +104,53 @@ The installer locates the global pi package without assuming a fixed nvm path. I
 
 An npm update may replace the patched vendor file. Run `--check` after updating pi. If the installed version is newer than `0.84.1`, do not force-copy the old JavaScript file; generate and validate a patch for the new version instead.
 
+## Local TUI ↔ Phone/Web Session Handoff
+
+The local `pi` TUI and PI WEB (phone) write to the **same session JSONL file**, but each process keeps its own in-memory session state. They do not live-sync: messages sent from the phone appear in the file, but a still-open local TUI does not automatically pick them up.
+
+### Leaving home (local → phone)
+
+Nothing special needed. The phone's PI WEB page reads the session file directly and always shows the latest state, including everything you did locally.
+
+### Coming home (phone → local)
+
+The still-open local TUI is now stale: the phone appended messages the TUI has not seen. **Do not type in the stale TUI** — input would branch from an old position and fork the session tree.
+
+Instead, run the built-in `/sync` command (from the `session-sync` extension):
+
+1. Wait for the agent to finish (if running).
+2. Type `/sync`.
+3. The session reloads from disk, landing on the latest leaf — including all phone messages.
+
+The extension also watches the session file in the background. When it detects external writes (phone appending while the local TUI is idle), it shows a persistent warning:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  ⚠  Session was modified externally (phone/web).    │
+│                                                     │
+│  Run /sync to reload the latest state.              │
+│  Typing here now will branch from a stale position. │
+└─────────────────────────────────────────────────────┘
+```
+
+The warning clears automatically after `/sync` or any local activity.
+
+### If you already typed in a stale TUI (recovery)
+
+If you accidentally sent input from a stale position, the session file now contains a branch fork. Both branches are preserved — nothing is lost. To recover:
+
+1. Run `/sync` to reload the latest state.
+2. Run `/tree` to open the session tree.
+3. Navigate to the branch that contains the phone conversation.
+4. Select the last entry on that branch to continue from there.
+
+### Extension details
+
+- Extension: `extensions/session-sync/index.ts`
+- Test: `extensions/session-sync/test-drift.mjs`
+- Only active in TUI mode; RPC/print/JSON modes are unaffected.
+- `/sync` refuses to run while the agent is streaming (to avoid aborting active work).
+
 ## Remote Control with PI WEB
 
 [`@jmfederico/pi-web@1.202608.1`](https://github.com/jmfederico/pi-web) runs as an independent browser service compatible with Pi `0.84.1`. It is installed globally, not loaded as a Pi Extension, so it does not add `/pi-web` or extra extension code to normal Pi processes.
