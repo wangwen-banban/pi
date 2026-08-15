@@ -11,8 +11,8 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { getCodexCachePath, getCodexProviderId } from "../weekly-usage-status/codex-provider.ts";
 import { createActiveModelState, getRoutingProviderForStatusline } from "./model-state.ts";
+import { formatResetCountdown, readSubscriptionQuota, SUBSCRIPTION_PROVIDERS } from "./quota.ts";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 const ROUTING_PATH = join(AGENT_DIR, "provider-routing.json");
@@ -29,44 +29,6 @@ function readProxyMode(provider: string): string {
 	}
 }
 
-interface CodexQuota {
-	remaining: number | null;
-	/** Unix timestamp in seconds. */
-	resetsAt?: number;
-}
-
-function readCodexQuota(provider: unknown): CodexQuota {
-	const codexProvider = getCodexProviderId(provider);
-	if (!codexProvider) return { remaining: null };
-	try {
-		const data = JSON.parse(readFileSync(getCodexCachePath(AGENT_DIR, codexProvider), "utf8")) as {
-			remainingPercent?: unknown;
-			resetsAt?: unknown;
-		};
-		return {
-			remaining: typeof data.remainingPercent === "number" && Number.isFinite(data.remainingPercent)
-				? Math.max(0, Math.min(100, data.remainingPercent))
-				: null,
-			resetsAt: typeof data.resetsAt === "number" && Number.isFinite(data.resetsAt)
-				? data.resetsAt
-				: undefined,
-		};
-	} catch {
-		return { remaining: null };
-	}
-}
-
-function formatResetCountdown(resetsAt: number | undefined, nowMs = Date.now()): string | null {
-	if (!resetsAt) return null;
-	const seconds = Math.max(0, Math.floor(resetsAt - nowMs / 1000));
-	if (seconds === 0) return "now";
-	const days = Math.floor(seconds / 86_400);
-	const hours = Math.floor((seconds % 86_400) / 3_600);
-	const minutes = Math.floor((seconds % 3_600) / 60);
-	if (days > 0) return `${days}d ${hours}h`;
-	if (hours > 0) return `${hours}h ${minutes}m`;
-	return `${Math.max(1, minutes)}m`;
-}
 
 export default function (pi: ExtensionAPI) {
 	let streaming = false;
@@ -124,9 +86,10 @@ export default function (pi: ExtensionAPI) {
 					const contextRemainingTokens = contextUsage?.tokens == null || contextTotal == null
 						? null
 						: Math.max(0, contextTotal - contextUsage.tokens);
-					const codexQuota = readCodexQuota(providerId);
-					const codexRemaining = codexQuota.remaining;
-					const codexReset = formatResetCountdown(codexQuota.resetsAt);
+					// --- Subscription quota bar (only for subscription providers) ---
+					// Third-party API / pay-per-use providers are not in the registry and
+					// render no quota bar at all; the balance follows the active provider.
+					const subscriptionProvider = SUBSCRIPTION_PROVIDERS[providerId];
 					const barWidth = Math.min(10, Math.max(4, Math.floor(width * 0.055)));
 					const capacity = (label: string, remaining: number | null) => {
 						const valueColor = remaining == null
@@ -141,8 +104,14 @@ export default function (pi: ExtensionAPI) {
 						const value = remaining == null ? "N/A" : `${Math.round(remaining)}%`;
 						return `${theme.fg("muted", label)} ${theme.fg(valueColor, value)} ${cells}`;
 					};
-					const quotaBar = capacity("CODEX WEEK", codexRemaining) +
-						(codexReset ? ` ${theme.fg("dim", `RESET ${codexReset}`)}` : "");
+					let quotaBar = "";
+					if (subscriptionProvider) {
+						const quota = readSubscriptionQuota(AGENT_DIR, providerId);
+						if (quota) {
+							quotaBar = capacity(subscriptionProvider.label, quota.remaining) +
+								(quota.resetsAt ? ` ${theme.fg("dim", `RESET ${formatResetCountdown(quota.resetsAt)}`)}` : "");
+						}
+					}
 					const contextBar = capacity("CTX", contextRemaining);
 					const contextAmounts = contextTotal == null
 						? theme.fg("dim", "N/A")
@@ -173,7 +142,8 @@ export default function (pi: ExtensionAPI) {
 					const firstGap = Math.max(1, width - visibleWidth(firstLeft) - visibleWidth(firstRight));
 					const firstLine = firstLeft + " ".repeat(firstGap) + firstRight;
 
-					const secondLine = `${quotaBar}   ${contextBar} ${contextAmounts}`;
+					const secondSegments = [quotaBar, `${contextBar} ${contextAmounts}`].filter(Boolean);
+					const secondLine = secondSegments.join("   ");
 					return [truncateToWidth(firstLine, width), truncateToWidth(secondLine, width)];
 				},
 			};
