@@ -10,7 +10,37 @@
   },
   "context": {
     "maxFullChars": 40000,
-    "maxSelectedChars": 12000
+    "maxSelectedChars": 12000,
+    "selectedMessages": 6
+  },
+  "modelProfiles": {
+    "defaultTier": "B",
+    "models": {
+      "openai-codex/gpt-5.6-sol": {
+        "tier": "S",
+        "note": "最强推理，高风险/复杂任务"
+      },
+      "openai-codex/gpt-5.6-luna": {
+        "tier": "A",
+        "note": "快且便宜；开 max 思考后明显优于 5.5/5.4"
+      },
+      "openai-codex/gpt-5.5": {
+        "tier": "B",
+        "note": "通用编码与评审"
+      },
+      "openai-codex/gpt-5.4": {
+        "tier": "B",
+        "note": "通用编码与评审"
+      },
+      "openai-codex/gpt-5.4-mini": {
+        "tier": "C",
+        "note": "轻量快速，简单任务省钱"
+      },
+      "opencode-go/deepseek-v4-flash": {
+        "tier": "C",
+        "note": "日常主力，便宜快速"
+      }
+    }
   },
   "routes": {
     "simple": {

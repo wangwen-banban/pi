@@ -20,16 +20,24 @@ import { Type } from "typebox";
 import {
 	DEFAULT_CONFIG,
 	THINKING_LEVELS,
+	buildModelListText,
 	clampThinkingLevel,
 	fallbackComplexity,
 	fallbackPermission,
 	mergeConfig,
+	paginateModels,
 	parseClassifierDecision,
+	recentMessages,
+	resolveModelProfile,
 	scopesOverlap,
 	selectModelCandidates,
 	type ClassifierDecision,
 	type Complexity,
 	type ContextMode,
+	type EligibleModelDescriptor,
+	type ModelListOptions,
+	type ModelProfilesConfig,
+	type ParentMessage,
 	type PermissionMode,
 	type SmartSubagentConfig,
 	type ThinkingLevel,
@@ -98,6 +106,7 @@ interface Job extends JobSnapshot {
 	stopRequested: boolean;
 	lastProgressHookAt: number;
 	fallbackRoutes: RouteDecision[];
+	parentMessages: ParentMessage[];
 	parentConversation: string;
 	contextNotes: string;
 }
@@ -118,9 +127,21 @@ interface CompletionDetails {
 	job: JobSnapshot;
 }
 
+interface ModelListDetails {
+	scope: "session" | "all-authenticated";
+	totalEligible: number;
+	matched: number;
+	shown: number;
+	offset: number;
+	nextOffset?: number;
+	truncated: boolean;
+	models: EligibleModelDescriptor[];
+}
+
 interface RouterResult {
 	decision: ClassifierDecision;
 	usage?: Usage;
+	messages: ParentMessage[];
 	conversation: string;
 }
 
@@ -143,55 +164,64 @@ function textFromContent(content: unknown): string {
 		.join("\n");
 }
 
-function serializeParentConversation(ctx: ExtensionContext, maxChars: number): string {
-	const sections: string[] = [];
+function collectParentMessages(ctx: ExtensionContext): ParentMessage[] {
+	const messages: ParentMessage[] = [];
 	for (const entry of ctx.sessionManager.getBranch() as any[]) {
 		if (entry.type === "compaction" && typeof entry.summary === "string") {
-			sections.push(`Compaction summary:\n${entry.summary}`);
+			messages.push({ role: "assistant", text: `[Compaction summary]\n${entry.summary}` });
 			continue;
 		}
 		if (entry.type !== "message" || !entry.message) continue;
 		const role = entry.message.role;
 		if (role !== "user" && role !== "assistant") continue;
 		const text = textFromContent(entry.message.content).trim();
-		if (text) sections.push(`${role === "user" ? "User" : "Assistant"}: ${text}`);
+		if (text) messages.push({ role, text });
 	}
-	const full = sections.join("\n\n");
-	if (full.length <= maxChars) return full;
-	return `[Earlier parent conversation omitted]\n\n${full.slice(-maxChars)}`;
+	return messages;
 }
 
-function relevantExcerpts(conversation: string, task: string, maxChars: number): string {
-	if (!conversation.trim()) return "";
-	const terms = new Set(
-		task
-			.toLowerCase()
-			.split(/[^\p{L}\p{N}_./-]+/u)
-			.filter((term) => term.length >= 3)
-			.slice(0, 40),
-	);
-	const chunks = conversation.split(/\n\n+/).filter(Boolean);
-	const ranked = chunks
-		.map((chunk, index) => {
-			const lower = chunk.toLowerCase();
-			let score = index / Math.max(1, chunks.length) * 0.75;
-			for (const term of terms) if (lower.includes(term)) score += 1;
-			return { chunk, index, score };
-		})
-		.sort((a, b) => b.score - a.score)
-		.slice(0, 8)
-		.sort((a, b) => a.index - b.index);
-	let result = "";
-	for (const item of ranked) {
-		const next = result ? `${result}\n\n${item.chunk}` : item.chunk;
-		if (next.length > maxChars) break;
-		result = next;
-	}
-	return result || conversation.slice(-maxChars);
+function serializeMessages(messages: ParentMessage[]): string {
+	return messages
+		.map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${message.text}`)
+		.join("\n\n");
 }
 
 function resolveAvailableModel(models: Model<any>[], reference: string): Model<any> | undefined {
 	return models.find((model) => `${model.provider}/${model.id}` === reference);
+}
+
+function getEligibleModels(ctx: ExtensionContext): Model<any>[] {
+	const available = ctx.modelRegistry.getAvailable();
+	if (ctx.scopedModels.length === 0) return available;
+	const scopedRefs = new Set(
+		ctx.scopedModels.map(({ model }) => `${model.provider}/${model.id}`),
+	);
+	return available.filter((model) => scopedRefs.has(`${model.provider}/${model.id}`));
+}
+
+function describeEligibleModel(
+	ctx: ExtensionContext,
+	model: Model<any>,
+	profiles: ModelProfilesConfig,
+	currentRef: string | undefined,
+): EligibleModelDescriptor {
+	const ref = `${model.provider}/${model.id}`;
+	const profile = resolveModelProfile(profiles, ref);
+	return {
+		ref,
+		provider: model.provider,
+		providerName: ctx.modelRegistry.getProviderDisplayName(model.provider),
+		id: model.id,
+		name: model.name,
+		current: ref === currentRef,
+		...profile,
+		thinkingLevels: getSupportedThinkingLevels(model).map(String),
+		contextWindow: model.contextWindow,
+		maxTokens: model.maxTokens,
+		costInput: model.cost.input,
+		costOutput: model.cost.output,
+		costTiered: (model.cost.tiers?.length ?? 0) > 0,
+	};
 }
 
 function resolveRouterModel(
@@ -239,11 +269,17 @@ async function classifyAndSummarize(
 ): Promise<RouterResult> {
 	const expectedOutput = params.expectedOutput ?? "";
 	const contextNotes = params.contextNotes ?? "";
-	const conversation = serializeParentConversation(ctx, config.router.maxConversationChars);
+	const messages = collectParentMessages(ctx);
+	const conversation = serializeMessages(messages);
 	let decision = fallbackDecision(params.task, expectedOutput, contextNotes, config);
 	let usage: Usage | undefined;
+	const allRoutingFieldsExplicit = [params.complexity, params.contextMode, params.permission]
+		.every((value) => Boolean(value) && value !== "auto");
 
-	if (config.router.enabled) {
+	if (allRoutingFieldsExplicit && params.contextMode !== "summary") {
+		decision.reason = "All routing fields were explicit; background advisor skipped.";
+		decision.contextSummary = "";
+	} else if (config.router.enabled) {
 		const models = ctx.modelRegistry.getAvailable();
 		const routerModel = resolveRouterModel(models, config.router.model, ctx.model);
 		if (routerModel) {
@@ -267,7 +303,7 @@ async function classifyAndSummarize(
 				`EXPECTED OUTPUT:\n${expectedOutput || "Not specified"}`,
 				`EXPLICIT CONTEXT FILES:\n${(params.contextFiles ?? []).join("\n") || "None"}`,
 				`EXPLICIT CONTEXT NOTES:\n${contextNotes || "None"}`,
-				`PARENT CONVERSATION:\n${conversation || "No parent conversation available"}`,
+				`PARENT CONVERSATION:\n${conversation.slice(0, config.router.maxConversationChars) || "No parent conversation available"}`,
 			].join("\n");
 			try {
 				const response = await ctx.modelRegistry.complete(
@@ -305,29 +341,33 @@ async function classifyAndSummarize(
 	}
 	if (params.contextMode && params.contextMode !== "auto") {
 		decision.contextMode = params.contextMode as ContextMode;
-	} else if ((params.contextFiles?.length ?? 0) > 0 && decision.contextMode === "isolated") {
-		decision.contextMode = "selected";
 	}
 	if (params.permission && params.permission !== "auto") {
 		decision.permission = params.permission as PermissionMode;
 	}
 	decision.contextSummary = decision.contextSummary.slice(0, config.router.maxSummaryChars);
-	return { decision, usage, conversation };
+	return { decision, usage, messages, conversation };
 }
 
 function buildContextPacket(
 	job: Job,
+	messages: ParentMessage[],
 	conversation: string,
 	contextNotes: string,
 ): string {
 	const route = job.route!;
+	const selectedMessages = serializeMessages(recentMessages(messages, job.config.context.selectedMessages));
+	const selectedContext = selectedMessages.length > job.config.context.maxSelectedChars
+		? `[Earlier messages omitted]\n${selectedMessages.slice(-job.config.context.maxSelectedChars)}`
+		: selectedMessages;
 	let inheritedContext = "No parent conversation was inherited. Work only from the task and repository instructions.";
 	if (route.contextMode === "selected") {
-		const selected = route.contextSummary || relevantExcerpts(conversation, job.task, job.config.context.maxSelectedChars);
-		inheritedContext = selected || "No additional parent facts were selected.";
+		inheritedContext = selectedContext || "No additional parent facts were selected.";
 	} else if (route.contextMode === "summary") {
-		const summary = route.contextSummary || relevantExcerpts(conversation, job.task, job.config.context.maxSelectedChars);
-		inheritedContext = summary || "No relevant parent summary was available.";
+		inheritedContext = route.contextSummary || [
+			"[Summary unavailable; fell back to the most recent parent messages]",
+			selectedContext || "No parent conversation was available.",
+		].join("\n");
 	} else if (route.contextMode === "full") {
 		inheritedContext = conversation.length > job.config.context.maxFullChars
 			? `[Earlier content omitted]\n${conversation.slice(-job.config.context.maxFullChars)}`
@@ -546,6 +586,13 @@ const ContextModeSchema = StringEnum(["auto", "isolated", "selected", "summary",
 const PermissionSchema = StringEnum(["auto", "read-only", "workspace-write"] as const, {
 	description: "Workspace permission override. Default auto.",
 	default: "auto",
+});
+
+const ListSubagentModelsParams = Type.Object({
+	filter: Type.Optional(Type.String({ description: "Case-insensitive model, provider, or profile-note filter." })),
+	tier: Type.Optional(StringEnum(["S", "A", "B", "C"] as const)),
+	maxRows: Type.Optional(Type.Number({ description: "Maximum rows to return (1-50). Default 20." })),
+	offset: Type.Optional(Type.Number({ description: "Zero-based pagination offset. Default 0." })),
 });
 
 const DelegateParams = Type.Object({
@@ -892,7 +939,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		try {
 			fs.writeFileSync(
 				job.contextPath,
-				buildContextPacket(job, job.parentConversation, job.contextNotes),
+				buildContextPacket(job, job.parentMessages, job.parentConversation, job.contextNotes),
 				{ encoding: "utf8", mode: 0o600 },
 			);
 		} catch (error) {
@@ -1068,20 +1115,93 @@ export default function smartSubagents(pi: ExtensionAPI) {
 
 	pi.registerShortcut("down", {
 		description: "Inspect running sub-agents",
+		// pi's public Shortcut type omits `override`, but the runtime accepts it.
+		// @ts-ignore -- pre-existing type gap, kept for parity with the pi docs.
 		override: true,
 		handler: async (ctx) => openAgentBrowser(ctx),
+	});
+
+	pi.registerTool({
+		name: "list_subagent_models",
+		label: "List Sub-Agent Models",
+		description: "List models currently eligible for delegate_subagent across all providers: strength tier, supported thinking levels, context window, and registry pricing. Call before dispatching a quality- or cost-sensitive sub-agent.",
+		promptSnippet: "Inspect eligible sub-agent models, capability tiers, supported thinking levels, context windows, and registry pricing",
+		promptGuidelines: [
+			"Before the first quality- or cost-sensitive delegate_subagent call in a session, or when a previous catalogue may be stale, call list_subagent_models; reuse a recent result for similar dispatches instead of querying before every call.",
+		],
+		parameters: ListSubagentModelsParams,
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			latestCtx = ctx;
+			const config = loadConfig();
+			const models = getEligibleModels(ctx);
+			const currentRef = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+			const descriptors = models.map((model) =>
+				describeEligibleModel(ctx, model, config.modelProfiles, currentRef),
+			);
+			const options: ModelListOptions = {
+				filter: params.filter,
+				tier: params.tier,
+				maxRows: Math.max(1, Math.min(50, Math.floor(params.maxRows ?? 20))),
+				offset: Math.max(0, Math.floor(params.offset ?? 0)),
+			};
+			const { descriptors: page, result } = paginateModels(descriptors, options);
+			const scope = ctx.scopedModels.length > 0 ? "session" : "all-authenticated";
+			const details: ModelListDetails = {
+				scope,
+				totalEligible: models.length,
+				matched: result.matched,
+				shown: result.shown,
+				offset: result.offset,
+				nextOffset: result.nextOffset,
+				truncated: result.truncated,
+				models: page,
+			};
+			return {
+				content: [{ type: "text", text: buildModelListText(page, result, scope) }],
+				details,
+			};
+		},
+
+		renderCall(args, theme) {
+			const filters = [
+				args.filter ? `filter=${args.filter}` : "",
+				args.tier ? `tier=${args.tier}` : "",
+			].filter(Boolean);
+			return new Text(
+				`${theme.fg("toolTitle", theme.bold("list_subagent_models"))}${filters.length > 0 ? theme.fg("dim", ` · ${filters.join(" · ")}`) : ""}`,
+				0,
+				0,
+			);
+		},
+
+		renderResult(result, _options, theme) {
+			const details = result.details as ModelListDetails | undefined;
+			if (!details) return new Text(theme.fg("dim", "…"), 0, 0);
+			const tiers: Record<EligibleModelDescriptor["tier"], number> = { S: 0, A: 0, B: 0, C: 0 };
+			for (const model of details.models) tiers[model.tier] = tiers[model.tier] + 1;
+			return new Text(
+				`${theme.fg("accent", `${details.shown} eligible`)}${theme.fg("dim", ` · S${tiers.S} A${tiers.A} B${tiers.B} C${tiers.C} · scope ${details.scope}${details.truncated ? " · truncated" : ""}`)}`,
+				0,
+				0,
+			);
+		},
 	});
 
 	pi.registerTool({
 		name: "delegate_subagent",
 		label: "Delegate Sub Agent",
 		description: "Dispatch a bounded task to an asynchronous sub-agent. Model, thinking effort, context inheritance and permission default to auto. The call returns after dispatch; completion is delivered automatically as a lifecycle message, so never poll or repeatedly check status.",
-		promptSnippet: "Dispatch independent bounded work to an automatically routed background sub-agent",
+		promptSnippet: "Dispatch bounded asynchronous work with explicit or automatic model, thinking, context, and permission routing",
 		promptGuidelines: [
 			"Use delegate_subagent for concrete independent work that can run concurrently with useful local work; keep immediate critical-path blockers local.",
-			"Make every delegate_subagent task self-contained, provide exact contextFiles/contextNotes, and provide disjoint writeScope values for concurrent editing tasks.",
-			"Do not poll after delegate_subagent. Completion or failure is automatically delivered through a hook-driven message that wakes the parent agent.",
-			"After delegate_subagent dispatches, continue meaningful non-overlapping work or yield; do not duplicate the delegated task.",
+			"When list_subagent_models shows a clear fit, normally pass model and effort explicitly to delegate_subagent; also set contextMode and permission explicitly when the task semantics are clear.",
+			"Any delegate_subagent routing field may remain auto. Use auto when no choice is well justified or model lookup is unavailable; the background advisor and deterministic rules provide a fail-open route when an eligible model exists.",
+			"Treat list_subagent_models tiers as capability guidance and registry prices as cost metadata, not quality benchmarks. Do not default to the highest tier; choose the least costly model and effort that safely meet the task.",
+			"Choose delegate_subagent contextMode independently: isolated for self-contained work, selected for the most recent parent messages, summary when semantic parent history matters, and full only when exact broad conversation details are indispensable.",
+			"For delegate_subagent, use read-only for review or investigation and workspace-write only when mutation is required; provide a narrow writeScope for workspace-write tasks.",
+			"Make every delegate_subagent task self-contained and provide precise contextFiles, contextNotes, and expectedOutput.",
+			"Do not poll after delegate_subagent. Completion or failure is delivered automatically; continue meaningful non-overlapping work or yield.",
 		],
 		parameters: DelegateParams,
 
@@ -1114,6 +1234,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 				stopRequested: false,
 				lastProgressHookAt: 0,
 				fallbackRoutes: [],
+				parentMessages: [],
 				parentConversation: "",
 				contextNotes: params.contextNotes ?? "",
 			};
@@ -1136,8 +1257,10 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			try {
 				if (signal?.aborted) throw new Error("Dispatch aborted before routing.");
 				const routed = await classifyAndSummarize(ctx, params, config, signal);
+				job.parentMessages = routed.messages;
+				job.parentConversation = routed.conversation;
 				if (signal?.aborted) throw new Error("Dispatch aborted before spawn.");
-				const models = ctx.modelRegistry.getAvailable();
+				const models = getEligibleModels(ctx);
 				const availableRefs = models.map((model) => `${model.provider}/${model.id}`);
 				const currentRef = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 				const requestedModel = params.model ?? "auto";
@@ -1174,7 +1297,6 @@ export default function smartSubagents(pi: ExtensionAPI) {
 				if (!effectiveRoute) throw new Error("Model routing produced no usable candidate.");
 				job.route = effectiveRoute;
 				job.fallbackRoutes = routeCandidates;
-				job.parentConversation = routed.conversation;
 				const runDir = path.join(RUNS_DIR, ctx.sessionManager.getSessionId(), id);
 				await fs.promises.mkdir(runDir, { recursive: true, mode: 0o700 });
 				job.contextPath = path.join(runDir, "context.md");

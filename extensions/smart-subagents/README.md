@@ -13,6 +13,65 @@ Global pi extension for asynchronous, automatically routed sub-agents.
 - Shows the effective model, thinking level, context mode, permission, and status in the TUI; completed rows disappear after 60 seconds.
 - Serializes write agents whose declared `writeScope` values overlap.
 
+## Routing: main agent decides, the system backs it up
+
+The router is advisory, not prescriptive. The main agent is told to inspect the
+available model catalogue and route explicitly; `auto` fields are filled by the
+background advisor (a lightweight classifier) and, failing that, deterministic
+rules — dispatching never blocks.
+
+### `list_subagent_models`
+
+Call this to see which models are currently eligible for `delegate_subagent`
+across all providers: strength tier, supported thinking levels, context window,
+and registry pricing.
+
+```text
+Eligible sub-agent models: 8 · scope: session
+REF | TIER | THINKING | CONTEXT | $IN/$OUT | NOTE
+openai-codex/gpt-5.6-sol | S | low..xhigh | 1M tok | 1.75/14.00 | 最强推理…
+```
+
+- `filter` (provider/model/name/note keyword), `tier` (S/A/B/C), `maxRows`,
+  and `offset` paginate large catalogues.
+- Tiers are curated capability guidance, **not** benchmarks. `B*` marks an
+  unprofiled model with the neutral default tier.
+- Prices are registry USD per 1M tokens (in/out); `-` means free, local, or
+  missing metadata.
+
+### Strength tiers
+
+`~/.pi/agent/subagents.json` can annotate models with a capability tier and a
+note; unprofiled models get the neutral default (`B`):
+
+```json
+{
+  "modelProfiles": {
+    "defaultTier": "B",
+    "models": {
+      "openai-codex/gpt-5.6-sol":  { "tier": "S", "note": "最强推理，高风险/复杂任务" },
+      "openai-codex/gpt-5.6-luna": { "tier": "A", "note": "快且便宜；开 max 思考后明显优于 5.5/5.4" },
+      "openai-codex/gpt-5.4-mini": { "tier": "C", "note": "轻量快速，简单任务省钱" }
+    }
+  }
+}
+```
+
+Context window, pricing, and supported thinking levels are always read live from
+the model registry — never copied into the config.
+
+### Context inheritance
+
+| Mode | Meaning |
+|---|---|
+| `isolated` | No parent conversation inherited (task/notes/files still pass) |
+| `selected` | The most recent `context.selectedMessages` parent messages (default 6) |
+| `summary` | Distilled parent context from the advisor; falls back to `selected` when distillation is unavailable |
+| `full` | The parent's full effective conversation, capped by `context.maxFullChars` |
+
+`contextFiles` no longer forces `isolated` up to `selected`; explicit files are
+passed in every mode.
+
 ## Agent tool
 
 The parent model receives `delegate_subagent` automatically. Its routing fields default to `auto`:
@@ -31,6 +90,12 @@ Useful context fields:
 - `expectedOutput`: acceptance criteria
 
 The tool returns after routing and process creation. The parent should not wait or poll. A terminal completion message is injected automatically when the child exits. If the parent is busy, it enters the steering queue and is consumed after the current model response/tool batch, before the next model call.
+
+Guidance to the main agent: consult `list_subagent_models` before quality- or
+cost-sensitive dispatches, pass `model`/`effort`/`contextMode`/`permission`
+explicitly when the catalogue makes a clear fit, and pick the least costly
+model that safely meets the task — the highest tier is not the default choice.
+Fields left `auto` are still filled fail-open by the advisor and rules.
 
 ## Commands
 
