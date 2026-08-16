@@ -1,0 +1,30 @@
+--- a/dist/components/editor.js
++++ b/dist/components/editor.js
+@@ -673,10 +673,14 @@
+         }
+         // Arrow key navigation (with history support)
+         if (kb.matches(data, "tui.editor.cursorUp")) {
+-            if (this.isOnFirstVisualLine() &&
+-                (this.isEditorEmpty() || this.historyIndex > -1 || this.state.cursorCol === 0)) {
++            if (this.historyIndex > -1) {
++                // Once browsing history, arrows move between entries directly.
+                 this.navigateHistory(-1);
+             }
++            else if (this.isOnFirstVisualLine() &&
++                (this.isEditorEmpty() || this.state.cursorCol === 0)) {
++                this.navigateHistory(-1);
++            }
+             else if (this.isOnFirstVisualLine()) {
+                 // Already at top - jump to start of line
+                 this.moveToLineStart();
+@@ -687,7 +691,8 @@
+             return;
+         }
+         if (kb.matches(data, "tui.editor.cursorDown")) {
+-            if (this.historyIndex > -1 && this.isOnLastVisualLine()) {
++            if (this.historyIndex > -1) {
++                // Once browsing history, arrows move between entries directly.
+                 this.navigateHistory(1);
+             }
+             else if (this.isOnLastVisualLine()) {
+*** End Patch
