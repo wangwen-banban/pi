@@ -11,7 +11,8 @@ Global pi extension for asynchronous, automatically routed sub-agents.
 - Works identically from native Pi and PI WEB sessions: embedded PI WEB runtimes resolve the standalone `pi` CLI instead of accidentally re-executing the hosting `sessiond.js`.
 - Shares the parent's working directory while keeping conversation context isolated.
 - Delivers completion immediately through lifecycle events and a visible `steer` message instead of polling. It enters at the next safe agent-loop boundary without aborting an in-flight response or tool call.
-- Shows the effective model, thinking level, context mode, permission, and status in the TUI; completed rows disappear after 60 seconds.
+- Shows the effective model, thinking level, context mode, permission, status, and a live duration in the TUI; active rows refresh once per second and completed rows disappear after 60 seconds.
+- Enforces a configurable hard wall-clock timeout, with `SIGTERM` then bounded `SIGKILL` escalation.
 - Serializes write agents whose declared `writeScope` values overlap.
 
 ## Routing: main agent decides, the system backs it up
@@ -98,6 +99,40 @@ explicitly when the catalogue makes a clear fit, and pick the least costly
 model that safely meets the task — the highest tier is not the default choice.
 Fields left `auto` are still filled fail-open by the advisor and rules.
 
+## Execution lifecycle and timeouts
+
+```json
+{
+  "execution": {
+    "hardTimeoutMs": 1800000,
+    "terminateGraceMs": 5000
+  }
+}
+```
+
+The default hard cap is **30 minutes**. This contains stuck/orphaned workers while
+leaving substantial headroom for `max`-thinking tasks; it is a wall-clock cap,
+not an idle-output timeout, so long silent reasoning is not mistaken for a hang.
+Values are clamped to 1 minute–24 hours; termination grace is clamped to
+100 ms–60 seconds.
+
+At the cap, the worker receives `SIGTERM`, then `SIGKILL` if it is still alive
+after the grace period. The durable result is `status: "failed"` with
+`terminationReason: "timed_out"` and names `execution.hardTimeoutMs` as the
+setting to adjust. External signals are failures; `/agents stop` is an explicit
+`stopped` result. A null exit code can never be interpreted as completion.
+
+The duration widget uses a single unreferenced one-second timer only while a job
+is routing, queued, or running. It stops when no job is active and is always
+cleared during session shutdown or extension reload.
+
+Session shutdown finalizes every routing, queued, and running job as durable
+`stopped` state before teardown. It writes `result.json` even when routing had
+not yet produced `context.md`, and intentionally uses a persistence-only path:
+no stale UI, completion message, or lifecycle hook is required to save it.
+Running children receive `SIGTERM` and then `SIGKILL` after the configured grace
+if needed.
+
 ## Commands
 
 ```text
@@ -152,7 +187,9 @@ Context packets and full results are stored with user-only permissions under:
 ~/.pi/agent/subagent-runs/<parent-session-id>/<subagent-id>/
 ```
 
-Each run contains `context.md` and `result.json`.
+A started run contains `context.md` and `result.json`. If the parent shuts down
+while a job is still routing, `result.json` is still written with
+`status: "stopped"`; `context.md` may legitimately not exist yet.
 
 ## Inspecting a running agent
 

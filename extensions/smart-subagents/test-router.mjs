@@ -52,9 +52,10 @@ test("resolveModelProfile distinguishes configured and neutral-default tiers", (
 	});
 });
 
-test("mergeConfig merges model profiles, clamps selectedMessages, and accepts legacy routes", () => {
+test("mergeConfig merges profiles, execution limits, context, and legacy routes", () => {
 	const merged = mergeConfig({
 		context: { selectedMessages: 500 },
+		execution: { hardTimeoutMs: 30_000, terminateGraceMs: 90_000 },
 		modelProfiles: {
 			defaultTier: "A",
 			models: {
@@ -68,6 +69,9 @@ test("mergeConfig merges model profiles, clamps selectedMessages, and accepts le
 	});
 	assert.equal(merged.context.selectedMessages, 50);
 	assert.equal(mergeConfig({ context: { selectedMessages: 0 } }).context.selectedMessages, 1);
+	assert.equal(merged.execution.hardTimeoutMs, 60_000);
+	assert.equal(merged.execution.terminateGraceMs, 60_000);
+	assert.equal(mergeConfig({}).execution.hardTimeoutMs, 30 * 60_000);
 	assert.equal(merged.modelProfiles.defaultTier, "A");
 	assert.deepEqual(merged.modelProfiles.models["provider/budget"], {
 		tier: "C",
@@ -150,5 +154,9 @@ test("smart-subagents index wires informed model routing and removes context-fil
 	assert.match(source, /selectedMessages/);
 	assert.match(source, /background advisor skipped/);
 	assert.match(source, /recentMessages\(messages/);
+	assert.match(source, /createActivityRefreshLoop/);
+	assert.match(source, /child\.on\("close", \(code, signal\)/);
+	assert.match(source, /createExecutionTimeout/);
+	assert.match(source, /shutdownJobs\(jobs\.values\(\)/);
 	assert.doesNotMatch(source, /params\.contextFiles.*selected/);
 });

@@ -1,6 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import {
 	getSupportedThinkingLevels,
@@ -18,6 +17,20 @@ import {
 import { Box, Container, Key, Markdown, Spacer, Text, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { getPiInvocation } from "./pi-invocation.ts";
+import {
+	applyFinalOutcome,
+	classifyChildClose,
+	createActivityRefreshLoop,
+	createExecutionTimeout,
+	shutdownJobs,
+	terminateWithGrace,
+	timeoutFailureMessage,
+	writeJsonAtomically,
+	type FinalOutcome,
+	type StopRequestKind,
+	type TerminationController,
+	type TerminationReason,
+} from "./lifecycle.ts";
 import {
 	DEFAULT_CONFIG,
 	THINKING_LEVELS,
@@ -88,6 +101,10 @@ interface JobSnapshot {
 	startedAt?: number;
 	finishedAt?: number;
 	exitCode?: number;
+	signal?: string;
+	terminationReason?: TerminationReason;
+	timedOutAt?: number;
+	timeoutEscalated?: boolean;
 	output?: string;
 	error?: string;
 	changedFiles: string[];
@@ -104,7 +121,11 @@ interface Job extends JobSnapshot {
 	stdoutBuffer: string;
 	liveOutput: string;
 	stderr: string;
-	stopRequested: boolean;
+	stopRequest?: StopRequestKind;
+	childStopReason?: string;
+	executionTimeout?: ReturnType<typeof createExecutionTimeout>;
+	stopEscalation?: TerminationController;
+	resultWritePromise?: Promise<void>;
 	lastProgressHookAt: number;
 	fallbackRoutes: RouteDecision[];
 	parentMessages: ParentMessage[];
@@ -432,6 +453,10 @@ function snapshot(job: Job): JobSnapshot {
 		startedAt: job.startedAt,
 		finishedAt: job.finishedAt,
 		exitCode: job.exitCode,
+		signal: job.signal,
+		terminationReason: job.terminationReason,
+		timedOutAt: job.timedOutAt,
+		timeoutEscalated: job.timeoutEscalated,
 		output: job.output ? truncateUtf8(job.output, 16 * 1024) : undefined,
 		error: job.error,
 		changedFiles: [...job.changedFiles],
@@ -613,6 +638,16 @@ export default function smartSubagents(pi: ExtensionAPI) {
 	const deliveredCompletionIds = new Set<string>();
 	const deferredCompletionMessages: Array<{ content: string; details: CompletionDetails }> = [];
 	let parentAgentActive = false;
+	let updateUi: () => void = () => {};
+	const durationRefreshLoop = createActivityRefreshLoop({
+		hasActiveJobs: () => Boolean(
+			!shuttingDown &&
+			latestCtx?.hasUI &&
+			[...jobs.values()].some((job) => job.status === "routing" || job.status === "queued" || job.status === "running"),
+		),
+		onTick: () => updateUi(),
+		intervalMs: 1000,
+	});
 
 	const getVisibleJobs = () => {
 		const now = Date.now();
@@ -647,9 +682,11 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		agentBrowserRenderTimer.unref?.();
 	};
 
-	const updateUi = () => {
+	updateUi = () => {
+		durationRefreshLoop.sync();
 		const ctx = latestCtx;
-		if (!ctx?.hasUI) return;
+		if (!ctx?.hasUI || shuttingDown) return;
+		refreshAgentBrowser();
 		if (uiExpiryTimer) {
 			clearTimeout(uiExpiryTimer);
 			uiExpiryTimer = undefined;
@@ -770,29 +807,29 @@ export default function smartSubagents(pi: ExtensionAPI) {
 	const writeRunResult = async (job: Job) => {
 		if (!job.logPath) return;
 		try {
-			await fs.promises.writeFile(
-				job.logPath,
-				JSON.stringify(
-					{
-						...snapshot(job),
-						output: job.output,
-						stderr: job.stderr,
-						contextPath: job.contextPath,
-					},
-					null,
-					2,
-				),
-				{ encoding: "utf8", mode: 0o600 },
-			);
+			await writeJsonAtomically(job.logPath, {
+				...snapshot(job),
+				output: job.output,
+				stderr: job.stderr,
+				contextPath: job.contextPath,
+			});
 		} catch {
-			// The completion message still carries the result.
+			// Lifecycle finalization must remain safe even if the run directory is unavailable.
 		}
+	};
+
+	const persistRunResult = (job: Job): Promise<void> => {
+		job.resultWritePromise ??= writeRunResult(job);
+		return job.resultWritePromise;
 	};
 
 	const deliverCompletion = (event: "completed" | "failed", job: Job) => {
 		if (shuttingDown || deliveredCompletionIds.has(job.id)) return;
 		const route = job.route!;
-		const output = truncateUtf8(job.output || job.error || job.stderr || "(no output)", RESULT_OUTPUT_LIMIT);
+		const primaryResult = event === "failed"
+			? job.error || job.stderr || job.output
+			: job.output || job.error || job.stderr;
+		const output = truncateUtf8(primaryResult || "(no output)", RESULT_OUTPUT_LIMIT);
 		const changed = job.changedFiles.length > 0 ? job.changedFiles.map((file) => `- ${file}`).join("\n") : "- None detected";
 		const content = [
 			`[Sub-agent lifecycle update — continue the original task]`,
@@ -829,31 +866,37 @@ export default function smartSubagents(pi: ExtensionAPI) {
 
 	let pumpQueue: () => void;
 
+	const clearJobTimers = (job: Job) => {
+		job.executionTimeout?.cancel();
+		job.executionTimeout = undefined;
+		job.stopEscalation?.cancel();
+		job.stopEscalation = undefined;
+	};
+
 	const finalizeJob = async (
 		job: Job,
-		status: "completed" | "failed" | "stopped",
-		exitCode: number,
-		error?: string,
-	) => {
-		if (FINAL_STATUSES.has(job.status)) return;
-		job.status = status;
-		job.exitCode = exitCode;
-		job.finishedAt = Date.now();
-		if (error) job.error = error;
-		job.process = undefined;
-		if (!shuttingDown) {
-			appendState(job);
-			updateUi();
-			// Completion delivery is the critical path. Queue it before observational
-			// hooks and disk I/O so the parent can react at its next safe boundary.
-			if (status === "completed" || status === "failed") deliverCompletion(status, job);
-			emitLifecycle(status === "completed" ? "completed" : status === "failed" ? "failed" : "stopped", job);
-			void writeRunResult(job);
-			pumpQueue();
+		outcome: FinalOutcome,
+		options: { persistenceOnly?: boolean } = {},
+	): Promise<boolean> => {
+		if (!applyFinalOutcome(job, outcome)) return false;
+		clearJobTimers(job);
+		// appendEntry is attempted while session_shutdown still owns the old session;
+		// result.json is the independent durable fallback if that session is stale.
+		appendState(job);
+		if (options.persistenceOnly || shuttingDown) {
+			await persistRunResult(job);
+			return true;
 		}
-		else {
-			await writeRunResult(job);
+		updateUi();
+		// Completion delivery is the critical path. Queue it before observational
+		// hooks and disk I/O so the parent can react at its next safe boundary.
+		if ((outcome.status === "completed" || outcome.status === "failed") && job.route) {
+			deliverCompletion(outcome.status, job);
 		}
+		emitLifecycle(outcome.status === "completed" ? "completed" : outcome.status === "failed" ? "failed" : "stopped", job);
+		void persistRunResult(job);
+		pumpQueue();
+		return true;
 	};
 
 	const appendLiveOutput = (job: Job, text: string) => {
@@ -902,7 +945,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			job.usage.cacheWrite += message.usage.cacheWrite ?? 0;
 			job.usage.cost += message.usage.cost?.total ?? 0;
 		}
-		if (message.stopReason) (job as any).stopReason = message.stopReason;
+		if (message.stopReason) job.childStopReason = message.stopReason;
 		if (message.errorMessage) job.error = message.errorMessage;
 		const textParts: string[] = [];
 		for (const part of Array.isArray(message.content) ? message.content : []) {
@@ -925,7 +968,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 	};
 
 	const startJob = (job: Job) => {
-		if (!job.route || !job.contextPath || shuttingDown || job.status === "stopped") return;
+		if (!job.route || !job.contextPath || shuttingDown || FINAL_STATUSES.has(job.status)) return;
 		try {
 			fs.writeFileSync(
 				job.contextPath,
@@ -933,7 +976,12 @@ export default function smartSubagents(pi: ExtensionAPI) {
 				{ encoding: "utf8", mode: 0o600 },
 			);
 		} catch (error) {
-			void finalizeJob(job, "failed", 1, error instanceof Error ? error.message : String(error));
+			void finalizeJob(job, {
+				status: "failed",
+				exitCode: 1,
+				terminationReason: "spawn_error",
+				error: error instanceof Error ? error.message : String(error),
+			});
 			return;
 		}
 		if (!job.attemptedModels.includes(job.route.modelRef)) job.attemptedModels.push(job.route.modelRef);
@@ -976,33 +1024,58 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			});
 			job.process = child;
 			child.stdout?.on("data", (data) => {
+				if (FINAL_STATUSES.has(job.status)) return;
 				job.stdoutBuffer += data.toString();
 				const lines = job.stdoutBuffer.split("\n");
 				job.stdoutBuffer = lines.pop() ?? "";
 				for (const line of lines) parseChildEvent(job, line);
 			});
 			child.stderr?.on("data", (data) => {
+				if (FINAL_STATUSES.has(job.status)) return;
 				job.stderr = `${job.stderr}${data.toString()}`.slice(-STDERR_LIMIT);
 			});
 			child.on("error", (error) => {
-				void finalizeJob(job, "failed", 1, error.message);
+				if (FINAL_STATUSES.has(job.status)) return;
+				if (job.stopRequest || job.timedOutAt) {
+					// kill() can emit `error`; keep the grace escalation armed instead of
+					// finalizing early and accidentally cancelling the pending SIGKILL.
+					job.stderr = `${job.stderr}\nprocess signalling error: ${error.message}`.trim().slice(-STDERR_LIMIT);
+					return;
+				}
+				void finalizeJob(job, {
+					status: "failed",
+					exitCode: 1,
+					terminationReason: "spawn_error",
+					error: error.message,
+				});
 			});
-			child.on("close", (code) => {
+			child.on("close", (code, signal) => {
+				if (FINAL_STATUSES.has(job.status)) {
+					job.stdoutBuffer = "";
+					return;
+				}
 				if (job.stdoutBuffer.trim()) parseChildEvent(job, job.stdoutBuffer);
 				job.stdoutBuffer = "";
-				if (shuttingDown) {
-					job.status = "stopped";
-					return;
-				}
-				if (job.stopRequested) {
-					void finalizeJob(job, "stopped", code ?? 143, "Stopped by user or session shutdown.");
-					return;
-				}
-				const stopReason = (job as any).stopReason;
-				const failed = (code ?? 0) !== 0 || stopReason === "error" || stopReason === "aborted";
+				job.executionTimeout?.cancel();
+				job.executionTimeout = undefined;
+				job.stopEscalation?.cancel();
+				job.stopEscalation = undefined;
+				const outcome = classifyChildClose({
+					code,
+					signal,
+					stopRequest: job.stopRequest,
+					timedOut: Boolean(job.timedOutAt),
+					timeoutEscalated: job.timeoutEscalated,
+					hardTimeoutMs: job.config.execution.hardTimeoutMs,
+					terminateGraceMs: job.config.execution.terminateGraceMs,
+					childStopReason: job.childStopReason,
+					error: job.error,
+					stderr: job.stderr,
+				});
 				const failureText = `${job.error ?? ""}\n${job.stderr}`;
 				const unsupportedModel = /model[_ ]not[_ ]supported|unsupported model|requested model is not supported/i.test(failureText);
-				if (failed && unsupportedModel && job.fallbackRoutes.length > 0) {
+				const fallbackEligible = outcome.terminationReason === "exit_nonzero" || outcome.terminationReason === "child_error";
+				if (fallbackEligible && unsupportedModel && job.fallbackRoutes.length > 0) {
 					const previousModel = job.route?.modelRef ?? "unknown";
 					job.route = job.fallbackRoutes.shift();
 					job.status = "queued";
@@ -1011,22 +1084,56 @@ export default function smartSubagents(pi: ExtensionAPI) {
 					job.output = undefined;
 					job.error = undefined;
 					job.stderr = "";
-					(job as any).stopReason = undefined;
+					job.childStopReason = undefined;
+					job.timedOutAt = undefined;
+					job.timeoutEscalated = undefined;
 					recordProgress(job, `model ${previousModel} unsupported; retrying with ${job.route?.modelRef}`);
 					queue.push(job.id);
 					appendState(job);
 					pumpQueue();
 					return;
 				}
-				void finalizeJob(
-					job,
-					failed ? "failed" : "completed",
-					code ?? 0,
-					failed ? job.error || job.stderr || `Child exited with code ${code ?? 1}` : undefined,
-				);
+				void finalizeJob(job, outcome);
+			});
+			job.executionTimeout = createExecutionTimeout({
+				process: child,
+				timeoutMs: job.config.execution.hardTimeoutMs,
+				graceMs: job.config.execution.terminateGraceMs,
+				onTimeout: () => {
+					if (FINAL_STATUSES.has(job.status)) return;
+					job.timedOutAt = Date.now();
+					job.timeoutEscalated = false;
+					job.error = timeoutFailureMessage(
+						job.config.execution.hardTimeoutMs,
+						job.config.execution.terminateGraceMs,
+						false,
+					);
+					recordProgress(job, "hard execution timeout reached; terminating worker");
+					appendState(job);
+				},
+				onEscalate: () => {
+					if (FINAL_STATUSES.has(job.status)) return;
+					job.timeoutEscalated = true;
+					void finalizeJob(job, {
+						status: "failed",
+						exitCode: 137,
+						signal: "SIGKILL",
+						terminationReason: "timed_out",
+						error: timeoutFailureMessage(
+							job.config.execution.hardTimeoutMs,
+							job.config.execution.terminateGraceMs,
+							true,
+						),
+					});
+				},
 			});
 		} catch (error) {
-			void finalizeJob(job, "failed", 1, error instanceof Error ? error.message : String(error));
+			void finalizeJob(job, {
+				status: "failed",
+				exitCode: 1,
+				terminationReason: "spawn_error",
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 	};
 
@@ -1056,18 +1163,44 @@ export default function smartSubagents(pi: ExtensionAPI) {
 	};
 
 	const stopJob = (job: Job) => {
-		if (FINAL_STATUSES.has(job.status)) return false;
-		job.stopRequested = true;
+		if (FINAL_STATUSES.has(job.status) || job.stopRequest === "user" || Boolean(job.timedOutAt)) return false;
+		job.stopRequest = "user";
+		job.executionTimeout?.cancel();
+		job.executionTimeout = undefined;
 		if (job.status === "queued" || job.status === "routing") {
 			const index = queue.indexOf(job.id);
 			if (index >= 0) queue.splice(index, 1);
-			void finalizeJob(job, "stopped", 0, "Stopped before execution.");
+			void finalizeJob(job, {
+				status: "stopped",
+				exitCode: 0,
+				terminationReason: "explicit_stop",
+				error: "Stopped by /agents stop before execution.",
+			});
 			return true;
 		}
-		job.process?.kill("SIGTERM");
 		const processRef = job.process;
-		const timeout = setTimeout(() => processRef?.kill("SIGKILL"), 5000);
-		timeout.unref?.();
+		if (!processRef) {
+			void finalizeJob(job, {
+				status: "stopped",
+				exitCode: 0,
+				terminationReason: "explicit_stop",
+				error: "Stopped by /agents stop.",
+			});
+			return true;
+		}
+		job.stopEscalation = terminateWithGrace({
+			process: processRef,
+			graceMs: job.config.execution.terminateGraceMs,
+			onEscalate: () => {
+				void finalizeJob(job, {
+					status: "stopped",
+					exitCode: 137,
+					signal: "SIGKILL",
+					terminationReason: "explicit_stop",
+					error: `Stopped by /agents stop; worker required SIGKILL after ${job.config.execution.terminateGraceMs}ms.`,
+				});
+			},
+		});
 		return true;
 	};
 
@@ -1087,7 +1220,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			box.addChild(new Text(theme.fg("muted", `context: ${route.contextMode} · permission: ${route.permission}`), 0, 0));
 			if (job.changedFiles.length > 0) box.addChild(new Text(theme.fg("muted", `changed: ${job.changedFiles.join(", ")}`), 0, 0));
 			box.addChild(new Spacer(1));
-			const output = job.output || job.error || "(no output)";
+			const output = details.event === "failed" ? job.error || job.output || "(no output)" : job.output || job.error || "(no output)";
 			if (expanded) {
 				box.addChild(new Markdown(output, 0, 0, getMarkdownTheme()));
 				if (job.logPath) {
@@ -1203,6 +1336,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 				.toLowerCase()
 				.replace(/[^a-z0-9_]+/g, "_")
 				.replace(/^_+|_+$/g, "") || `task_${sequence}`;
+			const runDir = path.join(RUNS_DIR, ctx.sessionManager.getSessionId(), id);
 			const job: Job = {
 				id,
 				name,
@@ -1221,7 +1355,8 @@ export default function smartSubagents(pi: ExtensionAPI) {
 				stdoutBuffer: "",
 				liveOutput: "",
 				stderr: "",
-				stopRequested: false,
+				contextPath: path.join(runDir, "context.md"),
+				logPath: path.join(runDir, "result.json"),
 				lastProgressHookAt: 0,
 				fallbackRoutes: [],
 				parentMessages: [],
@@ -1229,6 +1364,10 @@ export default function smartSubagents(pi: ExtensionAPI) {
 				contextNotes: params.contextNotes ?? "",
 			};
 			jobs.set(id, job);
+			const ensureDispatchActive = () => {
+				if (!shuttingDown && !FINAL_STATUSES.has(job.status)) return;
+				throw new Error(job.stopRequest === "user" ? "Dispatch stopped by /agents stop." : "Dispatch stopped by session shutdown.");
+			};
 			updateUi();
 			onUpdate?.({
 				content: [{ type: "text", text: `Routing ${name}: selecting model, thinking effort and context...` }],
@@ -1247,6 +1386,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			try {
 				if (signal?.aborted) throw new Error("Dispatch aborted before routing.");
 				const routed = await classifyAndSummarize(ctx, params, config, signal);
+				ensureDispatchActive();
 				job.parentMessages = routed.messages;
 				job.parentConversation = routed.conversation;
 				if (signal?.aborted) throw new Error("Dispatch aborted before spawn.");
@@ -1287,10 +1427,8 @@ export default function smartSubagents(pi: ExtensionAPI) {
 				if (!effectiveRoute) throw new Error("Model routing produced no usable candidate.");
 				job.route = effectiveRoute;
 				job.fallbackRoutes = routeCandidates;
-				const runDir = path.join(RUNS_DIR, ctx.sessionManager.getSessionId(), id);
 				await fs.promises.mkdir(runDir, { recursive: true, mode: 0o700 });
-				job.contextPath = path.join(runDir, "context.md");
-				job.logPath = path.join(runDir, "result.json");
+				ensureDispatchActive();
 				job.status = "queued";
 				queue.push(job.id);
 				appendState(job);
@@ -1325,12 +1463,14 @@ export default function smartSubagents(pi: ExtensionAPI) {
 					usage: routed.usage,
 				};
 			} catch (error) {
-				job.status = "failed";
-				job.finishedAt = Date.now();
-				job.error = error instanceof Error ? error.message : String(error);
-				appendState(job);
-				emitLifecycle("failed", job);
-				updateUi();
+				if (!FINAL_STATUSES.has(job.status)) {
+					await finalizeJob(job, {
+						status: "failed",
+						exitCode: 1,
+						terminationReason: "routing_error",
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
 				throw error;
 			}
 		},
@@ -1388,7 +1528,11 @@ export default function smartSubagents(pi: ExtensionAPI) {
 					ctx.ui.notify(`Sub-agent not found: ${target || "(missing target)"}`, "error");
 					return;
 				}
-				ctx.ui.notify(stopJob(job) ? `Stopping ${job.name}` : `${job.name} is already ${job.status}`, "info");
+				const stopping = stopJob(job);
+				ctx.ui.notify(
+					stopping ? `Stopping ${job.name}` : job.timedOutAt ? `${job.name} is already timing out` : job.stopRequest ? `${job.name} is already stopping` : `${job.name} is already ${job.status}`,
+					"info",
+				);
 				return;
 			}
 			if (action === "clear") {
@@ -1426,8 +1570,10 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
+		if (shuttingDown) return;
 		shuttingDown = true;
+		durationRefreshLoop.stop();
 		if (uiExpiryTimer) {
 			clearTimeout(uiExpiryTimer);
 			uiExpiryTimer = undefined;
@@ -1437,12 +1583,35 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			agentBrowserRenderTimer = undefined;
 		}
 		agentBrowserRequestRender = undefined;
+		deferredCompletionMessages.splice(0);
+		parentAgentActive = false;
 		queue.splice(0, queue.length);
-		for (const job of jobs.values()) {
-			if (job.status === "running") {
-				job.stopRequested = true;
-				job.process?.kill("SIGTERM");
-			}
-		}
+		await shutdownJobs(jobs.values(), {
+			markStopping(job) {
+				job.stopRequest = "shutdown";
+				job.executionTimeout?.cancel();
+				job.executionTimeout = undefined;
+				job.stopEscalation?.cancel();
+				job.stopEscalation = undefined;
+			},
+			async finalize(job) {
+				await finalizeJob(job, {
+					status: "stopped",
+					exitCode: job.status === "running" ? 143 : 0,
+					terminationReason: "session_shutdown",
+					error: "Stopped because the parent session shut down.",
+				}, { persistenceOnly: true });
+			},
+			terminate(processRef, job) {
+				const child = processRef as ChildProcess;
+				const termination = terminateWithGrace({
+					process: child,
+					graceMs: job.config.execution.terminateGraceMs,
+				});
+				child.once("close", () => termination.cancel());
+			},
+		});
+		await Promise.all([...jobs.values()].map((job) => job.resultWritePromise).filter((promise): promise is Promise<void> => Boolean(promise)));
+		latestCtx = undefined;
 	});
 }

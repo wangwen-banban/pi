@@ -36,6 +36,10 @@ export interface SmartSubagentConfig {
 		maxSelectedChars: number;
 		selectedMessages: number;
 	};
+	execution: {
+		hardTimeoutMs: number;
+		terminateGraceMs: number;
+	};
 	modelProfiles: ModelProfilesConfig;
 	routes: Record<Complexity, RouteConfig>;
 	hooks: Partial<Record<"started" | "progress" | "completed" | "failed" | "stopped", string[]>>;
@@ -63,6 +67,12 @@ export const DEFAULT_CONFIG: SmartSubagentConfig = {
 		maxFullChars: 40000,
 		maxSelectedChars: 12000,
 		selectedMessages: 6,
+	},
+	// A 30-minute wall-clock cap contains orphaned/stuck workers while leaving
+	// substantial headroom for max-thinking tasks. Shutdown escalates after 5s.
+	execution: {
+		hardTimeoutMs: 30 * 60 * 1000,
+		terminateGraceMs: 5000,
 	},
 	modelProfiles: {
 		defaultTier: "B",
@@ -147,6 +157,7 @@ export function mergeConfig(raw: unknown): SmartSubagentConfig {
 	if (!isRecord(raw)) return structuredClone(DEFAULT_CONFIG);
 	const router = isRecord(raw.router) ? raw.router : {};
 	const context = isRecord(raw.context) ? raw.context : {};
+	const execution = isRecord(raw.execution) ? raw.execution : {};
 	const routes = isRecord(raw.routes) ? raw.routes : {};
 	const hooks = isRecord(raw.hooks) ? raw.hooks : {};
 	const merged = structuredClone(DEFAULT_CONFIG);
@@ -172,6 +183,12 @@ export function mergeConfig(raw: unknown): SmartSubagentConfig {
 	}
 	if (typeof context.selectedMessages === "number") {
 		merged.context.selectedMessages = Math.max(1, Math.min(50, context.selectedMessages));
+	}
+	if (typeof execution.hardTimeoutMs === "number" && Number.isFinite(execution.hardTimeoutMs)) {
+		merged.execution.hardTimeoutMs = Math.max(60_000, Math.min(24 * 60 * 60 * 1000, Math.floor(execution.hardTimeoutMs)));
+	}
+	if (typeof execution.terminateGraceMs === "number" && Number.isFinite(execution.terminateGraceMs)) {
+		merged.execution.terminateGraceMs = Math.max(100, Math.min(60_000, Math.floor(execution.terminateGraceMs)));
 	}
 
 	const profiles = isRecord(raw.modelProfiles) ? raw.modelProfiles : {};

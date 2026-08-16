@@ -13,6 +13,10 @@
     "maxSelectedChars": 12000,
     "selectedMessages": 6
   },
+  "execution": {
+    "hardTimeoutMs": 1800000,
+    "terminateGraceMs": 5000
+  },
   "modelProfiles": {
     "defaultTier": "B",
     "models": {
