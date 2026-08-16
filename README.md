@@ -57,6 +57,10 @@ chmod +x ~/.pi/agent/scripts/*.sh
 # Restore the provider-first, model-second selector package patch
 ~/.pi/agent/scripts/apply-model-selector-patch.sh
 
+# Restore or verify history navigation and /rewind patches (Pi 0.84.1)
+~/.pi/agent/scripts/apply-history-navigation-patch.sh
+~/.pi/agent/scripts/apply-history-navigation-patch.sh --check
+
 # Install and start the loopback-only PI WEB user services
 ~/.pi/agent/scripts/setup-pi-web.sh
 
@@ -103,6 +107,14 @@ Install or verify it with:
 The installer locates the global pi package without assuming a fixed nvm path. It only patches the exact supported official version/hash, applies changes in a temporary file, validates JavaScript syntax and the final hash, and safely refuses unknown or modified installations.
 
 An npm update may replace the patched vendor file. Run `--check` after updating pi. If the installed version is newer than `0.84.1`, do not force-copy the old JavaScript file; generate and validate a patch for the new version instead.
+
+## History Navigation and `/rewind`
+
+- **History navigation:** before browsing, ↑/↓ retain normal multiline-cursor behavior. In browse mode, ↑ moves to older history and ↓ to newer history; passing the newest entry restores the draft. Editing a recalled item exits browse mode. The global patch takes effect after restarting Pi.
+- **`/rewind`:** each invocation opens the selector. Choosing a user turn truncates that turn and everything after it from active context/transcript logic, and returns the selected text to the composer. Original JSONL and old branches remain available through `/tree`; files are not rolled back. It refuses while Pi is busy and works in TUI and PI WEB.
+- Images and other attachments are not restored automatically: only text is recovered, so re-attach them manually before resubmitting.
+
+The `smart-subagents` lifecycle reports duration in real time, uses a 30-minute default hard timeout with a 5-second TERM grace period, and records durable `stopped` results across reload/shutdown. See its dedicated README for details.
 
 ## Local TUI ↔ Phone/Web Session Handoff
 
