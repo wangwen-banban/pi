@@ -6,7 +6,7 @@ import {
   BASE, SCHEMA_VERSION, DEFAULT_CONTROL_TTL_MS,
   sessionsDir, sessionDir, runtimesDir, runtimeDir,
   requestsDir, requestTempPath, requestFinalPath, acksDir, ackPath,
-  isSafeId, parseRuntime, parseAgents, parsePlan, parseAck,
+  isSafeId, parseRuntime, parseAgents, parsePlan, parseBackgroundTasks, parseAck,
   buildControlEnvelope, matchAck, computeStatus,
 } from './activity-schema.js';
 
@@ -198,6 +198,7 @@ export async function refreshActivity(files, previousState, now, options = {}) {
     const runtimes = [];
     const agentsList = [];
     const plans = [];
+    const backgroundsList = [];
 
     for (const runtimeId of runtimeEntries) {
       // Read runtime.json (required)
@@ -257,6 +258,31 @@ export async function refreshActivity(files, previousState, now, options = {}) {
         }
       }
 
+      // Read optional background-tasks.json — exact identity binding prevents
+      // stale task plans from an older runtime generation being merged.
+      const backgroundPath = `${runtimeDir(sessionId, runtimeId)}/background-tasks.json`;
+      const backgroundReadResult = await safeRead(files, backgroundPath);
+      if (!backgroundReadResult.ok) {
+        return disconnectedResult(state, `background-tasks.json (${sessionId}/${runtimeId})`, failureDetail(backgroundReadResult), now);
+      }
+      if (!backgroundReadResult.enoent) {
+        const backgroundJsonResult = parseJsonSafe(backgroundReadResult.content, backgroundPath);
+        if (backgroundJsonResult.ok) {
+          try {
+            const parsedBackground = parseBackgroundTasks(backgroundJsonResult.value);
+            if (parsedBackground.sessionId !== sessionId || parsedBackground.runtimeId !== runtimeId) {
+              diagnostics = addDiagnostic({ diagnostics }, 'warn', `Identity mismatch at ${backgroundPath}`, now);
+            } else {
+              backgroundsList.push(parsedBackground);
+            }
+          } catch (err) {
+            diagnostics = addDiagnostic({ diagnostics }, 'warn', `Invalid background tasks at ${backgroundPath}: ${err.message}`, now);
+          }
+        } else {
+          diagnostics = addDiagnostic({ diagnostics }, 'warn', backgroundJsonResult.error, now);
+        }
+      }
+
       // Read optional plan-mode.json — must belong to this path session/runtime.
       const planPath = `${runtimeDir(sessionId, runtimeId)}/plan-mode.json`;
       const planReadResult = await safeRead(files, planPath);
@@ -282,8 +308,8 @@ export async function refreshActivity(files, previousState, now, options = {}) {
       }
     }
 
-    if (runtimes.length > 0 || agentsList.length > 0 || plans.length > 0) {
-      sessions[sessionId] = { runtimes, agentsList, plans };
+    if (runtimes.length > 0 || agentsList.length > 0 || plans.length > 0 || backgroundsList.length > 0) {
+      sessions[sessionId] = { runtimes, agentsList, plans, backgroundsList };
     }
   }
 

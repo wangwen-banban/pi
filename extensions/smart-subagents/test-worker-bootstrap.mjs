@@ -335,7 +335,15 @@ test("offline smoke: installed pi --list-models registers both worker providers 
 	};
 
 	const run = async (args) => {
-		const invocation = getPiInvocation(args);
+		// This smoke must exercise the installed Pi CLI regardless of whether the
+		// outer test process itself came from TUI, CI, or PI WEB. Model the embedded
+		// host explicitly; otherwise a generic Node runtime can mistake this test
+		// file for cli.js and recursively execute the test suite.
+		const invocation = getPiInvocation(args, {
+			argv1: process.argv[1],
+			execPath: process.execPath,
+			env: { ...env, PI_WEB_SESSION: "1" },
+		});
 		const child = spawn(invocation.command, invocation.args, {
 			cwd: agentDir,
 			env,

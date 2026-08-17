@@ -16,7 +16,7 @@ const plugin = {
           {
             id: 'workspace.open-activity',
             title: 'Open Activity',
-            description: 'Open live sub-agent and Plan Mode activity for this workspace.',
+            description: 'Open live sub-agent, main-agent task plan, background command, and Plan Mode activity for this workspace.',
             group: 'Workspace',
             enabled: (context) => context.state.selectedWorkspace !== undefined,
             run: (context) => {

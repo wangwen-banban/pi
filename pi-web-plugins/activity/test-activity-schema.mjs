@@ -9,10 +9,10 @@ import {
   isSafeId, assertSafeId,
   sessionsDir, sessionDir, runtimesDir, runtimeDir,
   requestsDir, requestTempPath, requestFinalPath, acksDir, ackPath,
-  parseRuntime, parseAgents, parseJob, parsePlan, parseAck,
+  parseRuntime, parseAgents, parseJob, parsePlan, parseBackgroundTasks, parseBackgroundTask, parseBackgroundRun, parseAck,
   extractSafeSessionId,
   computeStatus, computeJobTiming, projectSession, newestRuntimePerSource,
-  isJobActive, isActiveJobStatus, isTerminalJobStatus,
+  isJobActive, isBackgroundRunActive, isActiveJobStatus, isTerminalJobStatus,
   buildControlEnvelope, matchAck,
 } from './activity-schema.js';
 
@@ -90,6 +90,25 @@ function mkPlan(overrides = {}) {
     since: 900,
     updatedAt: 2000,
     heartbeatAt: 2000,
+    ...overrides,
+  };
+}
+
+function mkBackground(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    sessionId: 'sess1',
+    runtimeId: 'bg1',
+    generation: 1,
+    revision: 3,
+    updatedAt: 3000,
+    tasks: [
+      { id: 'run', name: 'run', status: 'in_progress', position: 0, updatedAt: 2500, runId: 'bg-run-1' },
+      { id: 'next', name: 'next', status: 'pending', position: 1, updatedAt: 2500 },
+    ],
+    runs: [
+      { id: 'bg-run-1', taskId: 'run', name: 'run', status: 'running', stopping: false, createdAt: 2000, startedAt: 2100, lastOutputAt: 2900, timeoutAt: 9000 },
+    ],
     ...overrides,
   };
 }
@@ -506,6 +525,61 @@ describe('parseJob', () => {
     assert.equal(j.title, undefined);
     assert.equal(j.detail, undefined);
     assert.equal(j.endedAt, undefined);
+  });
+});
+
+// ========================================================================
+// parseBackgroundTasks
+// ========================================================================
+
+describe('parseBackgroundTasks', () => {
+  it('parses dynamic task-plan and managed-run lifecycle records', () => {
+    const result = parseBackgroundTasks(mkBackground());
+    assert.equal(result.revision, 3);
+    assert.deepEqual(result.tasks.map(task => [task.id, task.status]), [
+      ['run', 'in_progress'],
+      ['next', 'pending'],
+    ]);
+    assert.equal(result.runs[0].id, 'bg-run-1');
+    assert.equal(result.runs[0].status, 'running');
+    assert.equal(isBackgroundRunActive(result.runs[0]), true);
+  });
+
+  it('accepts every task and run terminal status without defaulting unknown values', () => {
+    for (const status of ['pending', 'in_progress', 'completed', 'failed', 'blocked', 'cancelled']) {
+      assert.equal(parseBackgroundTask({ id: 'task', name: 'task', status, position: 0, updatedAt: 1 }).status, status);
+    }
+    for (const status of ['running', 'completed', 'failed', 'stopped']) {
+      assert.equal(parseBackgroundRun({ id: 'run', taskId: 'task', name: 'run', status, createdAt: 1 }).status, status);
+    }
+    assert.throws(() => parseBackgroundTask({ id: 'task', name: 'task', status: 'mystery', position: 0, updatedAt: 1 }), /unknown status/);
+    assert.throws(() => parseBackgroundRun({ id: 'run', taskId: 'task', name: 'run', status: 'mystery', createdAt: 1 }), /unknown status/);
+  });
+
+  it('rejects duplicate or unsafe ids and malformed revision/timestamps', () => {
+    assert.throws(() => parseBackgroundTasks(mkBackground({ revision: -1 })), /revision/);
+    assert.throws(() => parseBackgroundTasks(mkBackground({ tasks: [
+      { id: 'same', name: 'same', status: 'pending', position: 0, updatedAt: 1 },
+      { id: 'same', name: 'same', status: 'pending', position: 1, updatedAt: 1 },
+    ] })), /duplicate task id/);
+    assert.throws(() => parseBackgroundTasks(mkBackground({ runs: [
+      { id: '../bad', taskId: 'run', name: 'bad', status: 'running', createdAt: 1 },
+    ] })), /unsafe id/);
+    assert.throws(() => parseBackgroundTasks(mkBackground({ updatedAt: Number.NaN })), /updatedAt/);
+  });
+
+  it('never surfaces command, title, output, credential or pid fields', () => {
+    const parsed = parseBackgroundTasks(mkBackground({
+      command: 'secret command',
+      title: 'secret title',
+      output: 'secret output',
+      apiKey: 'secret key',
+      pid: 1234,
+    }));
+    const serialized = JSON.stringify(parsed);
+    for (const secret of ['secret command', 'secret title', 'secret output', 'secret key', '1234']) {
+      assert.equal(serialized.includes(secret), false);
+    }
   });
 });
 
@@ -964,6 +1038,39 @@ describe('projectSession', () => {
     const proj = projectSession({ runtimes: [rt], agentsList: [agents], now: 5000 });
     assert.equal(proj.activeCount, 4);
     assert.equal(proj.badge, '4');
+  });
+
+  it('binds only the selected background runtime and includes managed runs in the total badge', () => {
+    const smart = parseRuntime(mkRuntime()).public;
+    const agents = parseAgents(mkAgents({ jobs: [mkJob({ id: 'smart-job', status: 'running' })] }));
+    const backgroundRuntime = parseRuntime(mkRuntime({
+      source: 'background-tasks',
+      runtimeId: 'bg1',
+      generation: 1,
+      controlToken: undefined,
+      jobs: { total: 1, active: 1 },
+    })).public;
+    const staleBackgroundRuntime = parseRuntime(mkRuntime({
+      source: 'background-tasks',
+      runtimeId: 'bg-old',
+      generation: 0,
+      controlToken: undefined,
+    })).public;
+    const current = parseBackgroundTasks(mkBackground());
+    const stale = parseBackgroundTasks(mkBackground({ runtimeId: 'bg-old', generation: 0, revision: 99, tasks: [], runs: [] }));
+    const proj = projectSession({
+      runtimes: [smart, backgroundRuntime, staleBackgroundRuntime],
+      agentsList: [agents],
+      backgroundsList: [stale, current],
+      now: 5000,
+    });
+    assert.equal(proj.activeCount, 1);
+    assert.equal(proj.backgroundActiveCount, 1);
+    assert.equal(proj.totalActiveCount, 2);
+    assert.equal(proj.badge, '2');
+    assert.equal(proj.background.revision, 3);
+    assert.deepEqual(proj.backgroundTasks.map(task => task.id), ['run', 'next']);
+    assert.deepEqual(proj.backgroundRuns.map(run => run.id), ['bg-run-1']);
   });
 
   it('badge is empty when no active jobs', () => {

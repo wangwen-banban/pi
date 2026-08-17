@@ -42,7 +42,7 @@ import {
 
 const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 
-const WRITE_TOOLS = new Set(["bash", "edit", "write"]);
+const WRITE_TOOLS = new Set(["bash", "edit", "write", "run_background_task"]);
 
 interface PlanModeSettings {
 	/** Master switch: allow provably read-only bash in plan mode (default true). */
@@ -274,7 +274,7 @@ export default function planMode(pi: ExtensionAPI) {
 		return {
 			systemPrompt:
 				"[PLAN MODE ACTIVE]\n" +
-				"You are currently in PLAN MODE. `edit` and `write` are fully BLOCKED.\n" +
+				"You are currently in PLAN MODE. `edit`, `write`, and `run_background_task` are fully BLOCKED.\n" +
 				"`bash` IS available for read-only commands — ls, cat, head, tail, grep, rg, find, fd, wc, " +
 				"jq, sed (without -i), awk, stat, tree, file, du, git log/diff/show/status/blame/ls-files, " +
 				"npm ls, docker ps, and similar inspection commands all run normally. Pipes and " +
@@ -414,7 +414,7 @@ export default function planMode(pi: ExtensionAPI) {
 							"• ask_user — present options or clarify requirements",
 							"• exit_plan_mode — present final plan for user approval",
 							"",
-							"Blocked: bash, edit, write (until plan is approved)",
+							"Blocked: mutating bash, edit, write, run_background_task (until plan is approved)",
 						].filter(Boolean).join("\n"),
 					},
 				],

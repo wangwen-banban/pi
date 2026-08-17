@@ -10,7 +10,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
   SCHEMA_VERSION, sessionsDir, runtimesDir, runtimeDir,
-  parseRuntime, parseAgents, parsePlan,
+  parseRuntime, parseAgents, parsePlan, parseBackgroundTasks,
 } from './activity-schema.js';
 import { buildViewModel, formatDuration } from './activity-view-model.js';
 import {
@@ -25,6 +25,7 @@ import {
   truncateText,
   jobStatusPresentation,
   smartStatusPresentation,
+  backgroundStatusPresentation,
   planChipPresentation,
   stopUnavailableReasonForSession,
   stopUnavailableReasonForJob,
@@ -206,6 +207,7 @@ function viewState({
   runtimeOverrides = {},
   capability = true,
   withPlan = false,
+  withBackground = false,
   planOverrides = {},
   planRuntimeOverrides = {},
   disconnected = false,
@@ -250,12 +252,45 @@ function viewState({
       ...planOverrides,
     }));
   }
+  const backgroundsList = [];
+  if (withBackground) {
+    const backgroundRuntimeId = `rt-bg-${sessionId}`;
+    runtimes.push(parseRuntime({
+      schemaVersion: SCHEMA_VERSION,
+      source: 'background-tasks',
+      sessionId,
+      runtimeId: backgroundRuntimeId,
+      generation: 0,
+      state: 'active',
+      startedAt: NOW - 120_000,
+      updatedAt: NOW - 1_000,
+      heartbeatAt: NOW - 1_000,
+      jobs: { total: 1, active: 1 },
+    }).public);
+    backgroundsList.push(parseBackgroundTasks({
+      schemaVersion: SCHEMA_VERSION,
+      sessionId,
+      runtimeId: backgroundRuntimeId,
+      generation: 0,
+      revision: 6,
+      updatedAt: NOW - 1_000,
+      tasks: [
+        { id: 'benchmark', name: 'benchmark', status: 'in_progress', position: 0, updatedAt: NOW - 60_000, runId: 'bg-run-1' },
+        { id: 'analyze', name: 'analyze', status: 'pending', position: 1, updatedAt: NOW - 60_000 },
+        { id: 'done', name: 'done', status: 'completed', position: 2, updatedAt: NOW - 120_000 },
+      ],
+      runs: [{
+        id: 'bg-run-1', taskId: 'benchmark', name: 'benchmark', status: 'running', stopping: false,
+        createdAt: NOW - 70_000, startedAt: NOW - 60_000, lastOutputAt: NOW - 5_000, timeoutAt: NOW + 60_000,
+      }],
+    }));
+  }
   const capabilities = {};
   if (capability && smart.capability) capabilities[`${sessionId}/rt-${sessionId}`] = smart.capability;
   return {
     cacheKey: 'm::w',
     disconnected,
-    snapshot: { sessions: { [sessionId]: { runtimes, agentsList: [agents], plans } } },
+    snapshot: { sessions: { [sessionId]: { runtimes, agentsList: [agents], plans, backgroundsList } } },
     capabilities,
     pendingRequests: {},
     diagnostics,
@@ -295,6 +330,8 @@ describe('escape helpers', () => {
 describe('presentations', () => {
   it('jobStatusPresentation maps every status to a clear label + tone', () => {
     const expected = {
+      pending: 'info',
+      in_progress: 'live',
       routing: 'info',
       queued: 'info',
       running: 'live',
@@ -302,6 +339,8 @@ describe('presentations', () => {
       stale: 'warn',
       completed: 'ok',
       failed: 'danger',
+      blocked: 'warn',
+      cancelled: 'muted',
       stopped: 'muted',
     };
     for (const [status, tone] of Object.entries(expected)) {
@@ -321,6 +360,9 @@ describe('presentations', () => {
     assert.equal(smartStatusPresentation('stale').label, 'smart · stale');
     assert.equal(smartStatusPresentation('shutdown').tone, 'danger');
     assert.equal(smartStatusPresentation('idle').label, 'no smart runtime');
+    assert.deepEqual(backgroundStatusPresentation('active'), { label: 'monitor · live', tone: 'live' });
+    assert.equal(backgroundStatusPresentation('stale').label, 'monitor · stale');
+    assert.equal(backgroundStatusPresentation('shutdown').tone, 'danger');
 
     const chip = planChipPresentation({ state: 'active', reason: 'refining architecture', since: NOW - 60_000, runtimeStatus: 'active' }, NOW);
     assert.equal(chip.stateLabel, '');
@@ -350,8 +392,8 @@ describe('presentations', () => {
   });
 
   it('confirmStopAllMessage names the session', () => {
-    assert.equal(confirmStopAllMessage('sess1'), 'Stop all active job(s) in session sess1?');
-    assert.equal(confirmStopAllMessage('sess1', 3), 'Stop all 3 active job(s) in session sess1?');
+    assert.equal(confirmStopAllMessage('sess1'), 'Stop all active sub-agent job(s) in session sess1?');
+    assert.equal(confirmStopAllMessage('sess1', 3), 'Stop all 3 active sub-agent job(s) in session sess1?');
   });
 });
 
@@ -369,7 +411,7 @@ describe('renderActivityPanelHtml — structure', () => {
     assert.ok(empty.includes('>Activity<'));
     assert.ok(empty.includes('data-refresh'));
     assert.ok(empty.includes('No activity records'));
-    assert.ok(!empty.includes('Stop all'));
+    assert.ok(!empty.includes('Stop agents'));
   });
 
   it('renders a representative active session (toolbar, badge, chips, fields, details)', () => {
@@ -390,7 +432,7 @@ describe('renderActivityPanelHtml — structure', () => {
     // stop controls with exact ids
     assert.ok(html.includes('data-stop-all="sess1"'));
     assert.ok(!html.includes('data-stop-all="sess1" disabled'), 'stop all enabled when fresh');
-    assert.ok(html.includes('>Stop all<'));
+    assert.ok(html.includes('>Stop agents<'));
     assert.ok(html.includes('data-stop-one="j1"'));
     assert.ok(html.includes('data-session-id="sess1"'));
     assert.ok(!html.includes('data-stop-one="j1" disabled'), 'stop one enabled when fresh');
@@ -410,6 +452,27 @@ describe('renderActivityPanelHtml — structure', () => {
     assert.ok(html.includes('preview deployed'));
     assert.ok(html.includes('Log path'));
     assert.ok(html.includes('/tmp/j1.log'));
+  });
+
+  it('renders dynamic main-agent task plan and managed background runs', () => {
+    const view = buildViewModel(viewState({ withBackground: true }), 'sess1', NOW);
+    const html = renderActivityPanelHtml(view, {});
+    assert.ok(html.includes('aria-label="2 active jobs"'));
+    assert.ok(html.includes('Main-agent Tasks · revision 6'));
+    assert.ok(html.includes('monitor · live'));
+    assert.ok(html.includes('class="task-plan"'));
+    assert.ok(html.includes('benchmark'));
+    assert.ok(html.includes('in_progress'));
+    assert.ok(html.includes('analyze'));
+    assert.ok(html.includes('pending'));
+    assert.ok(html.includes('done'));
+    assert.ok(html.includes('completed'));
+    assert.ok(html.includes('Managed runs'));
+    assert.ok(html.includes('background-run-card'));
+    assert.ok(html.includes('task <code>benchmark</code>'));
+    assert.ok(html.includes('<span class="field-label">progress</span> 5s ago'));
+    // Background records are display-only in v1; only the smart job owns Stop.
+    assert.equal((html.match(/data-stop-one=/g) ?? []).length, 1);
   });
 
   it('stale runtime: job shows stale, all stop controls disabled with a reason', () => {
@@ -585,6 +648,17 @@ describe('renderActivityPanelHtml — XSS and secrecy', () => {
         primarySource: 'smart-subagents',
         primaryGeneration: 0,
         plan: { state: 'active', reason: evil, since: NOW - 1_000, runtimeStatus: 'active' },
+        background: {
+          revision: evil,
+          runtimeStatus: 'active',
+          activeCount: 1,
+          tasks: [{ id: evil, name: evil, status: evil, position: 0, updatedAt: NOW, runId: evil }],
+          runs: [{
+            id: evil, taskId: evil, name: evil, status: evil, backendStatus: 'running', stopping: false,
+            elapsed: 1_000, progressAge: 500, timedOut: false, timeoutAt: NOW + 1_000,
+            exitCode: null, signal: evil, terminationReason: evil, canStop: false,
+          }],
+        },
         jobs: [{
           id: '"><img onerror=alert(1)>',
           name: evil,

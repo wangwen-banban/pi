@@ -71,6 +71,7 @@ const factory = createSessionSyncExtension({
 });
 
 const handlers = new Map();
+const eventBusHandlers = new Map();
 const commands = new Map();
 const mockPi = {
 	on: (event, handler) => {
@@ -79,6 +80,14 @@ const mockPi = {
 		handlers.set(event, list);
 	},
 	registerCommand: (name, options) => commands.set(name, options),
+	events: {
+		on: (channel, handler) => {
+			const list = eventBusHandlers.get(channel) ?? [];
+			list.push(handler);
+			eventBusHandlers.set(channel, list);
+			return () => {};
+		},
+	},
 };
 
 factory(mockPi);
@@ -86,6 +95,12 @@ factory(mockPi);
 async function fire(event, payload = {}) {
 	for (const handler of handlers.get(event) ?? []) {
 		await handler({ type: event, ...payload }, ctx);
+	}
+}
+
+async function fireChannel(channel, payload = {}) {
+	for (const handler of eventBusHandlers.get(channel) ?? []) {
+		await handler(payload);
 	}
 }
 
@@ -126,6 +141,20 @@ await fire("thinking_level_select", { level: "max", previousLevel: "high" });
 await sleep(FAST_QUIET_MS + FAST_POLL_MS);
 assert.equal(ctx.ui.widgets.has("session-drift"), false, "local thinking switch must not look external");
 console.log("✓ local thinking switch does not trigger /sync warning");
+
+await sleep(FAST_QUIET_MS + FAST_POLL_MS);
+append({
+	type: "custom",
+	id: "background001",
+	parentId: "think001",
+	timestamp: new Date().toISOString(),
+	customType: "background-task-plan-v1",
+	data: { revision: 2 },
+});
+await fireChannel("background-task:completed", { run: { id: "bg-1" } });
+await sleep(FAST_QUIET_MS + FAST_POLL_MS);
+assert.equal(ctx.ui.widgets.has("session-drift"), false, "local background completion must not look external");
+console.log("✓ local background completion hook does not trigger /sync warning");
 
 // A write with no local event is still external drift and must fail closed.
 await sleep(FAST_QUIET_MS + FAST_POLL_MS);

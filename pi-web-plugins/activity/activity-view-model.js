@@ -12,6 +12,7 @@
 import {
   SOURCE_SMART,
   SOURCE_PLAN,
+  SOURCE_BACKGROUND,
   DEFAULT_JOB_TIMEOUT_MS,
   DEFAULT_CONTROL_TTL_MS,
   MAX_STR,
@@ -19,6 +20,7 @@ import {
   computeStatus,
   projectSession,
   isJobActive,
+  isBackgroundRunActive,
   extractSafeSessionId,
 } from './activity-schema.js';
 
@@ -148,6 +150,38 @@ function planView(planRecord, planRuntime, now) {
   };
 }
 
+function backgroundTaskView(task) {
+  return {
+    id: task.id,
+    name: boundStr(task.name),
+    status: task.status,
+    position: task.position,
+    updatedAt: task.updatedAt,
+    runId: boundStr(task.runId),
+  };
+}
+
+function backgroundRunView(run, runtimeStatus) {
+  const active = isBackgroundRunActive(run);
+  const status = active && runtimeStatus === 'stale' ? 'stale' : run.stopping && active ? 'stopping' : run.status;
+  return {
+    id: run.id,
+    taskId: run.taskId,
+    name: boundStr(run.name),
+    status,
+    backendStatus: run.status,
+    stopping: run.stopping === true && active,
+    elapsed: run.timing ? run.timing.elapsed : 0,
+    progressAge: run.timing ? run.timing.progressAge : 0,
+    timedOut: run.timing ? run.timing.timedOut === true : false,
+    timeoutAt: run.timeoutAt ?? null,
+    exitCode: run.exitCode ?? null,
+    signal: boundStr(run.signal),
+    terminationReason: boundStr(run.terminationReason),
+    canStop: false,
+  };
+}
+
 // Stop ownership handed to the controller: only a boolean + owner ids.
 // `available` means there is at least one active job AND a fresh, active smart
 // runtime whose private control capability is present. Never the token.
@@ -189,6 +223,7 @@ export function buildViewModel(state, selectedSession, now, options = {}) {
       runtimes: data.runtimes || [],
       agentsList: data.agentsList || [],
       plans: data.plans || [],
+      backgroundsList: data.backgroundsList || [],
       now,
       jobTimeoutMs,
     });
@@ -212,25 +247,40 @@ export function buildViewModel(state, selectedSession, now, options = {}) {
     const pending = pendingActionsFor(state, sessionId, smartRuntime);
     const jobs = proj.jobs.map((job) => jobView(job, smartStatus, pending, freshActiveSmart));
 
-    const activeCount = proj.activeCount;
+    const smartActiveCount = proj.activeCount;
+    const backgroundActiveCount = proj.backgroundActiveCount;
+    const activeCount = proj.totalActiveCount;
     totalActive += activeCount;
 
     const planRuntime = proj.sources.get(SOURCE_PLAN) || null;
+    const backgroundRuntime = proj.sources.get(SOURCE_BACKGROUND) || null;
+    const backgroundStatus = computeStatus(backgroundRuntime, now);
+    const background = {
+      revision: proj.background ? proj.background.revision : 0,
+      runtimeStatus: backgroundStatus,
+      activeCount: backgroundActiveCount,
+      tasks: proj.backgroundTasks.map(backgroundTaskView),
+      runs: proj.backgroundRuns.map((run) => backgroundRunView(run, backgroundStatus)),
+    };
 
     sessions.push({
       sessionId,
       selected: sessionId === selectedId,
       status: proj.status,
       smartStatus,
+      backgroundStatus,
       active: activeCount > 0,
       activeCount,
+      smartActiveCount,
+      backgroundActiveCount,
       badge: proj.badge,
       hasRuntime: proj.primary != null,
       primarySource: proj.primary ? proj.primary.source : null,
       primaryGeneration: proj.primary ? proj.primary.generation : null,
       plan: planView(proj.plan, planRuntime, now),
+      background,
       jobs,
-      stop: stopView(sessionId, smartRuntime, freshActiveSmart, activeCount, controlUnavailableReason),
+      stop: stopView(sessionId, smartRuntime, freshActiveSmart, smartActiveCount, controlUnavailableReason),
       stopPending: pending.stopAll || pending.stopOneIds.size > 0,
     });
   }

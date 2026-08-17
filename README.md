@@ -35,6 +35,7 @@ Edit `provider-routing.json` to change the primary Codex route:
 | `codex-multi-account` | Independent OAuth identity for `openai-codex-second` |
 | `plan-mode` | Tool-enforced read-only planning with interactive approval |
 | `smart-subagents` | Concurrent task delegation with model routing |
+| `background-tasks` | Dynamic main-agent task plan plus managed long-command completion wakeups |
 | `btw` | Disposable multi-turn side conversations with optional `/keep` persistence |
 | `custom-statusline` | Provider, thinking, token, context, and Codex quota status |
 | `codex-web-search` | Live web search |
@@ -163,6 +164,21 @@ If you accidentally sent input from a stale position, the session file now conta
 - Only active in TUI mode; RPC/print/JSON modes are unaffected.
 - `/sync` refuses to run while the agent is streaming (to avoid aborting active work).
 
+## Main-agent Background Tasks
+
+For a long benchmark, build, deployment, training run, or data job, the main agent can maintain a dynamic Codex-style plan with `update_task_plan`, then start the blocking step with `run_background_task`. The managed tool returns immediately and owns the command lifecycle; raw `cmd &`, `nohup`, `disown`, and PID polling are intentionally not used.
+
+The task list remains editable while the command runs. New user prompts can add, cancel, or reprioritize pending work using the current plan revision. Exit 0, non-zero exit, signal, timeout, or explicit stop updates the linked task and injects one safe follow-up that wakes the main LLM with the latest plan and next pending task. Completion never interrupts an in-flight answer.
+
+```text
+/tasks
+/tasks stop <run-id-or-task-id>
+/tasks stop all
+/tasks clear-completed
+```
+
+Private logs live under `~/.pi/agent/background-task-runs/` with user-only permissions and are Git-ignored. PI WEB Activity receives only task ids/names, statuses, revision, and timing—never the command, full task text, output, credentials, context, or PID. See [`extensions/background-tasks/README.md`](extensions/background-tasks/README.md).
+
 ## Remote Control with PI WEB
 
 [`@jmfederico/pi-web@1.202608.1`](https://github.com/jmfederico/pi-web) runs as an independent browser service compatible with Pi `0.84.1`. It is installed globally, not loaded as a Pi Extension, so it does not add `/pi-web` or extra extension code to normal Pi processes.
@@ -202,7 +218,7 @@ Install the trusted browser-only Activity plugin (no web/sessiond restart):
 ~/.pi/agent/scripts/setup-pi-web-activity-plugin.sh --check
 ```
 
-Then hard-refresh the browser. The **Activity** workspace panel and badge show sub-agent routing/queue/running/stopping/terminal states, model/thinking, locally ticking elapsed time, progress age, stale/disconnected state, Plan Mode, and safe Stop one/all controls. Records survive browser reconnects under the Git-excluded workspace path `.pi/.runtime/pi-web-activity/v1/`; they never contain full delegated tasks, parent context, live output, credentials, or PIDs.
+Then hard-refresh the browser. The **Activity** workspace panel and badge show sub-agent routing/queue/running/stopping/terminal states, dynamic main-agent task plans and managed background runs, model/thinking, locally ticking elapsed time, progress age, stale/disconnected state, Plan Mode, and safe sub-agent Stop one/all controls. Records survive browser reconnects under the Git-excluded workspace path `.pi/.runtime/pi-web-activity/v1/`; they never contain full delegated tasks, parent context, live output, credentials, or PIDs.
 
 After changing the supporting Pi extensions, wait until no delegated worker is active and run `/reload` once in chat. Reloading while a worker is active intentionally stops it. A browser hard refresh loads browser-plugin changes; `/reload` loads Pi extension changes. Neither action requires restarting sessiond.
 

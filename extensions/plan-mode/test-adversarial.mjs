@@ -1,3 +1,5 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { classifyCommand } from "./readonly-check.ts";
 
 // Evasion attempts — none of these may return "allow"
@@ -118,4 +120,10 @@ if (fails.length) {
   for (const f of fails) console.log(`  ${f.problem}\n    cmd: ${f.cmd}\n    why: ${f.why}`);
   process.exit(1);
 }
+const planModeSource = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+assert.match(
+  planModeSource,
+  /WRITE_TOOLS = new Set\(\["bash", "edit", "write", "run_background_task"\]\)/,
+  "plan mode must block managed background commands as a write/process-control bypass",
+);
 console.log("No evasions, no false blocks ✓");

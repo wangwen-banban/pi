@@ -49,6 +49,16 @@ const LOCAL_ACTIVITY_EVENTS = [
 	"thinking_level_select",
 ] as const;
 
+/** Background lifecycle channels append local custom entries while the TUI is otherwise quiet. */
+const LOCAL_ACTIVITY_CHANNELS = [
+	"smart-subagent:completed",
+	"smart-subagent:failed",
+	"smart-subagent:stopped",
+	"background-task:completed",
+	"background-task:failed",
+	"background-task:stopped",
+] as const;
+
 type ResolvedSessionSyncOptions = Required<SessionSyncOptions>;
 
 export function createSessionSyncExtension(options: SessionSyncOptions = {}) {
@@ -153,12 +163,16 @@ function registerSessionSync(
 
 	// ── Local activity tracking ─────────────────────────────────
 
+	const recordLocalActivity = () => {
+		lastLocalActivity = Date.now();
+		needsBaselineRefresh = true;
+		clearWarning();
+	};
 	for (const eventType of LOCAL_ACTIVITY_EVENTS) {
-		pi.on(eventType, () => {
-			lastLocalActivity = Date.now();
-			needsBaselineRefresh = true;
-			clearWarning();
-		});
+		pi.on(eventType, recordLocalActivity);
+	}
+	for (const channel of LOCAL_ACTIVITY_CHANNELS) {
+		pi.events.on(channel, recordLocalActivity);
 	}
 
 	// ── /sync command ────────────────────────────────────────────

@@ -225,7 +225,7 @@ export function createActivityController(deps = {}) {
       if (!isActiveJobStatus(job.backendStatus)) return `Job ${job.id} is not active`;
     }
     if (!session.stop) return 'Stop unavailable: no smart runtime owner for this session';
-    if (session.activeCount === 0) return 'Stop unavailable: no active jobs';
+    if ((session.smartActiveCount ?? session.activeCount) === 0) return 'Stop unavailable: no active sub-agent jobs';
     if (session.smartStatus === 'stale') return 'Stop unavailable: smart runtime is stale';
     if (session.smartStatus === 'shutdown') return 'Stop unavailable: smart runtime has shut down';
     if (session.smartStatus === 'idle') return 'Stop unavailable: smart runtime is missing';

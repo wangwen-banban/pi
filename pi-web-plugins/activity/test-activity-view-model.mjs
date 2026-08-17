@@ -1,7 +1,7 @@
 // test-activity-view-model.mjs — node --test suite for activity-view-model.js
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseRuntime, parseAgents, parsePlan, HEARTBEAT_STALE_MS } from './activity-schema.js';
+import { parseRuntime, parseAgents, parsePlan, parseBackgroundTasks, HEARTBEAT_STALE_MS } from './activity-schema.js';
 import {
   buildViewModel, computeJobDisplayStatus, formatDuration, formatRelative,
 } from './activity-view-model.js';
@@ -80,7 +80,26 @@ function mkPlan(overrides = {}) {
   };
 }
 
-function sessionState({ sessionId = 'sess1', runtimes = [], agentsList = [], plans = [], capability = true, overrides = {} } = {}) {
+function mkBackground(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    sessionId: 'sess1',
+    runtimeId: 'bg1',
+    generation: 0,
+    revision: 4,
+    updatedAt: 5000,
+    tasks: [
+      { id: 'run', name: 'run', status: 'in_progress', position: 0, updatedAt: 4500, runId: 'bg-run-1' },
+      { id: 'next', name: 'next', status: 'pending', position: 1, updatedAt: 4500 },
+    ],
+    runs: [
+      { id: 'bg-run-1', taskId: 'run', name: 'run', status: 'running', stopping: false, createdAt: 4000, startedAt: 4100, lastOutputAt: 4900, timeoutAt: 20_000 },
+    ],
+    ...overrides,
+  };
+}
+
+function sessionState({ sessionId = 'sess1', runtimes = [], agentsList = [], plans = [], backgroundsList = [], capability = true, overrides = {} } = {}) {
   const capabilities = {};
   for (const r of runtimes) {
     if (r.source === 'smart-subagents' && capability) {
@@ -94,7 +113,7 @@ function sessionState({ sessionId = 'sess1', runtimes = [], agentsList = [], pla
     disconnected: false,
     snapshot: {
       sessions: {
-        [sessionId]: { runtimes, agentsList, plans },
+        [sessionId]: { runtimes, agentsList, plans, backgroundsList },
       },
     },
     capabilities,
@@ -327,6 +346,45 @@ describe('buildViewModel — statuses and plan', () => {
     assert.equal(job.resultSummary, 'done');
     assert.equal(job.logPath, '/tmp/x.json');
     assert.equal(job.canStop, true);
+  });
+
+  it('projects dynamic main-agent task plan and managed run timing into the total badge', () => {
+    const backgroundRt = parseRuntime(mkRuntime({
+      source: 'background-tasks', runtimeId: 'bg1', controlToken: undefined, heartbeatAt: 5000,
+      jobs: { total: 1, active: 1 },
+    })).public;
+    const background = parseBackgroundTasks(mkBackground());
+    const state = sessionState({ runtimes: [backgroundRt], backgroundsList: [background], capability: false });
+    const view = buildViewModel(state, null, 6000);
+    const session = view.sessions[0];
+    assert.equal(view.totalActive, 1);
+    assert.equal(view.badge, '1');
+    assert.equal(session.activeCount, 1);
+    assert.equal(session.smartActiveCount, 0);
+    assert.equal(session.backgroundActiveCount, 1);
+    assert.equal(session.background.revision, 4);
+    assert.deepEqual(session.background.tasks.map(task => [task.id, task.status]), [
+      ['run', 'in_progress'],
+      ['next', 'pending'],
+    ]);
+    assert.equal(session.background.runs[0].status, 'running');
+    assert.equal(session.background.runs[0].elapsed, 1900);
+    assert.equal(session.background.runs[0].progressAge, 1100);
+    assert.equal(session.stop, null, 'read-only Web task display has no stop capability');
+  });
+
+  it('stale background runtime marks only its active managed runs stale', () => {
+    const backgroundRt = parseRuntime(mkRuntime({
+      source: 'background-tasks', runtimeId: 'bg1', controlToken: undefined, heartbeatAt: undefined,
+    })).public;
+    const background = parseBackgroundTasks(mkBackground({ runs: [
+      ...mkBackground().runs,
+      { id: 'done', taskId: 'next', name: 'done', status: 'completed', createdAt: 1000, startedAt: 1100, finishedAt: 1200 },
+    ] }));
+    const view = buildViewModel(sessionState({ runtimes: [backgroundRt], backgroundsList: [background], capability: false }), null, 6000);
+    const runs = Object.fromEntries(view.sessions[0].background.runs.map(run => [run.id, run]));
+    assert.equal(runs['bg-run-1'].status, 'stale');
+    assert.equal(runs.done.status, 'completed');
   });
 
   it('plan chip carries state/reason/since plus independent plan runtime liveness', () => {

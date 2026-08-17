@@ -213,7 +213,7 @@ export function activityWorkspaceLabelItems(context) {
       });
     }
     if (view.totalActive > 0) {
-      items.push({ type: 'text', text: `${view.totalActive} active`, title: 'Active subagent job(s) across sessions' });
+      items.push({ type: 'text', text: `${view.totalActive} active`, title: 'Active sub-agent and main-agent background job(s) across sessions' });
     }
     const planSessions = view.sessions.filter((s) => s.plan && s.plan.state === 'active');
     for (const session of planSessions.slice(0, 3)) {
@@ -234,6 +234,8 @@ export function activityWorkspaceLabelItems(context) {
 export function jobStatusPresentation(job, disconnected = false) {
   const base = String(job && job.status ? job.status : 'idle');
   const tones = {
+    pending: 'info',
+    in_progress: 'live',
     routing: 'info',
     queued: 'info',
     running: 'live',
@@ -241,6 +243,8 @@ export function jobStatusPresentation(job, disconnected = false) {
     stale: 'warn',
     completed: 'ok',
     failed: 'danger',
+    blocked: 'warn',
+    cancelled: 'muted',
     stopped: 'muted',
     idle: 'muted',
   };
@@ -257,6 +261,15 @@ export function smartStatusPresentation(smartStatus) {
     case 'stale': return { label: 'smart · stale', tone: 'warn' };
     case 'shutdown': return { label: 'smart · shut down', tone: 'danger' };
     default: return { label: 'no smart runtime', tone: 'muted' };
+  }
+}
+
+export function backgroundStatusPresentation(status) {
+  switch (status) {
+    case 'active': return { label: 'monitor · live', tone: 'live' };
+    case 'stale': return { label: 'monitor · stale', tone: 'warn' };
+    case 'shutdown': return { label: 'monitor · shut down', tone: 'danger' };
+    default: return { label: 'monitor unavailable', tone: 'muted' };
   }
 }
 
@@ -281,7 +294,7 @@ export function stopUnavailableReasonForSession(session, disconnected = false) {
   if (disconnected) return 'Stop unavailable while disconnected from activity records';
   if (session.stopPending) return 'Stop request already pending';
   if (!session.stop) return 'Stop unavailable: no smart runtime owner for this session';
-  if (session.activeCount === 0) return 'Stop unavailable: no active jobs';
+  if ((session.smartActiveCount ?? session.activeCount) === 0) return 'Stop unavailable: no active sub-agent jobs';
   if (session.smartStatus === 'stale') return 'Stop unavailable: smart runtime is stale';
   if (session.smartStatus === 'shutdown') return 'Stop unavailable: smart runtime has shut down';
   if (session.smartStatus === 'idle') return 'Stop unavailable: smart runtime is missing';
@@ -303,7 +316,7 @@ export function stopUnavailableReasonForJob(job, session, disconnected = false) 
 
 export function confirmStopAllMessage(sessionId, activeCount) {
   const count = Number.isFinite(activeCount) && activeCount > 0 ? ` ${activeCount}` : '';
-  return `Stop all${count} active job(s) in session ${sessionId}?`;
+  return `Stop all${count} active sub-agent job(s) in session ${sessionId}?`;
 }
 
 function guardedConfirm(message) {
@@ -416,6 +429,56 @@ function renderJob(job, session, view, detailsOpen) {
   </li>`;
 }
 
+function renderBackgroundTask(task, disconnected) {
+  const presentation = jobStatusPresentation(task, disconnected);
+  return `<li class="task-plan-row">
+    <span class="task-position">${escapeHtml(String((task.position ?? 0) + 1))}</span>
+    <code class="task-id">${escapeHtml(task.name || task.id)}</code>
+    <span class="chip status-chip tone-${escapeAttr(presentation.tone)}">${escapeHtml(presentation.label)}</span>
+  </li>`;
+}
+
+function renderBackgroundRun(run, view) {
+  const presentation = jobStatusPresentation(run, view.disconnected === true);
+  const fields = [
+    field('elapsed', escapeHtml(formatDuration(run.elapsed))),
+    field('progress', escapeHtml(formatRelative(view.now - run.progressAge, view.now) || 'no output')),
+  ];
+  if (run.timeoutAt != null && Number.isFinite(run.timeoutAt)) {
+    fields.push(field('timeout', escapeHtml(run.timedOut ? 'timed out' : formatRelative(run.timeoutAt, view.now))));
+  }
+  if (run.exitCode != null) fields.push(field('exit', escapeHtml(String(run.exitCode))));
+  if (run.signal) fields.push(field('signal', escapeHtml(run.signal)));
+  if (run.terminationReason) fields.push(field('reason', escapeHtml(run.terminationReason)));
+  return `<li class="background-run-card">
+    <div class="job-title-line">
+      <strong class="job-name">${escapeHtml(run.name || run.id)}</strong>
+      <span class="chip status-chip tone-${escapeAttr(presentation.tone)}">${escapeHtml(presentation.label)}</span>
+    </div>
+    <div class="job-fields">${fields.join('')}</div>
+    <div class="run-task-link">task <code>${escapeHtml(run.taskId)}</code></div>
+  </li>`;
+}
+
+function renderBackgroundSection(background, view) {
+  if (!background) return '';
+  const tasks = Array.isArray(background.tasks) ? background.tasks : [];
+  const runs = Array.isArray(background.runs) ? background.runs : [];
+  if (tasks.length === 0 && runs.length === 0) return '';
+  const runtime = backgroundStatusPresentation(background.runtimeStatus);
+  const taskRows = tasks.length === 0
+    ? '<p class="muted">No task-plan entries.</p>'
+    : `<ol class="task-plan">${tasks.map((task) => renderBackgroundTask(task, view.disconnected === true)).join('')}</ol>`;
+  const runRows = runs.length === 0
+    ? ''
+    : `<h5>Managed runs</h5><ul class="background-runs">${runs.map((run) => renderBackgroundRun(run, view)).join('')}</ul>`;
+  return `<section class="background-section">
+    <header class="subsection-header"><h4>Main-agent Tasks · revision ${escapeHtml(String(background.revision ?? 0))}</h4><span class="chip tone-${escapeAttr(runtime.tone)}">${escapeHtml(runtime.label)}</span></header>
+    ${taskRows}
+    ${runRows}
+  </section>`;
+}
+
 function renderSession(session, view, detailsOpen) {
   const sessionId = String(session.sessionId ?? '');
   const smart = smartStatusPresentation(session.smartStatus);
@@ -423,18 +486,22 @@ function renderSession(session, view, detailsOpen) {
   const stopAllDisabled = view.disconnected === true || session.stopPending === true || !(session.stop && session.stop.available);
   const stopAllTitle = stopAllDisabled
     ? stopUnavailableReasonForSession(session, view.disconnected === true)
-    : `Stop all active jobs in session ${sessionId}`;
+    : `Stop all active sub-agent jobs in session ${sessionId}`;
   const jobs = Array.isArray(session.jobs) ? session.jobs : [];
+  const backgroundHtml = renderBackgroundSection(session.background, view);
   const header = `<header class="session-header">
     <h3 class="session-title">${escapeHtml(sessionId)}</h3>
     <span class="chip tone-${escapeAttr(smart.tone)}">${escapeHtml(smart.label)}</span>
     ${plan ? renderPlanChip(plan) : ''}
     <span class="active-count">${escapeHtml(String(session.activeCount ?? 0))} active</span>
-    <button class="danger" type="button" data-stop-all="${escapeAttr(sessionId)}"${stopAllDisabled ? ' disabled' : ''} title="${escapeAttr(stopAllTitle)}">Stop all</button>
+    <button class="danger" type="button" data-stop-all="${escapeAttr(sessionId)}"${stopAllDisabled ? ' disabled' : ''} title="${escapeAttr(stopAllTitle)}">Stop agents</button>
   </header>`;
-  const body = jobs.length === 0
-    ? '<p class="muted">No jobs recorded for this session.</p>'
-    : `<ul class="jobs">${jobs.map((job) => renderJob(job, session, view, detailsOpen)).join('')}</ul>`;
+  const smartJobsHtml = jobs.length === 0
+    ? ''
+    : `<section class="smart-jobs-section"><h4>Sub-agents</h4><ul class="jobs">${jobs.map((job) => renderJob(job, session, view, detailsOpen)).join('')}</ul></section>`;
+  const body = backgroundHtml || smartJobsHtml
+    ? `${backgroundHtml}${smartJobsHtml}`
+    : '<p class="muted">No jobs or task plan recorded for this session.</p>';
   return `<section class="session${session.selected ? ' selected' : ''}" data-session-id="${escapeAttr(sessionId)}"${session.selected ? ' aria-current="true"' : ''}>${header}${body}</section>`;
 }
 
@@ -509,6 +576,18 @@ export function activityStyles() {
     .tone-danger { color: var(--pi-danger); }
     .tone-muted { color: var(--pi-muted); }
     .tone-disconnected { color: var(--pi-danger); border-style: dashed; }
+    .background-section, .smart-jobs-section { display: grid; gap: 8px; border-top: 1px solid var(--pi-border-muted); padding-top: 10px; }
+    .background-section:first-of-type { border-top: 0; padding-top: 0; }
+    .background-section h4, .smart-jobs-section h4, .background-section h5 { margin: 0; font-size: 12px; color: var(--pi-text-secondary); }
+    .subsection-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+    .task-plan { margin: 0; padding: 0; display: grid; gap: 6px; list-style: none; }
+    .task-plan-row { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: center; gap: 8px; border: 1px solid var(--pi-border-muted); border-radius: 7px; padding: 7px 9px; }
+    .task-position { color: var(--pi-muted); font-variant-numeric: tabular-nums; }
+    .task-id { display: inline; width: fit-content; white-space: normal; overflow-wrap: anywhere; }
+    .background-runs { margin: 0; padding: 0; display: grid; gap: 8px; list-style: none; }
+    .background-run-card { display: grid; gap: 6px; border: 1px solid var(--pi-border-muted); border-radius: 8px; background: var(--pi-bg); padding: 10px; }
+    .run-task-link { color: var(--pi-muted); font-size: 12px; }
+    .run-task-link code { display: inline; padding: 2px 5px; white-space: normal; }
     .jobs { margin: 0; padding: 0; display: grid; gap: 10px; list-style: none; }
     .job-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px 12px; align-items: start; border: 1px solid var(--pi-border-muted); border-radius: 8px; background: var(--pi-bg); padding: 10px; }
     .job-copy { display: grid; min-width: 0; gap: 6px; }
@@ -531,6 +610,8 @@ export function activityStyles() {
     .empty { padding: 16px; color: var(--pi-muted); }
     @media (max-width: 760px) {
       .job-card { grid-template-columns: 1fr; }
+      .task-plan-row { grid-template-columns: 24px minmax(0, 1fr); }
+      .task-plan-row .status-chip { grid-column: 2; justify-self: start; }
       .job-actions { justify-content: flex-start; }
       .session-header { gap: 6px 8px; }
       .active-count { margin-left: 0; flex-basis: 100%; }

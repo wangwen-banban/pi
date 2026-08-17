@@ -4,13 +4,15 @@
 // round-trips against them:
 //   - extensions/smart-subagents/web-record.ts (runtime.json + agents.json)
 //   - extensions/plan-mode/index.ts (plan-mode.json writer literal)
+//   - extensions/background-tasks/web-record.ts (runtime.json + background-tasks.json)
 //   - extensions/web-activity/registry.ts (control request/ack protocol)
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildWebAgentsRecord, buildWebRuntimeRecord } from '../../extensions/smart-subagents/web-record.ts';
+import { buildBackgroundRuntimeRecord, buildBackgroundTasksRecord } from '../../extensions/background-tasks/web-record.ts';
 import { buildControlAck, parseControlRequest, WEB_ACTIVITY_SCHEMA_VERSION } from '../../extensions/web-activity/registry.ts';
 import {
-  parseRuntime, parseAgents, parsePlan, parseAck, parseJob,
+  parseRuntime, parseAgents, parsePlan, parseBackgroundTasks, parseAck, parseJob,
   projectSession, computeStatus, isJobActive,
   buildControlEnvelope, matchAck,
 } from './activity-schema.js';
@@ -240,6 +242,83 @@ describe('backend contract — agents records', () => {
     const { public: pub } = parseRuntime(record);
     assert.equal(pub.heartbeatAt, null);
     assert.equal(computeStatus(pub, 5000), 'stale');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// background-tasks.json round-trip (main-agent managed command writer)
+// ---------------------------------------------------------------------------
+
+describe('backend contract — background task records', () => {
+  const backgroundIdentity = { sessionId: 'sess-1', runtimeId: 'bg-1', generation: 4 };
+  const taskPlan = {
+    version: 1,
+    revision: 8,
+    reason: 'private dynamic prompt update',
+    updatedAt: 8000,
+    tasks: [
+      { id: 'benchmark', title: 'private benchmark details', status: 'in_progress', updatedAt: 7000, runId: 'bg-run-1' },
+      { id: 'analyze', title: 'private analysis details', status: 'pending', updatedAt: 7000 },
+    ],
+  };
+  const run = {
+    id: 'bg-run-1',
+    taskId: 'benchmark',
+    name: 'benchmark',
+    status: 'running',
+    cwd: '/private/workspace',
+    createdAt: 7000,
+    startedAt: 7100,
+    lastOutputAt: 7900,
+    timeoutAt: 20_000,
+    stdoutTail: 'secret output',
+    stderrTail: '',
+    stdoutPath: '/private/stdout.log',
+    stderrPath: '/private/stderr.log',
+    resultPath: '/private/result.json',
+    logTruncated: false,
+  };
+
+  it('parser accepts both real background runtime and task record builders', () => {
+    const runtimeRecord = buildBackgroundRuntimeRecord(
+      backgroundIdentity,
+      'active',
+      { startedAt: 6000, total: 1, active: 1 },
+      8000,
+    );
+    const parsedRuntime = parseRuntime(runtimeRecord);
+    assert.equal(parsedRuntime.public.source, 'background-tasks');
+    assert.equal(parsedRuntime.public.heartbeatAt, 8000);
+    assert.equal(parsedRuntime.capability, null);
+
+    const taskRecord = buildBackgroundTasksRecord(taskPlan, [run], backgroundIdentity, 8000);
+    const parsedTasks = parseBackgroundTasks(taskRecord);
+    assert.equal(parsedTasks.revision, 8);
+    assert.deepEqual(parsedTasks.tasks.map(task => [task.id, task.status]), [
+      ['benchmark', 'in_progress'],
+      ['analyze', 'pending'],
+    ]);
+    assert.equal(parsedTasks.runs[0].status, 'running');
+
+    const projected = projectSession({
+      runtimes: [parsedRuntime.public],
+      backgroundsList: [parsedTasks],
+      now: 8100,
+    });
+    assert.equal(projected.backgroundActiveCount, 1);
+    assert.equal(projected.totalActiveCount, 1);
+    assert.equal(projected.badge, '1');
+    assert.equal(projected.backgroundTasks[1].id, 'analyze');
+  });
+
+  it('public record excludes private titles, command, output, paths and pid', () => {
+    const record = buildBackgroundTasksRecord(taskPlan, [{ ...run, command: 'SECRET_CMD', pid: 1234 }], backgroundIdentity, 8000);
+    const serialized = JSON.stringify(record);
+    assert.equal(serialized.includes('private benchmark details'), false);
+    assert.equal(serialized.includes('SECRET_CMD'), false);
+    assert.equal(serialized.includes('secret output'), false);
+    assert.equal(serialized.includes('/private/'), false);
+    assert.equal(serialized.includes('1234'), false);
   });
 });
 

@@ -177,6 +177,20 @@ function mkPlanJson(sessionId, runtimeId, overrides = {}) {
   });
 }
 
+function mkBackgroundJson(sessionId, runtimeId, overrides = {}) {
+  return JSON.stringify({
+    schemaVersion: SCHEMA_VERSION,
+    sessionId,
+    runtimeId,
+    generation: 0,
+    revision: 2,
+    updatedAt: 3000,
+    tasks: [{ id: 'run', name: 'run', status: 'in_progress', position: 0, updatedAt: 2500, runId: 'bg-run-1' }],
+    runs: [{ id: 'bg-run-1', taskId: 'run', name: 'run', status: 'running', stopping: false, createdAt: 2000, startedAt: 2100, timeoutAt: 9000 }],
+    ...overrides,
+  });
+}
+
 function mkAckJson(sessionId, runtimeId, requestId, action, overrides = {}) {
   return JSON.stringify({
     schemaVersion: SCHEMA_VERSION,
@@ -329,6 +343,26 @@ describe('refreshActivity — sorted enumeration', () => {
     assert.equal(session.plans.length, 1);
     assert.equal(session.plans[0].state, 'active');
     assert.equal(session.plans[0].reason, 'proactive planning');
+  });
+
+  it('includes privacy-safe background task records when present', async () => {
+    const files = createFakeFiles({
+      [sessionsDir()]: listDir('sess1'),
+      [runtimesDir('sess1')]: listDir('bg1'),
+      [`${runtimeDir('sess1', 'bg1')}/runtime.json`]: mkRuntimeJson('sess1', 'bg1', {
+        source: 'background-tasks',
+        controlToken: undefined,
+        jobs: { total: 1, active: 1 },
+      }),
+      [`${runtimeDir('sess1', 'bg1')}/background-tasks.json`]: mkBackgroundJson('sess1', 'bg1'),
+    });
+    const state = await refreshActivity(files, createInitialState(), 5000);
+    const session = state.snapshot.sessions.sess1;
+    assert.equal(session.backgroundsList.length, 1);
+    assert.equal(session.backgroundsList[0].revision, 2);
+    assert.equal(session.backgroundsList[0].tasks[0].id, 'run');
+    assert.equal(session.backgroundsList[0].runs[0].status, 'running');
+    assert.equal(JSON.stringify(state.snapshot).includes('command'), false);
   });
 
   it('preserves multiple generations as history in the snapshot', async () => {
@@ -569,6 +603,18 @@ describe('refreshActivity — nested hard failures', () => {
           [`${runtimeDir('sess1', 'rt1')}/runtime.json`]: mkRuntimeJson('sess1', 'rt1'),
         },
         { failurePath: `${runtimeDir('sess1', 'rt1')}/agents.json` },
+      ),
+    },
+    {
+      label: 'background-tasks.json',
+      diag: 'background-tasks.json',
+      badFiles: () => createFakeFiles(
+        {
+          [sessionsDir()]: listDir('sess1'),
+          [runtimesDir('sess1')]: listDir('rt1'),
+          [`${runtimeDir('sess1', 'rt1')}/runtime.json`]: mkRuntimeJson('sess1', 'rt1'),
+        },
+        { failurePath: `${runtimeDir('sess1', 'rt1')}/background-tasks.json` },
       ),
     },
     {

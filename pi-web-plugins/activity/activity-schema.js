@@ -3,6 +3,7 @@
 // The records below mirror the ACTUAL backend writers:
 //   - extensions/smart-subagents/web-record.ts (runtime.json + agents.json)
 //   - extensions/plan-mode/index.ts (plan runtime.json + plan-mode.json)
+//   - extensions/background-tasks/web-record.ts (runtime.json + background-tasks.json)
 //   - extensions/web-activity/registry.ts (control request/ack protocol)
 // Dependency-free.
 
@@ -21,12 +22,17 @@ export const SAFE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 // Backend sources (strict). Only these extensions write registry records.
 export const SOURCE_SMART = 'smart-subagents';
 export const SOURCE_PLAN = 'plan-mode';
-export const SOURCES = [SOURCE_SMART, SOURCE_PLAN];
+export const SOURCE_BACKGROUND = 'background-tasks';
+export const SOURCES = [SOURCE_SMART, SOURCE_PLAN, SOURCE_BACKGROUND];
 
 // Backend job lifecycle (extensions/smart-subagents: JobStatus).
 export const ACTIVE_JOB_STATUSES = ['routing', 'queued', 'running'];
 export const TERMINAL_JOB_STATUSES = ['completed', 'failed', 'stopped'];
 export const JOB_STATUSES = [...ACTIVE_JOB_STATUSES, ...TERMINAL_JOB_STATUSES];
+
+// Main-agent task plan and managed command lifecycle.
+export const TASK_PLAN_STATUSES = ['pending', 'in_progress', 'completed', 'failed', 'blocked', 'cancelled'];
+export const BACKGROUND_RUN_STATUSES = ['running', 'completed', 'failed', 'stopped'];
 
 // ---- Safe IDs -------------------------------------------------------------
 
@@ -160,7 +166,8 @@ function stringArr(v, name, max = MAX_ARR) {
 //   runtimeId, generation, controlToken, state:'active'|'shutdown', startedAt,
 //   updatedAt, heartbeatAt, jobs:{total,active}}.
 // Backend contract (plan): same minus controlToken/jobs; source 'plan-mode';
-//   heartbeatAt only while active.
+//   heartbeatAt only while active. Background-task runtimes carry a jobs
+//   summary but no browser control capability.
 // Returns { public, capability }. Public projection excludes controlToken/pid.
 // Capability is non-null only for smart runtimes (control handshake secret).
 
@@ -302,6 +309,102 @@ export function parseAgents(raw) {
     generation,
     updatedAt,
     jobs,
+  };
+}
+
+// ---- parseBackgroundTasks -------------------------------------------------
+// Backend contract (background-tasks background-tasks.json):
+// {schemaVersion, sessionId, runtimeId, generation, revision, updatedAt,
+//  tasks:[{id,name,status,position,updatedAt,runId?}],
+//  runs:[{id,taskId,name,status,stopping,createdAt,startedAt,finishedAt,
+//         lastOutputAt,timeoutAt,exitCode,signal,terminationReason}]}.
+// Commands, full task titles, output, credentials and PID are deliberately absent.
+
+export function parseBackgroundTask(raw, idx = 0) {
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(`background task[${idx}]: not an object`);
+  }
+  const id = safeIdOrThrow(boundStr(raw.id, `background task[${idx}].id`, 64), `background task[${idx}].id`);
+  const name = boundStr(raw.name, `background task[${idx}].name`, MAX_STR);
+  if (typeof raw.status !== 'string' || !TASK_PLAN_STATUSES.includes(raw.status)) {
+    throw new Error(`background task[${idx}]: unknown status ${String(raw.status)}`);
+  }
+  const position = nonNegInt(raw.position, `background task[${idx}].position`);
+  const runId = raw.runId == null
+    ? undefined
+    : safeIdOrThrow(boundStr(raw.runId, `background task[${idx}].runId`, 128), `background task[${idx}].runId`);
+  return {
+    id,
+    name,
+    status: raw.status,
+    position,
+    updatedAt: finiteTs(raw.updatedAt, `background task[${idx}].updatedAt`),
+    runId,
+  };
+}
+
+export function parseBackgroundRun(raw, idx = 0) {
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(`background run[${idx}]: not an object`);
+  }
+  const id = safeIdOrThrow(boundStr(raw.id, `background run[${idx}].id`, 128), `background run[${idx}].id`);
+  const taskId = safeIdOrThrow(boundStr(raw.taskId, `background run[${idx}].taskId`, 64), `background run[${idx}].taskId`);
+  const name = boundStr(raw.name, `background run[${idx}].name`, MAX_STR);
+  if (typeof raw.status !== 'string' || !BACKGROUND_RUN_STATUSES.includes(raw.status)) {
+    throw new Error(`background run[${idx}]: unknown status ${String(raw.status)}`);
+  }
+  const exitCode = raw.exitCode == null ? undefined : finiteNum(raw.exitCode, `background run[${idx}].exitCode`);
+  return {
+    id,
+    taskId,
+    name,
+    status: raw.status,
+    stopping: raw.stopping === true,
+    createdAt: finiteTs(raw.createdAt, `background run[${idx}].createdAt`),
+    startedAt: optionalTs(raw.startedAt, `background run[${idx}].startedAt`),
+    finishedAt: optionalTs(raw.finishedAt, `background run[${idx}].finishedAt`),
+    lastOutputAt: optionalTs(raw.lastOutputAt, `background run[${idx}].lastOutputAt`),
+    timeoutAt: optionalTs(raw.timeoutAt, `background run[${idx}].timeoutAt`),
+    exitCode,
+    signal: optionalStr(raw.signal, `background run[${idx}].signal`, 64),
+    terminationReason: optionalStr(raw.terminationReason, `background run[${idx}].terminationReason`, 128),
+  };
+}
+
+export function parseBackgroundTasks(raw) {
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('background tasks: not an object');
+  }
+  if (raw.schemaVersion !== SCHEMA_VERSION) {
+    throw new Error(`background tasks: bad schemaVersion ${raw.schemaVersion}`);
+  }
+  const sessionId = safeIdOrThrow(boundStr(raw.sessionId, 'sessionId', 128), 'sessionId');
+  const runtimeId = safeIdOrThrow(boundStr(raw.runtimeId, 'runtimeId', 128), 'runtimeId');
+  const generation = generationOf(raw.generation);
+  const revision = nonNegInt(raw.revision, 'revision');
+  const rawTasks = boundArr(raw.tasks ?? [], 'background tasks');
+  const rawRuns = boundArr(raw.runs ?? [], 'background runs');
+  const tasks = rawTasks.map((task, index) => parseBackgroundTask(task, index));
+  const runs = rawRuns.map((run, index) => parseBackgroundRun(run, index));
+  const taskIds = new Set();
+  for (const task of tasks) {
+    if (taskIds.has(task.id)) throw new Error(`background tasks: duplicate task id ${task.id}`);
+    taskIds.add(task.id);
+  }
+  const runIds = new Set();
+  for (const run of runs) {
+    if (runIds.has(run.id)) throw new Error(`background runs: duplicate run id ${run.id}`);
+    runIds.add(run.id);
+  }
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    sessionId,
+    runtimeId,
+    generation,
+    revision,
+    updatedAt: finiteTs(raw.updatedAt, 'updatedAt'),
+    tasks,
+    runs,
   };
 }
 
@@ -485,18 +588,16 @@ export function runtimeIsNewer(a, b) {
   return a.runtimeId < b.runtimeId; // deterministic tiebreak
 }
 
-// projectSession({ runtimes, agentsList, plans, now, jobTimeoutMs })
-// - runtimes: array of parsed runtime public projections
-// - agentsList: array of parsed agents objects
-// - plans: array of parsed plan objects
-// - now: number (ms)
-// Returns: { primary, sources, plan, status, jobs, activeCount, badge }
-// Jobs are bound ONLY to the selected smart-subagents runtime (sessionId +
-// runtimeId + generation all match) — jobs from other generations/runtimes are
-// never combined. The plan chip binds only to the selected plan-mode runtime
-// and generation.
+// projectSession({ runtimes, agentsList, plans, backgroundsList, now, jobTimeoutMs })
+// Records are bound ONLY to the selected runtime of their exact source using
+// sessionId + runtimeId + generation. Older runtime generations are never
+// merged into the current task plan or job list.
 
-export function projectSession({ runtimes = [], agentsList = [], plans = [], now, jobTimeoutMs } = {}) {
+export function isBackgroundRunActive(run) {
+  return run && run.status === 'running';
+}
+
+export function projectSession({ runtimes = [], agentsList = [], plans = [], backgroundsList = [], now, jobTimeoutMs } = {}) {
   if (!Number.isFinite(now)) throw new Error('projectSession: now must be finite');
 
   const sources = newestRuntimePerSource(runtimes);
@@ -526,6 +627,17 @@ export function projectSession({ runtimes = [], agentsList = [], plans = [], now
     }
   }
 
+  // Bind the dynamic main-agent task plan to the newest background runtime.
+  const backgroundRuntime = sources.get(SOURCE_BACKGROUND) ?? null;
+  let background = null;
+  if (backgroundRuntime) {
+    for (const candidate of backgroundsList) {
+      if (candidate.sessionId === backgroundRuntime.sessionId && candidate.runtimeId === backgroundRuntime.runtimeId && candidate.generation === backgroundRuntime.generation) {
+        if (!background || candidate.updatedAt > background.updatedAt) background = candidate;
+      }
+    }
+  }
+
   // Active first (routing/queued/running/stopping); within each group newest first.
   allJobs.sort((a, b) => {
     const aActive = isJobActive(a) ? 0 : 1;
@@ -541,12 +653,39 @@ export function projectSession({ runtimes = [], agentsList = [], plans = [], now
     ...j,
     timing: computeJobTiming(j, now, jobTimeoutMs),
   }));
+  const backgroundTasks = [...(background?.tasks ?? [])].sort((a, b) => {
+    if (a.position !== b.position) return a.position - b.position;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+  const backgroundRuns = [...(background?.runs ?? [])]
+    .sort((a, b) => {
+      const activeDifference = Number(isBackgroundRunActive(b)) - Number(isBackgroundRunActive(a));
+      if (activeDifference !== 0) return activeDifference;
+      return (b.startedAt ?? b.createdAt) - (a.startedAt ?? a.createdAt);
+    })
+    .map(run => ({ ...run, timing: computeJobTiming(run, now, jobTimeoutMs) }));
 
   const status = computeStatus(primary, now);
   const activeCount = jobs.filter(j => isJobActive(j)).length;
-  const badge = activeCount > 0 ? String(activeCount) : '';
+  const backgroundActiveCount = backgroundRuns.filter(isBackgroundRunActive).length;
+  const totalActiveCount = activeCount + backgroundActiveCount;
+  const badge = totalActiveCount > 0 ? String(totalActiveCount) : '';
 
-  return { primary, sources, plan, status, jobs, activeCount, badge };
+  return {
+    primary,
+    sources,
+    plan,
+    background,
+    backgroundRuntime,
+    backgroundTasks,
+    backgroundRuns,
+    status,
+    jobs,
+    activeCount,
+    backgroundActiveCount,
+    totalActiveCount,
+    badge,
+  };
 }
 
 // ---- Control --------------------------------------------------------------
