@@ -1,8 +1,9 @@
 /**
- * Integration test for session-sync extension drift detection.
+ * Regression tests for session-sync drift detection.
  *
- * Simulates: session starts → local goes quiet → external client
- * appends to session file → drift warning should appear.
+ * Covers the distinction between local persisted state changes and external
+ * session-file growth. Local model/thinking changes must refresh the watcher
+ * baseline; external phone/web writes must still require /sync.
  *
  * Run: node --experimental-strip-types extensions/session-sync/test-drift.mjs
  */
@@ -11,10 +12,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const FAST_POLL = 200; // ms — override for testing
-const FAST_QUIET = 500; // ms
-
-// ── Mock extension API ─────────────────────────────────────────
+const FAST_POLL_MS = 40;
+const FAST_QUIET_MS = 80;
+const WAIT_TIMEOUT_MS = 1_000;
 
 class MockUI {
 	widgets = new Map();
@@ -36,94 +36,130 @@ class MockCtx {
 	}
 	isIdle() { return true; }
 	async waitForIdle() {}
-	async switchSession(f) { this.switchedTo = f; }
+	async switchSession(file) { this.switchedTo = file; }
 }
 
-// ── Test ───────────────────────────────────────────────────────
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitFor(predicate, message) {
+	const deadline = Date.now() + WAIT_TIMEOUT_MS;
+	while (Date.now() < deadline) {
+		if (predicate()) return;
+		await sleep(10);
+	}
+	assert.fail(message);
+}
 
 const dir = mkdtempSync(join(tmpdir(), "pi-drift-test-"));
 const sessionFile = join(dir, "test-session.jsonl");
+const header = {
+	type: "session",
+	version: 3,
+	id: "test",
+	timestamp: new Date().toISOString(),
+	cwd: dir,
+};
+writeFileSync(sessionFile, `${JSON.stringify(header)}\n`);
 
-// Write initial session content
-writeFileSync(sessionFile, JSON.stringify({ type: "session", version: 3, id: "test", timestamp: new Date().toISOString(), cwd: dir }) + "\n");
-
-const mod = await import("./index.ts");
-const factory = mod.default;
+const { createSessionSyncExtension } = await import("./index.ts");
+const factory = createSessionSyncExtension({
+	pollIntervalMs: FAST_POLL_MS,
+	quietPeriodMs: FAST_QUIET_MS,
+	minDriftBytes: 16,
+});
 
 const handlers = new Map();
 const commands = new Map();
 const mockPi = {
-	on: (evt, fn) => { const list = handlers.get(evt) ?? []; list.push(fn); handlers.set(evt, list); },
-	registerCommand: (name, opts) => commands.set(name, opts),
+	on: (event, handler) => {
+		const list = handlers.get(event) ?? [];
+		list.push(handler);
+		handlers.set(event, list);
+	},
+	registerCommand: (name, options) => commands.set(name, options),
 };
 
 factory(mockPi);
 
-// Fire session_start
-const ctx = new MockCtx(sessionFile);
-for (const fn of handlers.get("session_start") ?? []) {
-	await fn({}, ctx);
+async function fire(event, payload = {}) {
+	for (const handler of handlers.get(event) ?? []) {
+		await handler({ type: event, ...payload }, ctx);
+	}
 }
 
-console.log("✓ session_start fired, baseline established");
+function append(entry) {
+	writeFileSync(sessionFile, `${JSON.stringify(entry)}\n`, { flag: "a" });
+}
 
-// Wait for quiet period
-await new Promise(r => setTimeout(r, FAST_QUIET + 100));
+const ctx = new MockCtx(sessionFile);
+await fire("session_start");
+assert.ok(handlers.get("model_select")?.length, "model_select must be tracked as local activity");
+assert.ok(handlers.get("thinking_level_select")?.length, "thinking_level_select must be tracked as local activity");
+console.log("✓ session watcher registered local model/thinking activity");
 
-// Simulate external write: append a message entry
-const externalEntry = JSON.stringify({
-	type: "message",
-	id: "ext001",
+// Match Pi's real order: persist the entry first, then emit the extension event.
+await sleep(FAST_QUIET_MS + FAST_POLL_MS);
+append({
+	type: "model_change",
+	id: "model001",
 	parentId: null,
+	timestamp: new Date().toISOString(),
+	provider: "opencode-go",
+	modelId: "deepseek-v4-flash",
+});
+await fire("model_select", { model: { provider: "opencode-go", id: "deepseek-v4-flash" } });
+await sleep(FAST_QUIET_MS + FAST_POLL_MS);
+assert.equal(ctx.ui.widgets.has("session-drift"), false, "local model switch must not look external");
+console.log("✓ local model switch does not trigger /sync warning");
+
+await sleep(FAST_QUIET_MS + FAST_POLL_MS);
+append({
+	type: "thinking_level_change",
+	id: "think001",
+	parentId: "model001",
+	timestamp: new Date().toISOString(),
+	thinkingLevel: "max",
+});
+await fire("thinking_level_select", { level: "max", previousLevel: "high" });
+await sleep(FAST_QUIET_MS + FAST_POLL_MS);
+assert.equal(ctx.ui.widgets.has("session-drift"), false, "local thinking switch must not look external");
+console.log("✓ local thinking switch does not trigger /sync warning");
+
+// A write with no local event is still external drift and must fail closed.
+await sleep(FAST_QUIET_MS + FAST_POLL_MS);
+append({
+	type: "message",
+	id: "external001",
+	parentId: "think001",
 	timestamp: new Date().toISOString(),
 	message: { role: "user", content: "Message from phone", timestamp: Date.now() },
 });
-// Write enough bytes to exceed MIN_DRIFT_BYTES (16)
-const padding = " ".repeat(100);
-writeFileSync(sessionFile, externalEntry + padding + "\n", { flag: "a" });
+await waitFor(() => ctx.ui.widgets.has("session-drift"), "external write should trigger drift warning");
+assert.match(ctx.ui.widgets.get("session-drift").join("\n"), /Run \/sync/);
+console.log("✓ external phone/web write still triggers /sync warning");
 
-console.log("✓ external write simulated (appended to session file)");
+const syncCommand = commands.get("sync");
+assert.ok(syncCommand, "/sync command not registered");
+assert.equal(typeof syncCommand.handler, "function", "/sync handler is not a function");
+await syncCommand.handler("", ctx);
+assert.equal(ctx.switchedTo, sessionFile, "/sync should switch to the current session file");
+console.log("✓ /sync reloads the current session file");
 
-// Wait for poll to detect drift
-// Note: we can't easily speed up the timer in the extension without
-// injecting the interval. For this test we verify the polling mechanism
-// by checking after a real 3+ second wait.
-await new Promise(r => setTimeout(r, 3500));
-
-// In a real test we'd check the widget. Since we can't easily intercept
-// the timer, we verify the command and lifecycle work correctly.
-console.log("✓ drift poll ran");
-
-// Test /sync command
-const syncCmd = commands.get("sync");
-assert.ok(syncCmd, "/sync command not registered");
-assert.ok(typeof syncCmd.handler === "function", "/sync handler is not a function");
-
-// Execute /sync
-await syncCmd.handler("", ctx);
-assert.equal(ctx.switchedTo, sessionFile, "/sync should call switchSession with session file");
-console.log("✓ /sync calls switchSession with correct file");
-
-// Verify /sync refuses when busy
 const busyCtx = new MockCtx(sessionFile);
 busyCtx.isIdle = () => false;
-const notificationsBefore = busyCtx.ui.notifications.length;
-await syncCmd.handler("", busyCtx);
-assert.ok(busyCtx.ui.notifications.length > notificationsBefore, "should notify when busy");
-assert.ok(!busyCtx.switchedTo, "should NOT switch when busy");
-console.log("✓ /sync correctly refuses when agent is busy");
+await syncCommand.handler("", busyCtx);
+assert.ok(busyCtx.ui.notifications.some((notification) => notification.type === "warning"));
+assert.equal(busyCtx.switchedTo, undefined, "/sync must not switch while busy");
+console.log("✓ /sync refuses while the agent is busy");
 
-// Verify /sync handles missing session file
 const ephemeralCtx = new MockCtx(undefined);
-await syncCmd.handler("", ephemeralCtx);
-assert.ok(ephemeralCtx.ui.notifications.some(n => n.type === "warning"), "should warn about no session file");
-console.log("✓ /sync handles ephemeral sessions gracefully");
+await syncCommand.handler("", ephemeralCtx);
+assert.ok(ephemeralCtx.ui.notifications.some((notification) => notification.type === "warning"));
+console.log("✓ /sync handles ephemeral sessions");
 
-// Cleanup
-for (const fn of handlers.get("session_shutdown") ?? []) {
-	await fn();
-}
-console.log("✓ session_shutdown cleanup works");
-
+await fire("session_shutdown");
 rmSync(dir, { recursive: true, force: true });
+console.log("✓ session shutdown clears the watcher");
 console.log("\n✓ All session-sync tests passed");

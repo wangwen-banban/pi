@@ -25,7 +25,13 @@ const WIDGET_KEY = "session-drift";
 /** Minimum byte growth to consider external (avoids metadata jitter). */
 const MIN_DRIFT_BYTES = 16;
 
-/** Events that indicate the local session is actively working. */
+export interface SessionSyncOptions {
+	pollIntervalMs?: number;
+	quietPeriodMs?: number;
+	minDriftBytes?: number;
+}
+
+/** Events that indicate the local session is actively working or changing persisted session state. */
 const LOCAL_ACTIVITY_EVENTS = [
 	"agent_start",
 	"turn_start",
@@ -39,9 +45,27 @@ const LOCAL_ACTIVITY_EVENTS = [
 	"compaction_end",
 	"auto_retry_start",
 	"auto_retry_end",
+	"model_select",
+	"thinking_level_select",
 ] as const;
 
-export default function (pi: ExtensionAPI) {
+type ResolvedSessionSyncOptions = Required<SessionSyncOptions>;
+
+export function createSessionSyncExtension(options: SessionSyncOptions = {}) {
+	const resolvedOptions: ResolvedSessionSyncOptions = {
+		pollIntervalMs: options.pollIntervalMs ?? POLL_INTERVAL_MS,
+		quietPeriodMs: options.quietPeriodMs ?? QUIET_PERIOD_MS,
+		minDriftBytes: options.minDriftBytes ?? MIN_DRIFT_BYTES,
+	};
+	return function sessionSync(pi: ExtensionAPI) {
+		registerSessionSync(pi, resolvedOptions);
+	};
+}
+
+function registerSessionSync(
+	pi: ExtensionAPI,
+	{ pollIntervalMs, quietPeriodMs, minDriftBytes }: ResolvedSessionSyncOptions,
+) {
 	let sessionFile: string | undefined;
 	let baselineSize = 0;
 	let lastLocalActivity = Date.now();
@@ -77,13 +101,13 @@ export default function (pi: ExtensionAPI) {
 		if (!sessionFile) return;
 		try {
 			const size = statSync(sessionFile).size;
-			const isQuiet = Date.now() - lastLocalActivity >= QUIET_PERIOD_MS;
+			const isQuiet = Date.now() - lastLocalActivity >= quietPeriodMs;
 
 			if (needsBaselineRefresh || !isQuiet) {
 				// Local activity or first poll: accept current size as baseline.
 				baselineSize = size;
 				needsBaselineRefresh = false;
-			} else if (size > baselineSize + MIN_DRIFT_BYTES && !driftNotified) {
+			} else if (size > baselineSize + minDriftBytes && !driftNotified) {
 				// File grew while local TUI was quiet → external client wrote.
 				driftNotified = true;
 				try {
@@ -116,7 +140,7 @@ export default function (pi: ExtensionAPI) {
 		uiCtx = ctx.ui;
 		refreshBaseline();
 		if (pollTimer) clearInterval(pollTimer);
-		pollTimer = setInterval(poll, POLL_INTERVAL_MS);
+		pollTimer = setInterval(poll, pollIntervalMs);
 		pollTimer.unref?.();
 	});
 
@@ -164,3 +188,5 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 }
+
+export default createSessionSyncExtension();
