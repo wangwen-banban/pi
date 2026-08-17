@@ -208,6 +208,7 @@ function viewState({
   capability = true,
   withPlan = false,
   withBackground = false,
+  backgroundCompletedAt = NOW - 30_000,
   planOverrides = {},
   planRuntimeOverrides = {},
   disconnected = false,
@@ -277,7 +278,7 @@ function viewState({
       tasks: [
         { id: 'benchmark', name: 'benchmark', status: 'in_progress', position: 0, updatedAt: NOW - 60_000, runId: 'bg-run-1' },
         { id: 'analyze', name: 'analyze', status: 'pending', position: 1, updatedAt: NOW - 60_000 },
-        { id: 'done', name: 'done', status: 'completed', position: 2, updatedAt: NOW - 120_000 },
+        { id: 'done', name: 'done', status: 'completed', position: 2, updatedAt: backgroundCompletedAt },
       ],
       runs: [{
         id: 'bg-run-1', taskId: 'benchmark', name: 'benchmark', status: 'running', stopping: false,
@@ -473,6 +474,20 @@ describe('renderActivityPanelHtml — structure', () => {
     assert.ok(html.includes('<span class="field-label">progress</span> 5s ago'));
     // Background records are display-only in v1; only the smart job owns Stop.
     assert.equal((html.match(/data-stop-one=/g) ?? []).length, 1);
+  });
+
+  it('removes a completed task row at the 60s display boundary', () => {
+    const recent = renderActivityPanelHtml(
+      buildViewModel(viewState({ withBackground: true, backgroundCompletedAt: NOW - 59_999 }), null, NOW),
+      {},
+    );
+    const expired = renderActivityPanelHtml(
+      buildViewModel(viewState({ withBackground: true, backgroundCompletedAt: NOW - 60_000 }), null, NOW),
+      {},
+    );
+    assert.ok(recent.includes('<code class="task-id">done</code>'));
+    assert.ok(!expired.includes('<code class="task-id">done</code>'));
+    assert.ok(expired.includes('<code class="task-id">analyze</code>'), 'pending task remains visible');
   });
 
   it('stale runtime: job shows stale, all stop controls disabled with a reason', () => {

@@ -15,6 +15,7 @@ export const CONTROL_MAX_TTL_MS = 10_000;
 // while still expiring requests quickly and before the 15s stale threshold.
 export const DEFAULT_CONTROL_TTL_MS = 10_000;
 export const DEFAULT_JOB_TIMEOUT_MS = 60_000;
+export const COMPLETED_TASK_HOLD_MS = 60_000;
 export const MAX_STR = 1024;
 export const MAX_ARR = 256;
 export const SAFE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;

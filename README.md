@@ -168,7 +168,7 @@ If you accidentally sent input from a stale position, the session file now conta
 
 For a long benchmark, build, deployment, training run, or data job, the main agent can maintain a dynamic Codex-style plan with `update_task_plan`, then start the blocking step with `run_background_task`. The managed tool returns immediately and owns the command lifecycle; raw `cmd &`, `nohup`, `disown`, and PID polling are intentionally not used.
 
-The task list remains editable while the command runs. New user prompts can add, cancel, or reprioritize pending work using the current plan revision. Exit 0, non-zero exit, signal, timeout, or explicit stop updates the linked task and injects one safe follow-up that wakes the main LLM with the latest plan and next pending task. Completion never interrupts an in-flight answer.
+The task list remains editable while the command runs. New user prompts can add, cancel, or reprioritize pending work using the current plan revision. Exit 0, non-zero exit, signal, timeout, or explicit stop updates the linked task and injects one safe follow-up that wakes the main LLM with the latest plan and next pending task. Completion never interrupts an in-flight answer. Completed rows remain in compact TUI/PI WEB displays for 60 seconds, then hide so later pending tasks move up; `/tasks` and the persisted plan keep the full history.
 
 ```text
 /tasks

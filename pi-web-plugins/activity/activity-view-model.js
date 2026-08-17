@@ -14,6 +14,7 @@ import {
   SOURCE_PLAN,
   SOURCE_BACKGROUND,
   DEFAULT_JOB_TIMEOUT_MS,
+  COMPLETED_TASK_HOLD_MS,
   DEFAULT_CONTROL_TTL_MS,
   MAX_STR,
   MAX_ARR,
@@ -150,6 +151,12 @@ function planView(planRecord, planRuntime, now) {
   };
 }
 
+export function completedItemVisible(status, completedAt, now, holdMs = COMPLETED_TASK_HOLD_MS) {
+  if (status !== 'completed') return true;
+  if (!Number.isFinite(completedAt) || !Number.isFinite(now) || !Number.isFinite(holdMs) || holdMs < 0) return true;
+  return now - completedAt < holdMs;
+}
+
 function backgroundTaskView(task) {
   return {
     id: task.id,
@@ -208,6 +215,9 @@ function stopView(sessionId, smartRuntime, freshActiveSmart, activeCount, reason
 export function buildViewModel(state, selectedSession, now, options = {}) {
   if (!Number.isFinite(now)) throw new Error('buildViewModel: now must be finite');
   const jobTimeoutMs = options.jobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS;
+  const completedTaskHoldMs = Number.isFinite(options.completedTaskHoldMs)
+    ? Math.max(0, options.completedTaskHoldMs)
+    : COMPLETED_TASK_HOLD_MS;
   const uiErrors = Array.isArray(options.uiErrors) ? options.uiErrors : [];
 
   const selectedId = extractSafeSessionId(selectedSession);
@@ -259,8 +269,12 @@ export function buildViewModel(state, selectedSession, now, options = {}) {
       revision: proj.background ? proj.background.revision : 0,
       runtimeStatus: backgroundStatus,
       activeCount: backgroundActiveCount,
-      tasks: proj.backgroundTasks.map(backgroundTaskView),
-      runs: proj.backgroundRuns.map((run) => backgroundRunView(run, backgroundStatus)),
+      tasks: proj.backgroundTasks
+        .filter((task) => completedItemVisible(task.status, task.updatedAt, now, completedTaskHoldMs))
+        .map(backgroundTaskView),
+      runs: proj.backgroundRuns
+        .filter((run) => completedItemVisible(run.status, run.finishedAt, now, completedTaskHoldMs))
+        .map((run) => backgroundRunView(run, backgroundStatus)),
     };
 
     sessions.push({

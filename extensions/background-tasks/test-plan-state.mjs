@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+	COMPLETED_TASK_HOLD_MS,
 	TASK_PLAN_MARKER_TYPE,
 	attachRunToTask,
 	emptyTaskPlan,
@@ -9,6 +10,8 @@ import {
 	reconcileTaskPlan,
 	reconstructTaskPlan,
 	taskPlanText,
+	taskVisibleInCompactUi,
+	visibleTaskPlanItems,
 } from "./plan-state.ts";
 
 const tasks = (...items) => items;
@@ -123,6 +126,26 @@ test("branch reconstruction takes the newest valid marker", () => {
 	]);
 	assert.equal(reconstructed.revision, 2);
 	assert.equal(reconstructed.tasks[0].id, "new");
+});
+
+test("compact display keeps completed tasks briefly, then reveals later pending work", () => {
+	const now = 100_000;
+	const plan = {
+		...emptyTaskPlan(now),
+		revision: 1,
+		tasks: [
+			{ id: "recent", title: "Recent", status: "completed", updatedAt: now - COMPLETED_TASK_HOLD_MS + 1 },
+			{ id: "expired", title: "Expired", status: "completed", updatedAt: now - COMPLETED_TASK_HOLD_MS },
+			{ id: "failed", title: "Failed", status: "failed", updatedAt: 1 },
+			{ id: "blocked", title: "Blocked", status: "blocked", updatedAt: 1 },
+			{ id: "pending", title: "Pending", status: "pending", updatedAt: 1 },
+		],
+	};
+	assert.equal(taskVisibleInCompactUi(plan.tasks[0], now), true, "59,999ms is still visible");
+	assert.equal(taskVisibleInCompactUi(plan.tasks[1], now), false, "60,000ms is hidden");
+	assert.equal(taskVisibleInCompactUi({ ...plan.tasks[0], updatedAt: now + 1_000 }, now), true, "clock rollback cannot hide early");
+	assert.deepEqual(visibleTaskPlanItems(plan, now).map((item) => item.id), ["recent", "failed", "blocked", "pending"]);
+	assert.equal(plan.tasks.length, 5, "display filtering must not mutate persisted history");
 });
 
 test("task plan text remains compact and status-visible", () => {

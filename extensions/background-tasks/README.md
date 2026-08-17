@@ -80,9 +80,12 @@ while the command ran determines the next pending task.
 /tasks clear-completed
 ```
 
-The TUI widget shows pending, in-progress and terminal task history. The PI WEB
-Activity panel reads a privacy-trimmed record and shows task ids/statuses plus
-managed-run timing.
+The TUI widget shows pending, in-progress and terminal task history. A
+completed task remains in the compact TUI/PI WEB display for 60 seconds, then
+ages out so later pending work moves into view; the persisted plan and `/tasks`
+output still retain the completed history. Failed, blocked and cancelled tasks
+do not auto-hide. The PI WEB Activity panel reads a privacy-trimmed record and
+shows task ids/statuses plus managed-run timing.
 
 ## Storage and privacy
 

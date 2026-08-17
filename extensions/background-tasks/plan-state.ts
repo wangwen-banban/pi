@@ -2,6 +2,7 @@ export const TASK_PLAN_MARKER_TYPE = "background-task-plan-v1";
 export const TASK_PLAN_VERSION = 1;
 export const MAX_TASKS = 50;
 export const MAX_TASK_TITLE_CHARS = 240;
+export const COMPLETED_TASK_HOLD_MS = 60_000;
 export const SAFE_TASK_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 export const TASK_STATUSES = [
@@ -285,6 +286,25 @@ export function clearCompletedTaskHistory(current: TaskPlan, now = Date.now()): 
 
 export function nextPendingTask(plan: TaskPlan): TaskPlanItem | undefined {
 	return plan.tasks.find((task) => task.status === "pending");
+}
+
+/** Completed history remains persisted but ages out of compact live displays. */
+export function taskVisibleInCompactUi(
+	task: TaskPlanItem,
+	now = Date.now(),
+	holdMs = COMPLETED_TASK_HOLD_MS,
+): boolean {
+	if (task.status !== "completed") return true;
+	if (!Number.isFinite(now) || !Number.isFinite(task.updatedAt) || !Number.isFinite(holdMs) || holdMs < 0) return true;
+	return now - task.updatedAt < holdMs;
+}
+
+export function visibleTaskPlanItems(
+	plan: TaskPlan,
+	now = Date.now(),
+	holdMs = COMPLETED_TASK_HOLD_MS,
+): TaskPlanItem[] {
+	return plan.tasks.filter((task) => taskVisibleInCompactUi(task, now, holdMs));
 }
 
 export function taskPlanText(plan: TaskPlan, options: { includeResults?: boolean } = {}): string {

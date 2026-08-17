@@ -29,7 +29,7 @@ async function harness(t) {
 	const wrapperPath = join(root, "background-test-wrapper.ts");
 	writeFileSync(wrapperPath, [
 		`import { createBackgroundTasksExtension } from ${JSON.stringify(extensionIndexPath)};`,
-		`export default createBackgroundTasksExtension({ runsDir: ${JSON.stringify(join(root, "runs"))}, completionDebounceMs: 0 });`,
+		`export default createBackgroundTasksExtension({ runsDir: ${JSON.stringify(join(root, "runs"))}, completionDebounceMs: 0, completedTaskHoldMs: 30 });`,
 		"",
 	].join("\n"));
 
@@ -220,6 +220,37 @@ test("TUI widget keeps pending, in-progress and completed work visible", async (
 	assert.match(lines.join("\n"), /▶ current/);
 	assert.match(lines.join("\n"), /○ next/);
 	assert.match(h.statuses.get("background-tasks"), /1 pending/);
+	await h.fire("session_shutdown", { reason: "quit" });
+});
+
+test("expired completed row leaves the compact widget and truncated pending work moves up", async (t) => {
+	const previousWeb = process.env.PI_WEB_SESSION;
+	process.env.PI_WEB_SESSION = "0";
+	t.after(() => {
+		if (previousWeb === undefined) delete process.env.PI_WEB_SESSION;
+		else process.env.PI_WEB_SESSION = previousWeb;
+	});
+	const h = await harness(t);
+	h.ctx.hasUI = true;
+	await h.fire("session_start", { reason: "startup" });
+	const pending = Array.from({ length: 12 }, (_, index) => ({
+		id: `pending-${String(index).padStart(2, "0")}`,
+		title: `Pending ${index}`,
+		status: "pending",
+	}));
+	await execute(h.tools.get("update_task_plan"), {
+		baseRevision: 0,
+		tasks: [{ id: "recent-done", title: "Recently done", status: "completed" }, ...pending],
+	}, h.ctx);
+	assert.match(h.widgets.get("background-tasks").join("\n"), /recent-done/);
+	assert.match(h.widgets.get("background-tasks").join("\n"), /… 1 more/);
+	await waitFor(() => {
+		const text = (h.widgets.get("background-tasks") ?? []).join("\n");
+		return !text.includes("recent-done") && text.includes("pending-11") && !text.includes("… 1 more");
+	}, "completed task did not age out of the compact widget");
+	const stored = [...h.entries].reverse().find((entry) => entry.customType === "background-task-plan-v1").data;
+	assert.equal(stored.tasks.length, 13, "display expiry must not delete task history");
+	assert.equal(stored.tasks[0].status, "completed");
 	await h.fire("session_shutdown", { reason: "quit" });
 });
 

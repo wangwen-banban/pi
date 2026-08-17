@@ -1,9 +1,9 @@
 // test-activity-view-model.mjs — node --test suite for activity-view-model.js
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseRuntime, parseAgents, parsePlan, parseBackgroundTasks, HEARTBEAT_STALE_MS } from './activity-schema.js';
+import { parseRuntime, parseAgents, parsePlan, parseBackgroundTasks, COMPLETED_TASK_HOLD_MS, HEARTBEAT_STALE_MS } from './activity-schema.js';
 import {
-  buildViewModel, computeJobDisplayStatus, formatDuration, formatRelative,
+  buildViewModel, completedItemVisible, computeJobDisplayStatus, formatDuration, formatRelative,
 } from './activity-view-model.js';
 
 // ---- backend-shaped record helpers (mirror schema contract) ----
@@ -385,6 +385,36 @@ describe('buildViewModel — statuses and plan', () => {
     const runs = Object.fromEntries(view.sessions[0].background.runs.map(run => [run.id, run]));
     assert.equal(runs['bg-run-1'].status, 'stale');
     assert.equal(runs.done.status, 'completed');
+  });
+
+  it('completed tasks and completed runs age out after 60s without affecting active counts', () => {
+    const now = 5_000_000;
+    const backgroundRt = parseRuntime(mkRuntime({
+      source: 'background-tasks', runtimeId: 'bg1', controlToken: undefined, heartbeatAt: now,
+      jobs: { total: 4, active: 1 },
+    })).public;
+    const background = parseBackgroundTasks(mkBackground({
+      updatedAt: now,
+      tasks: [
+        { id: 'recent', name: 'recent', status: 'completed', position: 0, updatedAt: now - COMPLETED_TASK_HOLD_MS + 1 },
+        { id: 'expired', name: 'expired', status: 'completed', position: 1, updatedAt: now - COMPLETED_TASK_HOLD_MS },
+        { id: 'failed', name: 'failed', status: 'failed', position: 2, updatedAt: 1 },
+        { id: 'pending', name: 'pending', status: 'pending', position: 3, updatedAt: 1 },
+      ],
+      runs: [
+        { id: 'run-live', taskId: 'pending', name: 'live', status: 'running', createdAt: now - 1000, startedAt: now - 900 },
+        { id: 'run-recent', taskId: 'recent', name: 'recent', status: 'completed', createdAt: 1, startedAt: 2, finishedAt: now - COMPLETED_TASK_HOLD_MS + 1 },
+        { id: 'run-expired', taskId: 'expired', name: 'expired', status: 'completed', createdAt: 1, startedAt: 2, finishedAt: now - COMPLETED_TASK_HOLD_MS },
+        { id: 'run-failed', taskId: 'failed', name: 'failed', status: 'failed', createdAt: 1, startedAt: 2, finishedAt: 3 },
+      ],
+    }));
+    const view = buildViewModel(sessionState({ runtimes: [backgroundRt], backgroundsList: [background], capability: false }), null, now);
+    assert.deepEqual(view.sessions[0].background.tasks.map(task => task.id), ['recent', 'failed', 'pending']);
+    assert.deepEqual(view.sessions[0].background.runs.map(run => run.id), ['run-live', 'run-recent', 'run-failed']);
+    assert.equal(view.totalActive, 1);
+    assert.equal(view.badge, '1');
+    assert.equal(completedItemVisible('completed', now + 1000, now), true, 'clock rollback stays visible');
+    assert.equal(completedItemVisible('failed', 1, now), true, 'failed is actionable and never auto-hides');
   });
 
   it('plan chip carries state/reason/since plus independent plan runtime liveness', () => {

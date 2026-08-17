@@ -13,6 +13,7 @@ import {
 } from "../web-activity/registry.ts";
 import { createCompletionQueue } from "./completion-queue.ts";
 import {
+	COMPLETED_TASK_HOLD_MS,
 	TASK_PLAN_MARKER_TYPE,
 	TASK_STATUSES,
 	attachRunToTask,
@@ -23,6 +24,7 @@ import {
 	reconcileTaskPlan,
 	reconstructTaskPlan,
 	taskPlanText,
+	visibleTaskPlanItems,
 	type TaskPlan,
 	type TaskPlanInput,
 	type TaskStatus,
@@ -146,6 +148,7 @@ export interface BackgroundTasksExtensionOptions {
 	runsDir?: string;
 	startRun?: typeof startManagedBackgroundRun;
 	completionDebounceMs?: number;
+	completedTaskHoldMs?: number;
 }
 
 type ResolvedBackgroundTasksExtensionOptions = Required<BackgroundTasksExtensionOptions>;
@@ -155,6 +158,9 @@ export function createBackgroundTasksExtension(options: BackgroundTasksExtension
 		runsDir: options.runsDir ?? DEFAULT_RUNS_DIR,
 		startRun: options.startRun ?? startManagedBackgroundRun,
 		completionDebounceMs: options.completionDebounceMs ?? 100,
+		completedTaskHoldMs: Number.isFinite(options.completedTaskHoldMs)
+			? Math.max(0, Math.floor(options.completedTaskHoldMs!))
+			: COMPLETED_TASK_HOLD_MS,
 	};
 	return function backgroundTasks(pi: ExtensionAPI) {
 		registerBackgroundTasks(pi, resolved);
@@ -178,6 +184,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 	let webHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	let lastWebProgressFlushAt = 0;
 	let webDirty = false;
+	let uiExpiryTimer: ReturnType<typeof setTimeout> | undefined;
 
 	const currentSessionId = () => latestCtx?.sessionManager.getSessionId() ?? "";
 	const activeRuns = () => [...runs.values()].filter(runIsActive);
@@ -189,10 +196,18 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		for (const run of terminal.slice(MAX_RECENT_RUNS)) runs.delete(run.id);
 	};
 
+	const clearUiExpiryTimer = () => {
+		if (uiExpiryTimer) clearTimeout(uiExpiryTimer);
+		uiExpiryTimer = undefined;
+	};
+
 	const updateUi = () => {
+		clearUiExpiryTimer();
 		const ctx = latestCtx;
 		if (!ctx?.hasUI || shuttingDown) return;
-		if (plan.tasks.length === 0) {
+		const now = Date.now();
+		const compactTasks = visibleTaskPlanItems(plan, now, extensionOptions.completedTaskHoldMs);
+		if (compactTasks.length === 0) {
 			ctx.ui.setWidget("background-tasks", undefined);
 			ctx.ui.setStatus("background-tasks", undefined);
 			return;
@@ -205,13 +220,13 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 			blocked: "■",
 			cancelled: "−",
 		};
-		const visible = plan.tasks.slice(0, 12);
+		const visible = compactTasks.slice(0, 12);
 		const lines = [`Tasks · revision ${plan.revision}`];
 		for (const task of visible) {
 			const title = task.title.length > 88 ? `${task.title.slice(0, 88)}…` : task.title;
 			lines.push(`${icons[task.status]} ${task.id} · ${title}`);
 		}
-		if (plan.tasks.length > visible.length) lines.push(`… ${plan.tasks.length - visible.length} more · /tasks`);
+		if (compactTasks.length > visible.length) lines.push(`… ${compactTasks.length - visible.length} more · /tasks`);
 		ctx.ui.setWidget("background-tasks", lines, { placement: "aboveEditor" });
 		const active = activeRuns().length;
 		const pending = plan.tasks.filter((task) => task.status === "pending").length;
@@ -221,6 +236,17 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 				? ctx.ui.theme.fg("accent", `tasks:${active} running${pending ? `/${pending} pending` : ""}`)
 				: undefined,
 		);
+		const expiries = plan.tasks
+			.filter((task) => task.status === "completed")
+			.map((task) => task.updatedAt + extensionOptions.completedTaskHoldMs)
+			.filter((expiresAt) => expiresAt > now);
+		if (expiries.length > 0) {
+			uiExpiryTimer = setTimeout(() => {
+				uiExpiryTimer = undefined;
+				updateUi();
+			}, Math.max(1, Math.min(...expiries) - now));
+			uiExpiryTimer.unref?.();
+		}
 	};
 
 	const webIdentity = () => ({
@@ -668,6 +694,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		++webEpoch;
 		completionQueue.stop();
 		stopWebHeartbeat();
+		clearUiExpiryTimer();
 		stopAll("shutdown");
 		await Promise.all([...controllers.values()].map((controller) => controller.completion));
 		try {
