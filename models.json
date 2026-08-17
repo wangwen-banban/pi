@@ -1,0 +1,43 @@
+{
+  "providers": {
+    "openai-codex": {
+      "modelOverrides": {
+        "gpt-5.6-sol": {
+          "contextWindow": 1000000
+        },
+        "gpt-5.6-terra": {
+          "contextWindow": 1000000
+        },
+        "gpt-5.6-luna": {
+          "contextWindow": 1000000
+        }
+      }
+    },
+    "openai-codex-second": {
+      "modelOverrides": {
+        "gpt-5.6-sol": {
+          "contextWindow": 1000000
+        },
+        "gpt-5.6-terra": {
+          "contextWindow": 1000000
+        },
+        "gpt-5.6-luna": {
+          "contextWindow": 1000000
+        }
+      }
+    },
+    "openai": {
+      "modelOverrides": {
+        "gpt-5.6-sol": {
+          "contextWindow": 1050000
+        },
+        "gpt-5.6-terra": {
+          "contextWindow": 1050000
+        },
+        "gpt-5.6-luna": {
+          "contextWindow": 1050000
+        }
+      }
+    }
+  }
+}

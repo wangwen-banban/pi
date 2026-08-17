@@ -164,6 +164,11 @@ Claude relays) are re-registered through a small, fixed, audited bootstrap:
 - The unsupported-model fallback is the only automatic retry. It never runs
   after tool activity or file edits, and a generic `fetch failed` never
   silently falls back — it surfaces a bounded diagnostic instead.
+- Global `models.json` overrides give GPT-5.6 Sol/Terra/Luna a 1M Codex
+  context window for both OAuth accounts. Workers inherit those overrides even
+  under `--no-extensions`; the trusted bootstrap only restores provider and
+  transport registration. Routing uses Luna for simple work, Terra for normal
+  work, and Sol for complex/critical work.
 
 ## Commands
 
