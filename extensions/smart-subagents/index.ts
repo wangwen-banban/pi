@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
@@ -17,6 +18,11 @@ import {
 import { Box, Container, Key, Markdown, Spacer, Text, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { getPiInvocation } from "./pi-invocation.ts";
+import {
+	ControlDispatcher,
+	WebActivityRegistry,
+} from "../web-activity/registry.ts";
+import { buildWebAgentsRecord, buildWebRuntimeRecord, isWebActivityStartCurrent } from "./web-record.ts";
 import {
 	applyFinalOutcome,
 	classifyChildClose,
@@ -127,6 +133,9 @@ interface Job extends JobSnapshot {
 	stopEscalation?: TerminationController;
 	resultWritePromise?: Promise<void>;
 	lastProgressHookAt: number;
+	lastOutputAt?: number;
+	lastProgressAt?: number;
+	timeoutAt?: number;
 	fallbackRoutes: RouteDecision[];
 	parentMessages: ParentMessage[];
 	parentConversation: string;
@@ -639,6 +648,19 @@ export default function smartSubagents(pi: ExtensionAPI) {
 	const deferredCompletionMessages: Array<{ content: string; details: CompletionDetails }> = [];
 	let parentAgentActive = false;
 	let updateUi: () => void = () => {};
+	// PI WEB activity registry state. Timers and dispatchers are only started
+	// in session_start and cleared in session_shutdown.
+	let webRegistry: WebActivityRegistry | undefined;
+	let webDispatcher: ControlDispatcher | undefined;
+	let webRuntimeId = "";
+	let webGeneration = 0;
+	let webControlToken = "";
+	let webRuntimeStartedAt = 0;
+	let webStartEpoch = 0;
+	let webHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
+	let webControlPollTimer: ReturnType<typeof setInterval> | undefined;
+	let lastWebProgressFlushAt = 0;
+	let webProgressDirty = false;
 	const durationRefreshLoop = createActivityRefreshLoop({
 		hasActiveJobs: () => Boolean(
 			!shuttingDown &&
@@ -746,6 +768,42 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		} catch {
 			// Session may have been replaced while a process was shutting down.
 		}
+		flushWebAgents();
+	};
+
+	const flushWebAgents = (): Promise<boolean> | undefined => {
+		webProgressDirty = false;
+		const registry = webRegistry;
+		const ctx = latestCtx;
+		if (!registry || !ctx) return undefined;
+		const record = buildWebAgentsRecord([...jobs.values()], queue, {
+			sessionId: ctx.sessionManager.getSessionId(),
+			runtimeId: webRuntimeId,
+			generation: webGeneration,
+		});
+		return registry.write("agents", record);
+	};
+
+	const flushWebRuntime = (state: "active" | "shutdown" = "active"): Promise<boolean> | undefined => {
+		const registry = webRegistry;
+		const ctx = latestCtx;
+		if (!registry || !ctx) return undefined;
+		const all = [...jobs.values()];
+		const record = buildWebRuntimeRecord(
+			{
+				sessionId: ctx.sessionManager.getSessionId(),
+				runtimeId: webRuntimeId,
+				generation: webGeneration,
+				controlToken: webControlToken,
+			},
+			state,
+			{
+				startedAt: webRuntimeStartedAt,
+				total: all.length,
+				active: all.filter((job) => job.status === "routing" || job.status === "queued" || job.status === "running").length,
+			},
+		);
+		return registry.write("runtime", record);
 	};
 
 	const lifecyclePayload = (event: LifecycleEvent, job: Job) => ({
@@ -798,6 +856,14 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		if (job.progress.length > PROGRESS_ITEMS_LIMIT) job.progress.splice(0, job.progress.length - PROGRESS_ITEMS_LIMIT);
 		updateUi();
 		const now = Date.now();
+		job.lastProgressAt = now;
+		// Registry progress flush is throttled to at most once per 2s;
+		// deferred updates are picked up by the next flush or heartbeat.
+		webProgressDirty = true;
+		if (now - lastWebProgressFlushAt >= 2000) {
+			lastWebProgressFlushAt = now;
+			flushWebAgents();
+		}
 		if (now - job.lastProgressHookAt >= 2000) {
 			job.lastProgressHookAt = now;
 			emitLifecycle("progress", job);
@@ -903,6 +969,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		if (!text) return;
 		job.liveOutput += text;
 		if (job.liveOutput.length > LIVE_OUTPUT_LIMIT) job.liveOutput = job.liveOutput.slice(-LIVE_OUTPUT_LIMIT);
+		job.lastOutputAt = Date.now();
 		refreshAgentBrowser();
 	};
 
@@ -1007,9 +1074,18 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		const invocation = getPiInvocation(args);
 		job.status = "running";
 		job.startedAt = Date.now();
+		job.timeoutAt = job.startedAt + job.config.execution.hardTimeoutMs;
 		appendState(job);
 		emitLifecycle("started", job);
 		updateUi();
+		try {
+			latestCtx?.ui.notify(
+				`🤖 Sub-agent ${job.name} started · ${job.route.modelName} · ${job.route.effort} · ${job.route.contextMode} · ${job.route.permission}`,
+				"info",
+			);
+		} catch {
+			// Notifications are best-effort; PI WEB clients may ignore them.
+		}
 		try {
 			const child = spawn(invocation.command, invocation.args, {
 				cwd: job.cwd,
@@ -1188,6 +1264,8 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			});
 			return true;
 		}
+		// The public snapshot must show `stopping` while the stop request is active.
+		flushWebAgents();
 		job.stopEscalation = terminateWithGrace({
 			process: processRef,
 			graceMs: job.config.execution.terminateGraceMs,
@@ -1202,6 +1280,118 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			},
 		});
 		return true;
+	};
+
+	// --- PI WEB activity registry (workspace registry only when PI_WEB_SESSION=1) ---
+
+	const startWebTimers = () => {
+		if (webHeartbeatTimer) {
+			clearInterval(webHeartbeatTimer);
+			webHeartbeatTimer = undefined;
+		}
+		if (webControlPollTimer) {
+			clearInterval(webControlPollTimer);
+			webControlPollTimer = undefined;
+		}
+		// 5s liveness heartbeat: runtime.json is written unconditionally while the
+		// session runtime is alive, even with zero active jobs, so the browser
+		// panel never misclassifies an idle-but-live session as dead. Agents
+		// snapshots remain transition/progress based (flushed only when dirty).
+		webHeartbeatTimer = setInterval(() => {
+			if (!webRegistry) return;
+			flushWebRuntime("active");
+			if (webProgressDirty) flushWebAgents();
+		}, 5000);
+		webHeartbeatTimer.unref?.();
+		// Poll for atomic control-request files published by the browser plugin.
+		webControlPollTimer = setInterval(() => {
+			void webDispatcher?.poll().catch(() => {});
+		}, 1000);
+		webControlPollTimer.unref?.();
+	};
+
+	const stopWebTimers = () => {
+		if (webHeartbeatTimer) {
+			clearInterval(webHeartbeatTimer);
+			webHeartbeatTimer = undefined;
+		}
+		if (webControlPollTimer) {
+			clearInterval(webControlPollTimer);
+			webControlPollTimer = undefined;
+		}
+	};
+
+	const startWebActivity = async (ctx: ExtensionContext) => {
+		// A fresh generation + control token invalidates any stale request files
+		// left over from a previous session runtime. The epoch guards against a
+		// create that resolves after shutdown or after a newer session_start.
+		const epoch = ++webStartEpoch;
+		webGeneration += 1;
+		webRuntimeId = `sa-${uuidv7()}`;
+		webControlToken = randomBytes(32).toString("hex");
+		webRuntimeStartedAt = Date.now();
+		webDispatcher = undefined;
+		const registry = await WebActivityRegistry.create({
+			cwd: ctx.cwd,
+			identity: {
+				sessionId: ctx.sessionManager.getSessionId(),
+				runtimeId: webRuntimeId,
+				generation: webGeneration,
+				controlToken: webControlToken,
+			},
+			env: process.env,
+			notify: (message, kind) => {
+				try {
+					ctx.ui.notify(message, kind);
+				} catch {
+					// The browser panel also reads the registry directly.
+				}
+			},
+		});
+		// A late create (shutdown raced us, or a newer startup superseded us)
+		// performs no registry assignment, dispatcher, timers, prune, writes, or
+		// polls.
+		if (!isWebActivityStartCurrent({ shuttingDown, epoch, currentEpoch: webStartEpoch })) {
+			return;
+		}
+		webRegistry = registry.enabled ? registry : undefined;
+		if (!webRegistry) return;
+		// Best-effort cleanup of stale control files from earlier generations.
+		void webRegistry.pruneOwnControlFiles().catch(() => {});
+		webDispatcher = new ControlDispatcher(
+			registry,
+			{
+				sessionId: ctx.sessionManager.getSessionId(),
+				runtimeId: webRuntimeId,
+				generation: webGeneration,
+				controlToken: webControlToken,
+			},
+			{
+				stopOne: (jobId: string) => {
+					// Control stop_one matches the exact job id only. Names are
+					// user-derived and may collide, so a name match could stop the
+					// wrong job.
+					const job = jobs.get(jobId);
+					if (!job) return `unknown job: ${jobId}`;
+					if (FINAL_STATUSES.has(job.status)) return `job ${job.name} is already ${job.status}`;
+					if (job.stopRequest) return `job ${job.name} is already stopping`;
+					const stopped = stopJob(job);
+					return stopped ? `stop initiated for ${job.name}` : `job ${job.name} could not be stopped`;
+				},
+				stopAll: () => {
+					const targets = [...jobs.values()].filter((job) => !FINAL_STATUSES.has(job.status));
+					let stopped = 0;
+					for (const job of targets) {
+						if (stopJob(job)) stopped += 1;
+					}
+					updateUi();
+					return `stop initiated for ${stopped} of ${targets.length} job(s)`;
+				},
+			},
+		);
+		startWebTimers();
+		flushWebRuntime("active");
+		flushWebAgents();
 	};
 
 	pi.registerMessageRenderer<CompletionDetails>(
@@ -1364,6 +1554,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 				contextNotes: params.contextNotes ?? "",
 			};
 			jobs.set(id, job);
+			flushWebAgents();
 			const ensureDispatchActive = () => {
 				if (!shuttingDown && !FINAL_STATUSES.has(job.status)) return;
 				throw new Error(job.stopRequest === "user" ? "Dispatch stopped by /agents stop." : "Dispatch stopped by session shutdown.");
@@ -1523,6 +1714,20 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			}
 			if (action === "stop") {
 				const target = rest.join(" ");
+				if (target === "all" || target === "*") {
+					const targets = [...jobs.values()].filter((job) => !FINAL_STATUSES.has(job.status));
+					if (targets.length === 0) {
+						ctx.ui.notify("No active sub-agents to stop", "info");
+						return;
+					}
+					let stopped = 0;
+					for (const job of targets) {
+						if (stopJob(job)) stopped += 1;
+					}
+					updateUi();
+					ctx.ui.notify(`Stopping ${stopped} of ${targets.length} sub-agents`, "info");
+					return;
+				}
 				const job = [...jobs.values()].find((candidate) => candidate.id === target || candidate.name === target);
 				if (!job) {
 					ctx.ui.notify(`Sub-agent not found: ${target || "(missing target)"}`, "error");
@@ -1553,6 +1758,9 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		latestCtx = ctx;
 		shuttingDown = false;
 		updateUi();
+		// Registry, control watcher, and heartbeat timers only start here and
+		// only stop in session_shutdown.
+		void startWebActivity(ctx);
 	});
 
 	pi.on("agent_start", () => {
@@ -1574,6 +1782,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		if (shuttingDown) return;
 		shuttingDown = true;
 		durationRefreshLoop.stop();
+		stopWebTimers();
 		if (uiExpiryTimer) {
 			clearTimeout(uiExpiryTimer);
 			uiExpiryTimer = undefined;
@@ -1612,6 +1821,23 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			},
 		});
 		await Promise.all([...jobs.values()].map((job) => job.resultWritePromise).filter((promise): promise is Promise<void> => Boolean(promise)));
+		// Final durable web snapshot. Timers were already stopped above, so this is
+		// the single (and last) shutdown write. Await the serialized registry writes
+		// as far as the API allows so teardown does not race the final state.
+		try {
+			if (webRegistry) {
+				const writes: Promise<boolean>[] = [];
+				const runtimeWrite = flushWebRuntime("shutdown");
+				if (runtimeWrite) writes.push(runtimeWrite);
+				const agentsWrite = flushWebAgents();
+				if (agentsWrite) writes.push(agentsWrite);
+				await Promise.all(writes);
+			}
+		} catch {
+			// Panel observability must never block session teardown.
+		}
+		webRegistry = undefined;
+		webDispatcher = undefined;
 		latestCtx = undefined;
 	});
 }

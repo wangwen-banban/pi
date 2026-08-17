@@ -193,6 +193,19 @@ Verify without changing anything:
 
 Open locally at <http://127.0.0.1:8504>. Use **Actions → Add Project**, enter one project directory, select its workspace, then start or resume a session.
 
+### Activity panel for phone/background work
+
+Install the trusted browser-only Activity plugin (no web/sessiond restart):
+
+```bash
+~/.pi/agent/scripts/setup-pi-web-activity-plugin.sh
+~/.pi/agent/scripts/setup-pi-web-activity-plugin.sh --check
+```
+
+Then hard-refresh the browser. The **Activity** workspace panel and badge show sub-agent routing/queue/running/stopping/terminal states, model/thinking, locally ticking elapsed time, progress age, stale/disconnected state, Plan Mode, and safe Stop one/all controls. Records survive browser reconnects under the Git-excluded workspace path `.pi/.runtime/pi-web-activity/v1/`; they never contain full delegated tasks, parent context, live output, credentials, or PIDs.
+
+After changing the supporting Pi extensions, wait until no delegated worker is active and run `/reload` once in chat. Reloading while a worker is active intentionally stops it. A browser hard refresh loads browser-plugin changes; `/reload` loads Pi extension changes. Neither action requires restarting sessiond.
+
 Useful commands:
 
 ```bash
@@ -228,10 +241,13 @@ Keep the home Mac awake, let PI WEB and Tailscale start after reboot, and retain
 
 ## Plan Mode
 
-- `enter_plan_mode` blocks write tools.
-- `ask_user` displays interactive choices.
-- `exit_plan_mode` presents a plan for approval.
-- Approval restores write access.
+- `enter_plan_mode` blocks write tools and writes a branch-aware durable marker.
+- `ask_user` displays interactive choices where supported.
+- `exit_plan_mode` presents the complete plan for explicit approval.
+- TUI uses its custom approval view; PI WEB/RPC uses browser confirm and optional feedback dialogs.
+- Reject, cancel, feedback, JSON/print mode, or unavailable UI all fail closed and keep write access blocked.
+- `/reload`, `/tree`, and `/rewind` reconstruct Plan Mode from the current branch; shutdown never silently turns it off.
+- The PI WEB Activity panel displays a persistent PLAN chip, reason, and runtime liveness.
 
 Manual commands: `/plan`, `/plan off`, `/plan <reason>`.
 

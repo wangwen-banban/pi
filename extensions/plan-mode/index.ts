@@ -10,7 +10,7 @@
  * The model is guided via promptGuidelines to use these tools proactively.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	Editor,
 	type EditorTheme,
@@ -22,9 +22,23 @@ import {
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { classifyCommand } from "./readonly-check.ts";
+import {
+	WebActivityRegistry,
+	WEB_ACTIVITY_SCHEMA_VERSION,
+} from "../web-activity/registry.ts";
+import {
+	PLAN_MARKER_TYPE,
+	EpochGuard,
+	blockedPlanExitMessage,
+	buildPlanMarker,
+	decideRpcPlanExit,
+	planExitChannel,
+	reconstructPlanState,
+} from "./plan-state.ts";
 
 const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 
@@ -66,6 +80,109 @@ export default function planMode(pi: ExtensionAPI) {
 	let settings = loadSettings();
 	// Cache AI-judge verdicts by exact command string (per session).
 	const judgeCache = new Map<string, { readonly: boolean; why: string }>();
+	// PI WEB plan activity state. Registry + heartbeat timers are only started
+	// in session_start and cleared in session_shutdown; shutdown never silently
+	// turns plan mode off (the branch markers own the durable state).
+	let currentCtx: ExtensionContext | undefined;
+	let webRegistry: WebActivityRegistry | undefined;
+	let webRuntimeId = "";
+	let webGeneration = 0;
+	let webHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
+	let planSince = 0;
+	// Session-lifecycle bookkeeping for the PI WEB activity runtime record.
+	// `webStartedAt` is the monotonic start time of the *current* session runtime;
+	// `planGuard` detects the awaited-create-vs-shutdown race (and /reload).
+	let webStartedAt = 0;
+	const planGuard = new EpochGuard();
+
+	// --- Durable plan-mode state (branch markers + PI WEB activity) ---
+
+	const appendMarker = (state: "active" | "inactive", reason: string, source: string) => {
+		try {
+			pi.appendEntry(PLAN_MARKER_TYPE, buildPlanMarker(state, reason, source));
+		} catch {
+			// A stale session must not break state transitions.
+		}
+	};
+
+	const writePlanRecord = () => {
+		const registry = webRegistry;
+		const ctx = currentCtx;
+		if (!registry || !ctx) return;
+		const now = Date.now();
+		void registry.write("plan-mode", {
+			schemaVersion: WEB_ACTIVITY_SCHEMA_VERSION,
+			sessionId: ctx.sessionManager.getSessionId(),
+			runtimeId: webRuntimeId,
+			generation: webGeneration,
+			state: inPlanMode ? "active" : "inactive",
+			reason: inPlanMode ? planModeReason : "",
+			since: planSince,
+			updatedAt: now,
+			heartbeatAt: now,
+		});
+	};
+
+	// Write the session runtime record. Omit PID and control capability;
+	// plan-mode owns an independent runtimeId under the registry.
+	const writeRuntimeRecord = (state: "active" | "shutdown") => {
+		const registry = webRegistry;
+		const ctx = currentCtx;
+		if (!registry || !ctx) return;
+		const now = Date.now();
+		const record: Record<string, unknown> = {
+			schemaVersion: WEB_ACTIVITY_SCHEMA_VERSION,
+			source: "plan-mode",
+			sessionId: ctx.sessionManager.getSessionId(),
+			runtimeId: webRuntimeId,
+			generation: webGeneration,
+			state,
+			startedAt: webStartedAt,
+			updatedAt: now,
+		};
+		if (state === "active") {
+			record.heartbeatAt = now;
+		}
+		return registry.write("runtime", record);
+	};
+
+	const setFooterStatus = (ctx: ExtensionContext) => {
+		if (!ctx.hasUI) return;
+		try {
+			if (inPlanMode) {
+				ctx.ui.setStatus(
+					"plan-mode",
+					ctx.ui.theme ? ctx.ui.theme.fg("warning", "📋 plan mode") : "📋 plan mode",
+				);
+			} else {
+				ctx.ui.setStatus("plan-mode", undefined);
+			}
+		} catch {
+			// Footer status is cosmetic; RPC/print modes may no-op it.
+		}
+	};
+
+	const activatePlanMode = (ctx: ExtensionContext, reason: string, source: string) => {
+		const changed = !inPlanMode;
+		inPlanMode = true;
+		planModeReason = reason;
+		planSince = changed ? Date.now() : planSince;
+		turnsSincePlanStart = 0;
+		setFooterStatus(ctx);
+		if (changed) appendMarker("active", reason, source);
+		writePlanRecord();
+	};
+
+	const deactivatePlanMode = (ctx: ExtensionContext, source: string, reason = "") => {
+		const changed = inPlanMode;
+		inPlanMode = false;
+		planModeReason = "";
+		planSince = 0;
+		turnsSincePlanStart = 0;
+		setFooterStatus(ctx);
+		if (changed) appendMarker("inactive", reason, source);
+		writePlanRecord();
+	};
 
 	/**
 	 * Ask a small model whether a shell command is strictly read-only.
@@ -269,14 +386,21 @@ export default function planMode(pi: ExtensionAPI) {
 			reason: Type.Optional(Type.String({ description: "Brief reason for entering plan mode (optional)" })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			inPlanMode = true;
-			planModeReason = params.reason ?? "";
-			turnsSincePlanStart = 0;
+			currentCtx = ctx;
 			settings = loadSettings();
-			ctx.ui.notify(
-				"📋 Plan mode active — edit/write blocked, read-only bash allowed",
-				"info",
-			);
+			const reason = params.reason ?? "";
+			const alreadyActive = inPlanMode;
+			activatePlanMode(ctx, reason, "enter");
+			try {
+				ctx.ui.notify(
+					alreadyActive
+						? "📋 Plan mode is already active"
+						: "📋 Plan mode active — edit/write blocked, read-only bash allowed",
+					"info",
+				);
+			} catch {
+				// PI WEB clients may drop notifications; the registry record remains.
+			}
 			return {
 				content: [
 					{
@@ -482,9 +606,50 @@ export default function planMode(pi: ExtensionAPI) {
 		}),
 		executionMode: "sequential",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			if (ctx.mode !== "tui") {
-				inPlanMode = false;
-				return { content: [{ type: "text", text: "Plan approved (non-interactive mode)" }] };
+			currentCtx = ctx;
+			const planText = String(params.plan ?? "").slice(0, 12_000);
+			const channel = planExitChannel(ctx.mode);
+
+			// JSON / print / headless: fail closed. Plan mode is never left without
+			// an explicit interactive approval.
+			if (channel === "blocked") {
+				return { content: [{ type: "text", text: blockedPlanExitMessage() }] };
+			}
+
+			// RPC: the full plan is shown via confirm; decline can carry feedback
+			// through input. Reject/feedback/cancel all stay in plan mode.
+			if (channel === "rpc") {
+				let confirmed = false;
+				try {
+					confirmed = await ctx.ui.confirm(
+						"Plan Approval",
+						`${planText}\n\nApprove this plan to exit plan mode and start implementing?`,
+					);
+				} catch {
+					confirmed = false;
+				}
+				let feedback: string | undefined;
+				if (!confirmed) {
+					try {
+						feedback = await ctx.ui.input(
+							"Plan feedback (optional)",
+							"Type feedback, or press Enter to reject the plan",
+						);
+					} catch {
+						feedback = undefined;
+					}
+				}
+				const decision = decideRpcPlanExit(confirmed, feedback ?? null);
+				if (decision.outcome === "approve") {
+					deactivatePlanMode(ctx, "approve", "plan approved in RPC");
+					try {
+						ctx.ui.notify("✅ Plan approved — write tools unblocked", "info");
+					} catch {
+						// Registry record and marker already persist the transition.
+					}
+					return { content: [{ type: "text", text: decision.text }] };
+				}
+				return { content: [{ type: "text", text: decision.text }] };
 			}
 
 			const result = await ctx.ui.custom<"approve" | "reject" | { feedback: string } | null>(
@@ -596,8 +761,12 @@ export default function planMode(pi: ExtensionAPI) {
 			);
 
 			if (result === "approve") {
-				inPlanMode = false;
-				ctx.ui.notify("✅ Plan approved — write tools unblocked", "info");
+				deactivatePlanMode(ctx, "approve", "plan approved in TUI");
+				try {
+					ctx.ui.notify("✅ Plan approved — write tools unblocked", "info");
+				} catch {
+					// Registry record and marker already persist the transition.
+				}
 				return {
 					content: [
 						{
@@ -655,31 +824,155 @@ export default function planMode(pi: ExtensionAPI) {
 	pi.registerCommand("plan", {
 		description: "Toggle plan mode (or '/plan off' to force exit)",
 		handler: async (args, ctx) => {
+			currentCtx = ctx;
 			const arg = (args ?? "").toString().trim().toLowerCase();
 			if (arg === "off" || arg === "exit") {
-				inPlanMode = false;
-				ctx.ui.notify("Plan mode: OFF — write tools allowed", "info");
+				if (inPlanMode) deactivatePlanMode(ctx, "manual_off", "manually turned off");
+				else setFooterStatus(ctx);
+				try {
+					ctx.ui.notify("Plan mode: OFF — write tools allowed", "info");
+				} catch {
+					// Marker and registry record already persist the transition.
+				}
 			} else if (arg === "on" || arg === "" || arg === "enter") {
 				if (inPlanMode) {
-					ctx.ui.notify("Plan mode is already active", "info");
+					try {
+						ctx.ui.notify("Plan mode is already active", "info");
+					} catch {
+						// Best-effort notification.
+					}
 				} else {
-					inPlanMode = true;
-					planModeReason = arg === "on" || arg === "enter" || !arg ? "user requested" : arg;
-					turnsSincePlanStart = 0;
 					settings = loadSettings();
-					ctx.ui.notify(
-						"📋 Plan mode: ON — edit/write blocked, read-only bash allowed",
-						"info",
-					);
+					activatePlanMode(ctx, "user requested", "manual_on");
+					try {
+						ctx.ui.notify(
+							"📋 Plan mode: ON — edit/write blocked, read-only bash allowed",
+							"info",
+						);
+					} catch {
+						// Best-effort notification.
+					}
 				}
 			} else {
 				// Treat as reason
-				inPlanMode = true;
-				planModeReason = arg;
-				turnsSincePlanStart = 0;
 				settings = loadSettings();
-				ctx.ui.notify(`📋 Plan mode: ON — ${arg}`, "info");
+				activatePlanMode(ctx, arg, "manual_on");
+				try {
+					ctx.ui.notify(`📋 Plan mode: ON — ${arg}`, "info");
+				} catch {
+					// Best-effort notification.
+				}
 			}
 		},
+	});
+
+	// --- Session lifecycle: reconstruct durable state, start/stop web activity ---
+
+	pi.on("session_start", async (_event, ctx) => {
+		// Capture epoch BEFORE any await; shutdown/newer start invalidates it.
+		const myEpoch = planGuard.start();
+		currentCtx = ctx;
+		settings = loadSettings();
+		// Reconstruct from the CURRENT branch so /reload, rewind and /tree
+		// semantics all observe the same durable plan-mode state.
+		let reconstructed: { active: boolean; reason: string };
+		try {
+			reconstructed = reconstructPlanState(ctx.sessionManager.getBranch() as any[]);
+		} catch {
+			reconstructed = { active: false, reason: "" };
+		}
+		inPlanMode = reconstructed.active;
+		planModeReason = reconstructed.reason;
+		planSince = reconstructed.active ? Date.now() : 0;
+		turnsSincePlanStart = 0;
+		setFooterStatus(ctx);
+
+		// Stop any existing heartbeat before creating the new registry.
+		if (webHeartbeatTimer) {
+			clearInterval(webHeartbeatTimer);
+			webHeartbeatTimer = undefined;
+		}
+
+		// (Re)create the workspace registry with a fresh runtime identity.
+		webGeneration += 1;
+		webRuntimeId = `plan-${randomUUID()}`;
+		let registry: WebActivityRegistry | undefined;
+		try {
+			const created = await WebActivityRegistry.create({
+				cwd: ctx.cwd,
+				identity: {
+					sessionId: ctx.sessionManager.getSessionId(),
+					runtimeId: webRuntimeId,
+					generation: webGeneration,
+					controlToken: "",
+				},
+				env: process.env,
+				notify: (message, kind) => {
+					try {
+						ctx.ui.notify(message, kind);
+					} catch {
+						// The browser panel also reads the registry directly.
+					}
+				},
+			});
+			registry = created.enabled ? created : undefined;
+		} catch {
+			registry = undefined;
+		}
+
+		// Epoch guard: if shutdown fired or a newer session_start happened during
+		// the await, late initialization must do nothing.
+		if (!planGuard.isCurrent(myEpoch)) {
+			return;
+		}
+
+		// Safe to assign state and start timers.
+		webRegistry = registry;
+		webStartedAt = Date.now();
+		void writeRuntimeRecord("active");
+		writePlanRecord();
+
+		// Best-effort prune of own stale control files.
+		if (registry) {
+			void registry.pruneOwnControlFiles();
+
+			// Unconditional 5s heartbeat while the session runtime is alive,
+			// including when plan mode is inactive, so liveness isn't falsely stale.
+			webHeartbeatTimer = setInterval(() => {
+				void writeRuntimeRecord("active");
+				writePlanRecord();
+			}, 5000);
+			webHeartbeatTimer.unref?.();
+		}
+	});
+
+	// Compaction can drop older custom entries; re-append an active marker so
+	// plan mode can never be silently lost.
+	pi.on("session_compact", () => {
+		if (inPlanMode) appendMarker("active", planModeReason || "proactive planning", "post_compaction");
+	});
+
+	pi.on("session_shutdown", async () => {
+		// Signal shutdown to any in-flight session_start FIRST (before clearing
+		// timers) so the epoch guard catches the race deterministically.
+		planGuard.shutdown();
+		// Stop timers first, then write runtime shutdown once when initialized.
+		if (webHeartbeatTimer) {
+			clearInterval(webHeartbeatTimer);
+			webHeartbeatTimer = undefined;
+		}
+		const registry = webRegistry;
+		if (registry) {
+			try {
+				await writeRuntimeRecord("shutdown");
+			} catch {
+				// Final registry snapshot is best-effort during teardown.
+			}
+		}
+		// Deliberately do NOT flip inPlanMode or append an inactive marker:
+		// shutdown also fires for /reload and session switches, and turning
+		// plan mode off silently would unblock write tools.
+		webRegistry = undefined;
+		currentCtx = undefined;
 	});
 }
