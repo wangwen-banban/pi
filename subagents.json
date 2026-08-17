@@ -15,7 +15,11 @@
   },
   "execution": {
     "hardTimeoutMs": 1800000,
-    "terminateGraceMs": 5000
+    "terminateGraceMs": 5000,
+    "workerExtensions": [
+      "codex-multi-account",
+      "provider-routing"
+    ]
   },
   "modelProfiles": {
     "defaultTier": "B",

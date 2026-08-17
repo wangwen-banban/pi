@@ -206,6 +206,8 @@ Then hard-refresh the browser. The **Activity** workspace panel and badge show s
 
 After changing the supporting Pi extensions, wait until no delegated worker is active and run `/reload` once in chat. Reloading while a worker is active intentionally stops it. A browser hard refresh loads browser-plugin changes; `/reload` loads Pi extension changes. Neither action requires restarting sessiond.
 
+Workers retain `--no-extensions` isolation and explicitly load only the audited `codex-multi-account` then `provider-routing` bootstrap. This gives PI WEB workers the same Codex account/proxy transport capability as the parent without loading arbitrary extensions.
+
 Useful commands:
 
 ```bash

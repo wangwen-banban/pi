@@ -1,3 +1,8 @@
+import {
+	sanitizeWorkerExtensionKeys,
+	type WorkerExtensionKey,
+} from "./worker-bootstrap.ts";
+
 export type Complexity = "simple" | "medium" | "complex" | "critical";
 export type ContextMode = "isolated" | "selected" | "summary" | "full";
 export type PermissionMode = "read-only" | "workspace-write";
@@ -39,6 +44,7 @@ export interface SmartSubagentConfig {
 	execution: {
 		hardTimeoutMs: number;
 		terminateGraceMs: number;
+		workerExtensions: WorkerExtensionKey[];
 	};
 	modelProfiles: ModelProfilesConfig;
 	routes: Record<Complexity, RouteConfig>;
@@ -73,6 +79,9 @@ export const DEFAULT_CONFIG: SmartSubagentConfig = {
 	execution: {
 		hardTimeoutMs: 30 * 60 * 1000,
 		terminateGraceMs: 5000,
+		// Trusted worker provider bootstrap, loaded in this fixed order after
+		// --no-extensions. codex-multi-account first, then provider-routing.
+		workerExtensions: ["codex-multi-account", "provider-routing"],
 	},
 	modelProfiles: {
 		defaultTier: "B",
@@ -189,6 +198,11 @@ export function mergeConfig(raw: unknown): SmartSubagentConfig {
 	}
 	if (typeof execution.terminateGraceMs === "number" && Number.isFinite(execution.terminateGraceMs)) {
 		merged.execution.terminateGraceMs = Math.max(100, Math.min(60_000, Math.floor(execution.terminateGraceMs)));
+	}
+	// Symbolic keys only; unknown/traversal-like entries are dropped and the
+	// fixed order is enforced here so config can never reorder the bootstrap.
+	if (Array.isArray(execution.workerExtensions)) {
+		merged.execution.workerExtensions = sanitizeWorkerExtensionKeys(execution.workerExtensions);
 	}
 
 	const profiles = isRecord(raw.modelProfiles) ? raw.modelProfiles : {};

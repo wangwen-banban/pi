@@ -7,7 +7,7 @@ Global pi extension for asynchronous, automatically routed sub-agents.
 - Classifies each delegated task as `simple`, `medium`, `complex`, or `critical`.
 - Selects an authenticated model and supported thinking level from `~/.pi/agent/subagents.json`.
 - Chooses `isolated`, `selected`, `summary`, or `full` parent-context inheritance.
-- Runs each worker in an isolated `pi --mode json --no-session --no-extensions` process.
+- Runs each worker in an isolated `pi --mode json --no-session --no-extensions` process with a trusted provider bootstrap (see below).
 - Works identically from native Pi and PI WEB sessions: embedded PI WEB runtimes resolve the standalone `pi` CLI instead of accidentally re-executing the hosting `sessiond.js`.
 - Shares the parent's working directory while keeping conversation context isolated.
 - Delivers completion immediately through lifecycle events and a visible `steer` message instead of polling. It enters at the next safe agent-loop boundary without aborting an in-flight response or tool call.
@@ -132,6 +132,38 @@ not yet produced `context.md`, and intentionally uses a persistence-only path:
 no stale UI, completion message, or lifecycle hook is required to save it.
 Running children receive `SIGTERM` and then `SIGKILL` after the configured grace
 if needed.
+
+## Worker provider bootstrap
+
+Workers keep `--no-extensions`, so they do not inherit the parent's extension
+set. Dynamic providers (the secondary Codex OAuth account and the routed Codex /
+Claude relays) are re-registered through a small, fixed, audited bootstrap:
+
+```json
+{
+  "execution": {
+    "workerExtensions": ["codex-multi-account", "provider-routing"]
+  }
+}
+```
+
+- Values are **symbolic keys only** — never paths. The table maps them to
+  `extensions/codex-multi-account/index.ts` (order 0) and
+  `extensions/provider-routing/index.ts` (order 1) under the agent directory.
+- Both are required in this order for the secondary account:
+  `provider-routing` alone leaves `openai-codex-second` without oauth/models.
+- Keys are deduped and forced into the fixed order; unknown or path-shaped
+  config entries are ignored and can never become load paths. Files are
+  realpath-verified regular files inside the extensions directory before
+  dispatch, so a missing/moved/compromised trusted file fails with a
+  `routing_error` before any worker spawns.
+- Providers supplied/routed by the bootstrap (`openai-codex`,
+  `openai-codex-second`, and the `claude-relay*` family) are preflighted
+  against the configured keys without any network call; unrelated builtin
+  providers continue to work.
+- The unsupported-model fallback is the only automatic retry. It never runs
+  after tool activity or file edits, and a generic `fetch failed` never
+  silently falls back — it surfaces a bounded diagnostic instead.
 
 ## Commands
 

@@ -19,6 +19,14 @@ import { Box, Container, Key, Markdown, Spacer, Text, matchesKey, truncateToWidt
 import { Type } from "typebox";
 import { getPiInvocation } from "./pi-invocation.ts";
 import {
+	buildWorkerArgs,
+	fetchFailureHint,
+	mayFallbackAfterFailure,
+	preflightWorkerProvider,
+	resolveWorkerExtensions,
+	type ResolvedWorkerExtension,
+} from "./worker-bootstrap.ts";
+import {
 	ControlDispatcher,
 	WebActivityRegistry,
 } from "../web-activity/registry.ts";
@@ -140,6 +148,10 @@ interface Job extends JobSnapshot {
 	parentMessages: ParentMessage[];
 	parentConversation: string;
 	contextNotes: string;
+	/** True once the worker emits any tool activity; disables automatic fallback. */
+	toolActivitySeen: boolean;
+	/** Trusted provider bootstrap files resolved before dispatch (fixed order). */
+	workerExtensions: ResolvedWorkerExtension[];
 }
 
 interface DispatchDetails {
@@ -986,6 +998,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			return;
 		}
 		if (event.type === "tool_execution_start") {
+			job.toolActivitySeen = true;
 			const args = event.args ? ` ${typeof event.args === "string" ? event.args : JSON.stringify(event.args)}` : "";
 			recordProgress(job, `tool: ${event.toolName ?? "unknown"}`);
 			appendLiveOutput(job, `\n▶ ${event.toolName ?? "tool"}${args}\n`);
@@ -1018,6 +1031,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		for (const part of Array.isArray(message.content) ? message.content : []) {
 			if (part.type === "text" && typeof part.text === "string") textParts.push(part.text);
 			if (part.type === "toolCall") {
+				job.toolActivitySeen = true;
 				recordProgress(job, `tool: ${part.name}`);
 				appendLiveOutput(job, `\n▶ ${part.name} ${JSON.stringify(part.arguments ?? {})}\n`);
 				if ((part.name === "edit" || part.name === "write") && part.arguments) {
@@ -1060,17 +1074,14 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			job.task,
 			job.expectedOutput ? `\n## Expected output / acceptance criteria\n${job.expectedOutput}` : "",
 		].join("\n");
-		const args = [
-			"--mode", "json",
-			"-p",
-			"--no-session",
-			"--no-extensions",
-			"--model", job.route.modelRef,
-			"--thinking", job.route.effort,
-			"--tools", tools,
-			"--append-system-prompt", job.contextPath,
+		const args = buildWorkerArgs({
+			modelRef: job.route.modelRef,
+			effort: job.route.effort,
+			tools,
+			contextPath: job.contextPath,
 			prompt,
-		];
+			extensions: job.workerExtensions,
+		});
 		const invocation = getPiInvocation(args);
 		job.status = "running";
 		job.startedAt = Date.now();
@@ -1149,9 +1160,17 @@ export default function smartSubagents(pi: ExtensionAPI) {
 					stderr: job.stderr,
 				});
 				const failureText = `${job.error ?? ""}\n${job.stderr}`;
-				const unsupportedModel = /model[_ ]not[_ ]supported|unsupported model|requested model is not supported/i.test(failureText);
-				const fallbackEligible = outcome.terminationReason === "exit_nonzero" || outcome.terminationReason === "child_error";
-				if (fallbackEligible && unsupportedModel && job.fallbackRoutes.length > 0) {
+				// The unsupported-model fallback is the only automatic retry, and it
+				// never runs after tool activity or file edits (possible side
+				// effects). A generic fetch failure is not an unsupported model.
+				const fallbackAllowed = mayFallbackAfterFailure({
+					terminationReason: outcome.terminationReason,
+					failureText,
+					toolActivitySeen: job.toolActivitySeen,
+					changedFileCount: job.changedFiles.length,
+					fallbackRouteCount: job.fallbackRoutes.length,
+				});
+				if (fallbackAllowed) {
 					const previousModel = job.route?.modelRef ?? "unknown";
 					job.route = job.fallbackRoutes.shift();
 					job.status = "queued";
@@ -1163,11 +1182,19 @@ export default function smartSubagents(pi: ExtensionAPI) {
 					job.childStopReason = undefined;
 					job.timedOutAt = undefined;
 					job.timeoutEscalated = undefined;
+					job.timeoutAt = undefined;
+					job.toolActivitySeen = false;
 					recordProgress(job, `model ${previousModel} unsupported; retrying with ${job.route?.modelRef}`);
 					queue.push(job.id);
 					appendState(job);
 					pumpQueue();
 					return;
+				}
+				// Bounded diagnostic when the worker died before any tool activity
+				// with a generic transport/fetch failure (never prints secrets).
+				if (!job.toolActivitySeen) {
+					const hint = fetchFailureHint(failureText);
+					if (hint) outcome.error = outcome.error ? `${outcome.error}\n\n${hint}` : hint;
 				}
 				void finalizeJob(job, outcome);
 			});
@@ -1552,6 +1579,8 @@ export default function smartSubagents(pi: ExtensionAPI) {
 				parentMessages: [],
 				parentConversation: "",
 				contextNotes: params.contextNotes ?? "",
+				toolActivitySeen: false,
+				workerExtensions: [],
 			};
 			jobs.set(id, job);
 			flushWebAgents();
@@ -1616,8 +1645,24 @@ export default function smartSubagents(pi: ExtensionAPI) {
 				});
 				const effectiveRoute = routeCandidates.shift();
 				if (!effectiveRoute) throw new Error("Model routing produced no usable candidate.");
+				// Preflight without network: extension-dependent/routed providers must
+				// be covered by the configured trusted worker extensions, otherwise
+				// the child would die in the provider composer at startup.
+				const preflightError = preflightWorkerProvider(
+					effectiveRoute.provider,
+					config.execution.workerExtensions,
+				);
+				if (preflightError) throw new Error(preflightError);
+				// Resolve trusted bootstrap files now so any missing/unknown/outside
+				// path fails the dispatch with an actionable routing_error before spawn.
+				job.workerExtensions = resolveWorkerExtensions(
+					config.execution.workerExtensions,
+					getAgentDir(),
+				);
 				job.route = effectiveRoute;
-				job.fallbackRoutes = routeCandidates;
+				job.fallbackRoutes = routeCandidates.filter((candidate) => {
+					return preflightWorkerProvider(candidate.provider, config.execution.workerExtensions) === null;
+				});
 				await fs.promises.mkdir(runDir, { recursive: true, mode: 0o700 });
 				ensureDispatchActive();
 				job.status = "queued";
