@@ -30,10 +30,12 @@ import {
 // ---------------------------------------------------------------------------
 
 test("default config carries the trusted worker extensions in fixed order", () => {
-	assert.deepEqual(DEFAULT_CONFIG.execution.workerExtensions, ["codex-multi-account", "provider-routing"]);
-	assert.deepEqual(WORKER_EXTENSION_KEYS, ["codex-multi-account", "provider-routing"]);
+	assert.deepEqual(DEFAULT_CONFIG.execution.workerExtensions, ["codex-multi-account", "provider-routing", "codex-web-search"]);
+	assert.deepEqual(WORKER_EXTENSION_KEYS, ["codex-multi-account", "provider-routing", "codex-web-search"]);
 	assert.equal(WORKER_EXTENSIONS["codex-multi-account"].order, 0);
 	assert.equal(WORKER_EXTENSIONS["provider-routing"].order, 1);
+	assert.equal(WORKER_EXTENSIONS["codex-web-search"].order, 2);
+	assert.deepEqual(WORKER_EXTENSIONS["codex-web-search"].providers, []);
 });
 
 test("mergeConfig dedupes, sorts into fixed order, and drops unknown/traversal-like keys", () => {
@@ -42,6 +44,7 @@ test("mergeConfig dedupes, sorts into fixed order, and drops unknown/traversal-l
 			workerExtensions: [
 				"provider-routing",
 				"codex-multi-account",
+				"codex-web-search",
 				"codex-multi-account",
 				"unknown-key",
 				"../evil",
@@ -53,9 +56,9 @@ test("mergeConfig dedupes, sorts into fixed order, and drops unknown/traversal-l
 			],
 		},
 	});
-	assert.deepEqual(merged.execution.workerExtensions, ["codex-multi-account", "provider-routing"]);
+	assert.deepEqual(merged.execution.workerExtensions, ["codex-multi-account", "provider-routing", "codex-web-search"]);
 	// Missing config keeps the default.
-	assert.deepEqual(mergeConfig({}).execution.workerExtensions, ["codex-multi-account", "provider-routing"]);
+	assert.deepEqual(mergeConfig({}).execution.workerExtensions, ["codex-multi-account", "provider-routing", "codex-web-search"]);
 	// An explicit empty list disables the bootstrap (preflight still gates routed providers).
 	assert.deepEqual(mergeConfig({ execution: { workerExtensions: [] } }).execution.workerExtensions, []);
 });
@@ -91,24 +94,29 @@ function makeAgentDirWithExtensions() {
 	const agentDir = mkdtempSync(join(tmpdir(), "ws-ok-"));
 	const codexDir = join(agentDir, "extensions", "codex-multi-account");
 	const routingDir = join(agentDir, "extensions", "provider-routing");
+	const searchDir = join(agentDir, "extensions", "codex-web-search");
 	mkdirSync(codexDir, { recursive: true });
 	mkdirSync(routingDir, { recursive: true });
+	mkdirSync(searchDir, { recursive: true });
 	const codexFile = join(codexDir, "index.ts");
 	const routingFile = join(routingDir, "index.ts");
+	const searchFile = join(searchDir, "index.ts");
 	writeFileSync(codexFile, "export default () => {};\n");
 	writeFileSync(routingFile, "export default () => {};\n");
-	return { agentDir, codexFile, routingFile };
+	writeFileSync(searchFile, "export default () => {};\n");
+	return { agentDir, codexFile, routingFile, searchFile };
 }
 
 test("resolveWorkerExtensions realpaths files and forces fixed order regardless of input", () => {
-	const { agentDir, codexFile, routingFile } = makeAgentDirWithExtensions();
-	const resolved = resolveWorkerExtensions(["codex-multi-account", "provider-routing"], agentDir);
+	const { agentDir, codexFile, routingFile, searchFile } = makeAgentDirWithExtensions();
+	const resolved = resolveWorkerExtensions(["codex-multi-account", "provider-routing", "codex-web-search"], agentDir);
 	assert.deepEqual(resolved, [
 		{ key: "codex-multi-account", file: realpathSync(codexFile) },
 		{ key: "provider-routing", file: realpathSync(routingFile) },
+		{ key: "codex-web-search", file: realpathSync(searchFile) },
 	]);
-	const reversed = resolveWorkerExtensions(["provider-routing", "codex-multi-account"], agentDir);
-	assert.deepEqual(reversed.map((entry) => entry.key), ["codex-multi-account", "provider-routing"]);
+	const reversed = resolveWorkerExtensions(["codex-web-search", "provider-routing", "codex-multi-account"], agentDir);
+	assert.deepEqual(reversed.map((entry) => entry.key), ["codex-multi-account", "provider-routing", "codex-web-search"]);
 });
 
 test("resolveWorkerExtensions fails on a missing extensions root or missing file", () => {
@@ -165,10 +173,11 @@ function sampleExtensions() {
 	return [
 		{ key: "codex-multi-account", file: "/agent/extensions/codex-multi-account/index.ts" },
 		{ key: "provider-routing", file: "/agent/extensions/provider-routing/index.ts" },
+		{ key: "codex-web-search", file: "/agent/extensions/codex-web-search/index.ts" },
 	];
 }
 
-test("buildWorkerArgs keeps --no-extensions, inserts exactly two ordered -e pairs before --model, never smart-subagents, prompt last", () => {
+test("buildWorkerArgs keeps --no-extensions, inserts exactly three ordered -e pairs before --model, never smart-subagents, prompt last", () => {
 	const args = buildWorkerArgs({
 		modelRef: "openai-codex-second/gpt-5.6-luna",
 		effort: "xhigh",
@@ -178,16 +187,18 @@ test("buildWorkerArgs keeps --no-extensions, inserts exactly two ordered -e pair
 		extensions: sampleExtensions(),
 	});
 	assert.ok(args.includes("--no-extensions"), "keeps --no-extensions");
-	assert.equal(args.filter((arg) => arg === "-e").length, 2, "exactly two -e pairs");
+	assert.equal(args.filter((arg) => arg === "-e").length, 3, "exactly three -e pairs");
 	const noExtIndex = args.indexOf("--no-extensions");
-	assert.deepEqual(args.slice(noExtIndex + 1, noExtIndex + 5), [
+	assert.deepEqual(args.slice(noExtIndex + 1, noExtIndex + 7), [
 		"-e",
 		"/agent/extensions/codex-multi-account/index.ts",
 		"-e",
 		"/agent/extensions/provider-routing/index.ts",
+		"-e",
+		"/agent/extensions/codex-web-search/index.ts",
 	]);
 	const modelIndex = args.indexOf("--model");
-	assert.ok(modelIndex > noExtIndex + 4, "all -e pairs come before --model");
+	assert.ok(modelIndex > noExtIndex + 6, "all -e pairs come before --model");
 	assert.equal(args[args.length - 1], "do the thing", "prompt is the last positional argument");
 	assert.ok(!args.some((arg) => arg.includes("smart-subagents")), "smart-subagents is never loaded");
 	assert.deepEqual(args.slice(modelIndex), [
@@ -299,10 +310,10 @@ test("smart-subagents index wires trusted bootstrap, preflight, tool-activity ga
 // Offline bounded smoke against the exact installed pi CLI (0.84.1)
 // ---------------------------------------------------------------------------
 
-test("offline smoke: installed pi --list-models registers both worker providers with no network", async () => {
+test("offline smoke: installed pi --list-models registers worker providers plus web search with no network", async () => {
 	const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
-	const resolved = resolveWorkerExtensions(["codex-multi-account", "provider-routing"], agentDir);
-	assert.equal(resolved.length, 2, "both trusted worker extensions resolve under the agent dir");
+	const resolved = resolveWorkerExtensions(["codex-multi-account", "provider-routing", "codex-web-search"], agentDir);
+	assert.equal(resolved.length, 3, "all trusted worker extensions resolve under the agent dir");
 
 	const listArgs = [
 		...buildWorkerArgs({
@@ -312,13 +323,13 @@ test("offline smoke: installed pi --list-models registers both worker providers 
 			contextPath: "/unused/context.md",
 			prompt: "unused",
 			extensions: resolved,
-		}).slice(0, 9), // --mode json -p --no-session --no-extensions -e <f1> -e <f2>
+		}).slice(0, 11), // --mode json -p --no-session --no-extensions -e <f1> -e <f2> -e <f3>
 		"--list-models",
 	];
 	assert.deepEqual(
 		listArgs.filter((arg) => arg === "-e"),
-		["-e", "-e"],
-		"smoke carries exactly two -e pairs",
+		["-e", "-e", "-e"],
+		"smoke carries exactly three -e pairs",
 	);
 
 	// Poison every proxy variable so any successful network call is

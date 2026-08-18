@@ -41,6 +41,12 @@ export const WORKER_EXTENSIONS = {
 		order: 1,
 		providers: ["openai-codex", "openai-codex-second", "claude-relay", "claude-relay-alibaba", "big-data-claude"],
 	},
+	"codex-web-search": {
+		key: "codex-web-search",
+		rel: "codex-web-search/index.ts",
+		order: 2,
+		providers: [],
+	},
 } as const satisfies Record<string, WorkerExtensionDescriptor>;
 
 export type WorkerExtensionKey = keyof typeof WORKER_EXTENSIONS;

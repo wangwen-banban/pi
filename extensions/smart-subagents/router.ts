@@ -79,9 +79,10 @@ export const DEFAULT_CONFIG: SmartSubagentConfig = {
 	execution: {
 		hardTimeoutMs: 30 * 60 * 1000,
 		terminateGraceMs: 5000,
-		// Trusted worker provider bootstrap, loaded in this fixed order after
-		// --no-extensions. codex-multi-account first, then provider-routing.
-		workerExtensions: ["codex-multi-account", "provider-routing"],
+		// Trusted worker bootstrap, loaded in this fixed order after
+		// --no-extensions: codex-multi-account, provider-routing, then
+		// codex-web-search (gives workers the web_search tool).
+		workerExtensions: ["codex-multi-account", "provider-routing", "codex-web-search"],
 	},
 	modelProfiles: {
 		defaultTier: "B",

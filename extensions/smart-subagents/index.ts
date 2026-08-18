@@ -1067,8 +1067,8 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		}
 		if (!job.attemptedModels.includes(job.route.modelRef)) job.attemptedModels.push(job.route.modelRef);
 		const tools = job.route.permission === "read-only"
-			? "read,grep,find,ls"
-			: "read,bash,edit,write,grep,find,ls";
+			? "read,grep,find,ls,web_search"
+			: "read,bash,edit,write,grep,find,ls,web_search";
 		const prompt = [
 			`# Delegated task: ${job.name}`,
 			job.task,

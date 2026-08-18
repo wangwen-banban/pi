@@ -222,7 +222,7 @@ Then hard-refresh the browser. The **Activity** workspace panel and badge show s
 
 After changing the supporting Pi extensions, wait until no delegated worker is active and run `/reload` once in chat. Reloading while a worker is active intentionally stops it. A browser hard refresh loads browser-plugin changes; `/reload` loads Pi extension changes. Neither action requires restarting sessiond.
 
-Workers retain `--no-extensions` isolation and explicitly load only the audited `codex-multi-account` then `provider-routing` bootstrap. This gives PI WEB workers the same Codex account/proxy transport capability as the parent without loading arbitrary extensions.
+Workers retain `--no-extensions` isolation and explicitly load only the audited bootstrap: `codex-multi-account`, `provider-routing`, then `codex-web-search`. This gives PI WEB workers the same Codex account/proxy transport capability as the parent (plus the `web_search` tool for delegated research) without loading arbitrary extensions.
 
 GPT-5.6 Sol/Terra/Luna use the long-context overrides in `models.json`: both Codex OAuth accounts advertise a 1,000,000-token window to Pi, while the direct OpenAI API advertises its documented 1,050,000-token window. Codex App and CLI share the top-level `~/.codex/config.toml` settings `model_context_window = 1000000` and `model_auto_compact_token_limit = 900000`. A Codex runtime may report 828,400 usable input tokens after reserving output and its 95% safety budget; that is the effective input portion of the 1M total window, not a fallback to the old 272K tier. Requests that grow beyond 272K consume long-context quota at the applicable higher rate.
 

@@ -11,6 +11,7 @@ const webSearchTool = defineTool({
 	promptGuidelines: [
 		"Use web_search for current or time-sensitive information and cite the returned source URLs.",
 		"Do not claim a source says something unless the web_search output supports it.",
+		"Delegated sub-agent workers also have web_search available; use it inside delegated tasks when the work needs current facts.",
 	],
 	parameters: Type.Object({
 		query: Type.String({ minLength: 1, description: "Focused web search query" }),

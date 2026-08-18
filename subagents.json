@@ -18,7 +18,8 @@
     "terminateGraceMs": 5000,
     "workerExtensions": [
       "codex-multi-account",
-      "provider-routing"
+      "provider-routing",
+      "codex-web-search"
     ]
   },
   "modelProfiles": {

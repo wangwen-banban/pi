@@ -158,5 +158,7 @@ test("smart-subagents index wires informed model routing and removes context-fil
 	assert.match(source, /child\.on\("close", \(code, signal\)/);
 	assert.match(source, /createExecutionTimeout/);
 	assert.match(source, /shutdownJobs\(jobs\.values\(\)/);
+	assert.match(source, /read,grep,find,ls,web_search/);
+	assert.match(source, /read,bash,edit,write,grep,find,ls,web_search/);
 	assert.doesNotMatch(source, /params\.contextFiles.*selected/);
 });

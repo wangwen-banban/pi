@@ -142,16 +142,21 @@ Claude relays) are re-registered through a small, fixed, audited bootstrap:
 ```json
 {
   "execution": {
-    "workerExtensions": ["codex-multi-account", "provider-routing"]
+    "workerExtensions": ["codex-multi-account", "provider-routing", "codex-web-search"]
   }
 }
 ```
 
 - Values are **symbolic keys only** — never paths. The table maps them to
-  `extensions/codex-multi-account/index.ts` (order 0) and
-  `extensions/provider-routing/index.ts` (order 1) under the agent directory.
-- Both are required in this order for the secondary account:
+  `extensions/codex-multi-account/index.ts` (order 0),
+  `extensions/provider-routing/index.ts` (order 1), and
+  `extensions/codex-web-search/index.ts` (order 2) under the agent directory.
+- The provider pair is required in this order for the secondary account:
   `provider-routing` alone leaves `openai-codex-second` without oauth/models.
+- `codex-web-search` gives every worker the `web_search` tool (Codex search
+  with the Exa free fallback). It is loaded after the provider bootstrap and
+  is included in the worker `--tools` allowlist for both read-only and
+  workspace-write dispatches.
 - Keys are deduped and forced into the fixed order; unknown or path-shaped
   config entries are ignored and can never become load paths. Files are
   realpath-verified regular files inside the extensions directory before
