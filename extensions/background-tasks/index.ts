@@ -51,6 +51,7 @@ const MAX_COMMAND_CHARS = 32 * 1024;
 const MAX_RECENT_RUNS = 50;
 const WEB_HEARTBEAT_MS = 5_000;
 const WEB_PROGRESS_FLUSH_MS = 2_000;
+const COMPLETED_DISMISS_MS = 15_000;
 
 const TaskStatusSchema = StringEnum(TASK_STATUSES);
 const UpdateTaskPlanParams = Type.Object({
@@ -399,6 +400,21 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		}
 	};
 
+	const dismissTimers = new Set<ReturnType<typeof setTimeout>>();
+
+	const scheduleDismiss = (runId: string) => {
+		const timer = setTimeout(() => {
+			dismissTimers.delete(timer);
+			const run = runs.get(runId);
+			if (!run) return;
+			if (run.status !== "completed" && run.status !== "failed" && run.status !== "stopped") return;
+			runs.delete(runId);
+			updateUi();
+		}, COMPLETED_DISMISS_MS);
+		timer.unref?.();
+		dismissTimers.add(timer);
+	};
+
 	const handleCompletion = (run: BackgroundRunSnapshot) => {
 		controllers.delete(run.id);
 		lastProgressEventAt.delete(run.id);
@@ -409,6 +425,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		flushWebTasks();
 		emitLifecycle(run.status === "completed" ? "completed" : run.status === "failed" ? "failed" : "stopped", run);
 		if (!shuttingDown) completionQueue.enqueue({ id: run.id, run });
+		scheduleDismiss(run.id);
 	};
 
 	const findController = (id: string): { id: string; controller: BackgroundRunController } | undefined => {
@@ -692,6 +709,8 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		if (shuttingDown) return;
 		shuttingDown = true;
 		++webEpoch;
+		for (const timer of dismissTimers) clearTimeout(timer);
+		dismissTimers.clear();
 		completionQueue.stop();
 		stopWebHeartbeat();
 		clearUiExpiryTimer();
