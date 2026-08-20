@@ -15,8 +15,9 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Box, Container, Key, Markdown, Spacer, Text, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
+import { Box, Container, Markdown, Spacer, Text, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { resolveAgentBrowserInput, type AgentBrowserKeybindings } from "./agent-browser-input.ts";
 import { getPiInvocation } from "./pi-invocation.ts";
 import {
 	buildWorkerArgs,
@@ -508,6 +509,7 @@ class AgentBrowser implements Component {
 	constructor(
 		private readonly getJobs: () => Job[],
 		private readonly theme: ExtensionContext["ui"]["theme"],
+		private readonly keybindings: AgentBrowserKeybindings,
 		private readonly done: () => void,
 		private readonly requestRender: () => void,
 	) {}
@@ -523,36 +525,38 @@ class AgentBrowser implements Component {
 	}
 
 	handleInput(data: string): void {
-		const jobs = this.jobs();
-		if (matchesKey(data, Key.escape) || matchesKey(data, Key.left)) {
-			if (this.detail) {
-				this.detail = false;
-				this.scroll = 0;
-				this.requestRender();
-			} else this.done();
-			return;
-		}
-		if (matchesKey(data, "q")) {
+		const action = resolveAgentBrowserInput(data, this.detail, this.keybindings, matchesKey);
+		if (!action) return;
+		if (action === "close") {
 			this.done();
 			return;
 		}
-		if (this.detail) {
-			if (matchesKey(data, Key.up)) this.scroll = Math.max(0, this.scroll - 1);
-			else if (matchesKey(data, Key.down)) this.scroll += 1;
-			else if (matchesKey(data, Key.pageUp)) this.scroll = Math.max(0, this.scroll - 12);
-			else if (matchesKey(data, Key.pageDown)) this.scroll += 12;
-			else if (matchesKey(data, Key.home)) this.scroll = 0;
-			else if (matchesKey(data, Key.end)) this.scroll = Number.MAX_SAFE_INTEGER;
+		if (action === "back") {
+			this.detail = false;
+			this.scroll = 0;
 			this.requestRender();
 			return;
 		}
+		if (this.detail) {
+			if (action === "line-up") this.scroll = Math.max(0, this.scroll - 1);
+			else if (action === "line-down") this.scroll += 1;
+			else if (action === "page-up") this.scroll = Math.max(0, this.scroll - 12);
+			else if (action === "page-down") this.scroll += 12;
+			else if (action === "top") this.scroll = 0;
+			else if (action === "bottom") this.scroll = Number.MAX_SAFE_INTEGER;
+			else return;
+			this.requestRender();
+			return;
+		}
+
+		const jobs = this.jobs();
 		if (!jobs.length) return;
-		if (matchesKey(data, Key.up)) this.selected = (this.selected - 1 + jobs.length) % jobs.length;
-		else if (matchesKey(data, Key.down)) this.selected = (this.selected + 1) % jobs.length;
-		else if (matchesKey(data, Key.enter) || matchesKey(data, Key.right)) {
+		if (action === "select-up") this.selected = (this.selected - 1 + jobs.length) % jobs.length;
+		else if (action === "select-down") this.selected = (this.selected + 1) % jobs.length;
+		else if (action === "inspect") {
 			this.detail = true;
 			this.scroll = Number.MAX_SAFE_INTEGER;
-		}
+		} else return;
 		this.requestRender();
 	}
 
@@ -586,7 +590,7 @@ class AgentBrowser implements Component {
 
 	private renderDetail(width: number, job: Job): string[] {
 		const header = [
-			truncateToWidth(`${this.theme.fg("accent", "Sub-agent detail")} ${this.theme.fg("dim", "↑↓/PgUp/PgDn scroll · ← list · Esc close")}`, width),
+			truncateToWidth(`${this.theme.fg("accent", "Sub-agent detail")} ${this.theme.fg("dim", "↑↓ line · PgUp/PgDn or ⌥↑/⌥↓ page · Home/End · ← list · Esc close")}`, width),
 			this.border(width),
 			truncateToWidth(`${this.theme.bold(job.name)}  ${this.theme.fg(job.status === "completed" ? "success" : job.status === "running" ? "warning" : "muted", job.status)}`, width),
 			truncateToWidth(`Model: ${job.route ? displayModel(job.route) : "routing"} · Thinking: ${job.route?.effort ?? "auto"} · Context: ${job.route?.contextMode ?? "auto"}`, width),
@@ -692,9 +696,9 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		if (!ctx.hasUI || agentBrowserOpen || getVisibleJobs().length === 0) return;
 		agentBrowserOpen = true;
 		void ctx.ui.custom<void>(
-			(tui, theme, _keybindings, done) => {
+			(tui, theme, keybindings, done) => {
 				agentBrowserRequestRender = () => tui.requestRender();
-				return new AgentBrowser(getVisibleJobs, theme, () => {
+				return new AgentBrowser(getVisibleJobs, theme, keybindings, () => {
 					agentBrowserOpen = false;
 					agentBrowserRequestRender = undefined;
 					done();

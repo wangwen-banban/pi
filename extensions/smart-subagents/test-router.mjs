@@ -155,6 +155,9 @@ test("smart-subagents index wires informed model routing and removes context-fil
 	assert.match(source, /background advisor skipped/);
 	assert.match(source, /recentMessages\(messages/);
 	assert.match(source, /createActivityRefreshLoop/);
+	assert.match(source, /resolveAgentBrowserInput/);
+	assert.match(source, /new AgentBrowser\(getVisibleJobs, theme, keybindings/);
+	assert.match(source, /⌥↑\/⌥↓ page/);
 	assert.match(source, /child\.on\("close", \(code, signal\)/);
 	assert.match(source, /createExecutionTimeout/);
 	assert.match(source, /shutdownJobs\(jobs\.values\(\)/);

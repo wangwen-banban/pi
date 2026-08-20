@@ -240,7 +240,9 @@ When the editor is empty and a sub-agent is visible, press `↓` to enter the Su
 - `↑` / `↓`: choose an agent
 - `Enter` / `→`: open live details
 - Detail view shows model, thinking, context, permission, task, assistant output and tool activity
-- `↑` / `↓` or `PgUp` / `PgDn`: scroll live output
+- `↑` / `↓`: scroll live output one line
+- `PgUp` / `PgDn`, or macOS `Option+↑` / `Option+↓`: scroll by page
+- `Home` / `End`: jump to the beginning / latest output
 - `←`: return to the agent list
 - `Esc` or `q`: close the browser
 
