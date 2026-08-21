@@ -26,6 +26,7 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { classifyCommand } from "./readonly-check.ts";
+import { withEditorFocus } from "./focusable-editor.ts";
 import {
 	WebActivityRegistry,
 	WEB_ACTIVITY_SCHEMA_VERSION,
@@ -565,7 +566,14 @@ export default function planMode(pi: ExtensionAPI) {
 						return lines;
 					}
 
-					return { render, invalidate: () => { cachedLines = undefined; }, handleInput };
+					return withEditorFocus({
+						render,
+						invalidate: () => {
+							cachedLines = undefined;
+							editor.invalidate();
+						},
+						handleInput,
+					}, editor);
 				},
 			);
 
@@ -756,7 +764,14 @@ export default function planMode(pi: ExtensionAPI) {
 						return lines;
 					}
 
-					return { render, invalidate: () => { cachedLines = undefined; }, handleInput };
+					return withEditorFocus({
+						render,
+						invalidate: () => {
+							cachedLines = undefined;
+							editor.invalidate();
+						},
+						handleInput,
+					}, editor);
 				},
 			);
 
