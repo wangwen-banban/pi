@@ -112,7 +112,8 @@ const ctx = new MockCtx(sessionFile);
 await fire("session_start");
 assert.ok(handlers.get("model_select")?.length, "model_select must be tracked as local activity");
 assert.ok(handlers.get("thinking_level_select")?.length, "thinking_level_select must be tracked as local activity");
-console.log("✓ session watcher registered local model/thinking activity");
+assert.ok(eventBusHandlers.get("codex-fast-mode:changed")?.length, "Fast mode markers must be tracked as local activity");
+console.log("✓ session watcher registered local model/thinking/Fast activity");
 
 // Match Pi's real order: persist the entry first, then emit the extension event.
 await sleep(FAST_QUIET_MS + FAST_POLL_MS);
@@ -155,6 +156,20 @@ await fireChannel("background-task:completed", { run: { id: "bg-1" } });
 await sleep(FAST_QUIET_MS + FAST_POLL_MS);
 assert.equal(ctx.ui.widgets.has("session-drift"), false, "local background completion must not look external");
 console.log("✓ local background completion hook does not trigger /sync warning");
+
+await sleep(FAST_QUIET_MS + FAST_POLL_MS);
+append({
+	type: "custom",
+	id: "fast001",
+	parentId: "background001",
+	timestamp: new Date().toISOString(),
+	customType: "codex-fast-mode-v1",
+	data: { enabled: true },
+});
+await fireChannel("codex-fast-mode:changed", { active: true });
+await sleep(FAST_QUIET_MS + FAST_POLL_MS);
+assert.equal(ctx.ui.widgets.has("session-drift"), false, "local Fast toggle must not look external");
+console.log("✓ local Fast toggle does not trigger /sync warning");
 
 // A write with no local event is still external drift and must fail closed.
 await sleep(FAST_QUIET_MS + FAST_POLL_MS);

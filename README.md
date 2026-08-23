@@ -90,6 +90,19 @@ chmod 600 ~/.pi/agent/auth.json
 
 After both accounts are authorized, switch accounts through `/model`; repeated logout/login is not required. The footer and `/weekly` use the quota belonging to the currently selected provider.
 
+## Codex Fast Mode
+
+For either Codex OAuth account, toggle the current Pi session's Fast service tier with:
+
+```text
+/fast
+/fast on
+/fast off
+/fast status
+```
+
+Fast mode maps to the Codex request option `serviceTier: "priority"` and displays `⚡FAST` in the custom statusline. It is branch-aware and survives `/reload`/resume, but remains scoped to the current main session; sub-agent workers stay on Standard. The current catalog supports GPT-5.6 Sol/Terra/Luna, GPT-5.5, and GPT-5.4 (not GPT-5.4-mini). Fast provides roughly 1.5× speed at higher usage: GPT-5.6/5.5 consume about 2.5× Standard ChatGPT credits and GPT-5.4 about 2×. See [OpenAI Codex Speed](https://developers.openai.com/codex/speed).
+
 ## Two-Level Model Selector
 
 The `/model` UI is a package-level patch: select a provider first, then expand it to select a concrete model. It is versioned under:

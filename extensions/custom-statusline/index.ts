@@ -11,7 +11,8 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createActiveModelState, getRoutingProviderForStatusline } from "./model-state.ts";
+import { CODEX_FAST_EVENT } from "../provider-routing/fast-mode.ts";
+import { createActiveModelState, createStatuslineFlagState, getRoutingProviderForStatusline } from "./model-state.ts";
 import { formatResetCountdown, readSubscriptionQuota, SUBSCRIPTION_PROVIDERS } from "./quota.ts";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
@@ -34,18 +35,26 @@ export default function (pi: ExtensionAPI) {
 	let streaming = false;
 	let turnCount = 0;
 	const activeModel = createActiveModelState();
+	const fastMode = createStatuslineFlagState();
+
+	pi.events.on(CODEX_FAST_EVENT, (payload) => {
+		const active = Boolean(payload && typeof payload === "object" && (payload as { active?: unknown }).active === true);
+		fastMode.set(active);
+	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		activeModel.set(ctx.model);
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			const unsub = footerData.onBranchChange(() => tui.requestRender());
 			const unbindModelRender = activeModel.bindRender(() => tui.requestRender());
+			const unbindFastRender = fastMode.bindRender(() => tui.requestRender());
 			const refreshTimer = setInterval(() => tui.requestRender(), 30_000);
 			refreshTimer.unref?.();
 
 			return {
 				dispose() {
 					unbindModelRender();
+					unbindFastRender();
 					unsub();
 					clearInterval(refreshTimer);
 				},
@@ -118,6 +127,7 @@ export default function (pi: ExtensionAPI) {
 						: theme.fg("dim", `${contextRemainingTokens == null ? "?" : fmt(contextRemainingTokens)}/${fmt(contextTotal)} remaining`);
 					const thinking = pi.getThinkingLevel();
 					const thinkingLabel = theme.fg(thinking === "off" ? "dim" : "accent", `THINK ${thinking}`);
+					const fastLabel = fastMode.get() ? theme.fg("warning", "⚡FAST") : "";
 
 					// --- Status indicator ---
 					const statusIcon = streaming
@@ -137,7 +147,9 @@ export default function (pi: ExtensionAPI) {
 					const proxyLabel = proxyMode === "direct"
 						? theme.fg("success", "⚡DIRECT")
 						: theme.fg("warning", `⇄ ${proxyMode}`);
-					const firstLeft = `${statusIcon} ${proxyLabel} ${thinkingLabel} ${turnLabel} ${tokenInfo}${costStr}`;
+					const firstLeft = [statusIcon, proxyLabel, fastLabel, thinkingLabel, turnLabel, `${tokenInfo}${costStr}`]
+						.filter(Boolean)
+						.join(" ");
 					const firstRight = `${modelStr}${branchStr}`;
 					const firstGap = Math.max(1, width - visibleWidth(firstLeft) - visibleWidth(firstRight));
 					const firstLine = firstLeft + " ".repeat(firstGap) + firstRight;

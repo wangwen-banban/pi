@@ -57,6 +57,7 @@ const LOCAL_ACTIVITY_CHANNELS = [
 	"background-task:completed",
 	"background-task:failed",
 	"background-task:stopped",
+	"codex-fast-mode:changed",
 ] as const;
 
 type ResolvedSessionSyncOptions = Required<SessionSyncOptions>;

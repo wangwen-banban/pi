@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createAssistantMessageEventStream,
   getApiProvider,
@@ -15,6 +15,16 @@ import {
   createRoutedHttpTransport,
   type RoutedHttpTransportOptions,
 } from "./transport.ts";
+import {
+  CODEX_FAST_EVENT,
+  CODEX_FAST_MARKER_TYPE,
+  applyCodexFastServiceTier,
+  buildFastModeMarker,
+  fastCreditMultiplier,
+  fastModeEvent,
+  isCodexFastModel,
+  reconstructFastMode,
+} from "./fast-mode.ts";
 
 
 const ROUTING_PATH = join(homedir(), ".pi", "agent", "provider-routing.json");
@@ -269,6 +279,43 @@ export function registerProviderRouting(
   // Node-core fallback keeps explicit direct/proxy routes working when pi
   // bundles undici or does not expose it through Node's package resolver.
   const transport = createRoutedHttpTransport(transportOptions);
+  let fastModeEnabled = false;
+
+  const publishFastMode = (ctx: ExtensionContext) => {
+    const state = fastModeEvent(fastModeEnabled, ctx.model);
+    try {
+      pi.events.emit(CODEX_FAST_EVENT, state);
+    } catch {
+      // The custom statusline is optional; the request tier remains authoritative.
+    }
+    if (ctx.hasUI) {
+      try {
+        ctx.ui.setStatus(
+          "codex-fast-mode",
+          state.active ? ctx.ui.theme.fg("warning", "⚡ FAST") : undefined,
+        );
+      } catch {
+        // RPC/print modes may not expose a status surface.
+      }
+    }
+    return state;
+  };
+
+  const appendFastModeMarker = () => {
+    try {
+      pi.appendEntry(CODEX_FAST_MARKER_TYPE, buildFastModeMarker(fastModeEnabled));
+    } catch {
+      // A stale session during replacement must not break provider routing.
+    }
+  };
+
+  const setFastMode = (enabled: boolean, ctx: ExtensionContext) => {
+    const changed = fastModeEnabled !== enabled;
+    fastModeEnabled = enabled;
+    if (changed) appendFastModeMarker();
+    return publishFastMode(ctx);
+  };
+
   const relay = routeFor("claude-relay");
   for (const key of ["baseUrl", "modelId", "requestModelId"] as const) {
     if (!relay[key]) throw new Error(`Missing claude-relay.${key} in ${ROUTING_PATH}`);
@@ -611,9 +658,10 @@ export function registerProviderRouting(
   ): Promise<AssistantMessageEventStream> => {
     const provider = getApiProvider("openai-codex-responses");
     const route = routeFor("openai-codex");
-    const env = withRouteEnv(options?.env, route);
+    const effectiveOptions = applyCodexFastServiceTier(options, model, fastModeEnabled) as SimpleStreamOptions & { serviceTier?: string };
+    const env = withRouteEnv(effectiveOptions?.env, route);
     if (route.mode !== "proxy") {
-      return provider.streamSimple(model, context, { ...options, env });
+      return provider.streamSimple(model, context, { ...effectiveOptions, env });
     }
 
     const routedFetch: typeof fetch = (input, init) =>
@@ -621,7 +669,7 @@ export function registerProviderRouting(
     // Force HTTP/SSE for deterministic proxy routing. The upstream Codex
     // adapter otherwise prefers WebSocket, whose proxy path is runtime-specific.
     return provider.streamSimple(model, context, {
-      ...options,
+      ...effectiveOptions,
       env,
       fetch: routedFetch,
       transport: "sse",
@@ -651,18 +699,80 @@ export function registerProviderRouting(
     },
   });
 
-  // Codex defaults to xhigh whenever either account is selected.
-  pi.on("model_select", async (event) => {
+  pi.on("session_start", (_event, ctx) => {
+    fastModeEnabled = reconstructFastMode(ctx.sessionManager.getBranch() as any[]);
+    publishFastMode(ctx);
+  });
+
+  // Codex defaults to xhigh whenever either account is selected. Fast mode is
+  // session-scoped and becomes active again when the user returns to a
+  // supported Codex model.
+  pi.on("model_select", async (event, ctx) => {
     if (
       (event.model.provider === "openai-codex" || event.model.provider === "openai-codex-second") &&
       pi.getThinkingLevel() !== "xhigh"
     ) {
       pi.setThinkingLevel("xhigh");
     }
+    publishFastMode(ctx);
+  });
+
+  pi.on("session_tree", (_event, ctx) => {
+    fastModeEnabled = reconstructFastMode(ctx.sessionManager.getBranch() as any[]);
+    publishFastMode(ctx);
+  });
+
+  // Compaction can discard older custom markers; re-append the current state
+  // so reload/resume can never resurrect a stale Fast setting.
+  pi.on("session_compact", () => {
+    appendFastModeMarker();
   });
 
   pi.on("session_shutdown", async () => {
     await Promise.allSettled([transport.close()]);
+  });
+
+  pi.registerCommand("fast", {
+    description: "Toggle Codex Fast service tier for the current session: /fast [on|off|status]",
+    handler: async (args, ctx) => {
+      const action = (args ?? "").trim().toLowerCase() || "toggle";
+      if (!new Set(["toggle", "on", "off", "status"]).has(action)) {
+        ctx.ui.notify("Usage: /fast [on|off|status]", "warning");
+        return;
+      }
+      if (action === "status") {
+        const state = publishFastMode(ctx);
+        const multiplier = fastCreditMultiplier(state.modelId);
+        const detail = state.active
+          ? `ON · ${state.provider}/${state.modelId} · priority · ~1.5× speed · ${multiplier ?? "higher"}× ChatGPT credits`
+          : state.enabled
+            ? `ON (armed) · current model ${state.provider}/${state.modelId || "none"} does not support Fast`
+            : "OFF · Standard service tier";
+        ctx.ui.notify(`Codex Fast mode: ${detail}`, "info");
+        return;
+      }
+
+      const enable = action === "on" || (action === "toggle" && !fastModeEnabled);
+      if (enable && !isCodexFastModel(ctx.model)) {
+        ctx.ui.notify(
+          "Fast mode is available only for supported Codex OAuth models (GPT-5.6, GPT-5.5, GPT-5.4). Switch models, then run /fast again.",
+          "warning",
+        );
+        publishFastMode(ctx);
+        return;
+      }
+
+      const state = setFastMode(enable, ctx);
+      if (state.active) {
+        const multiplier = fastCreditMultiplier(state.modelId);
+        ctx.ui.notify(
+          `⚡ Codex Fast mode ON · priority service tier · ~1.5× speed · ${multiplier ?? "higher"}× ChatGPT credits. Run /fast off to return to Standard.`,
+          "warning",
+        );
+      } else {
+        ctx.ui.notify("Codex Fast mode OFF · Standard service tier.", "info");
+      }
+    },
   });
 
   pi.registerCommand("provider-routing", {
