@@ -14,8 +14,8 @@
     "selectedMessages": 6
   },
   "execution": {
-    "hardTimeoutMs": 1800000,
-    "terminateGraceMs": 5000,
+    "hardTimeoutMs": 21600000,
+    "terminateGraceMs": 30000,
     "workerExtensions": [
       "codex-multi-account",
       "provider-routing",
