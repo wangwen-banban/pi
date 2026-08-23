@@ -90,6 +90,8 @@ export async function openBtwPanel(opts: OpenPanelOptions): Promise<BtwPanelResu
 			let keep = false;
 			let keepName: string | undefined;
 			let closing = false;
+			let queuedSteer = 0;
+			let queuedFollow = 0;
 
 			const editorTheme: EditorTheme = {
 				borderColor: (s) => theme.fg("accent", s),
@@ -132,6 +134,12 @@ export async function openBtwPanel(opts: OpenPanelOptions): Promise<BtwPanelResu
 						streaming = false;
 						inflight = null;
 						statusText = "";
+						queuedSteer = 0;
+						queuedFollow = 0;
+						break;
+					case "queue_update":
+						queuedSteer = ev.steering?.length ?? 0;
+						queuedFollow = ev.followUp?.length ?? 0;
 						break;
 					case "error":
 						streaming = false;
@@ -153,17 +161,33 @@ export async function openBtwPanel(opts: OpenPanelOptions): Promise<BtwPanelResu
 				done({ keep, keepName, turns });
 			}
 
-			async function send(text: string) {
+			async function send(text: string, kind: "enter" | "tab" = "enter") {
+				const wasStreaming = streaming;
 				turns++;
 				streaming = true;
 				statusText = "thinking…";
 				refresh();
 				try {
-					await session.prompt(text);
+					if (wasStreaming) {
+						// Agent 忙碌中：Enter = steer（当前工具批结束后插入），Tab = follow-up（全部结束后再问）
+						if (kind === "tab") {
+							await session.followUp(text);
+							statusText = "follow-up 已排队，完成后追问";
+						} else {
+							await session.steer(text);
+							statusText = "已打断，指令插入队列";
+						}
+					} else {
+						await session.prompt(text);
+					}
 				} catch (e: any) {
+					streaming = false;
 					statusText = `error: ${String(e?.message ?? e).slice(0, 80)}`;
 				}
-				streaming = false;
+				// 空闲发送的 prompt 结束后恢复；流式排队路径保持忙碌态，由事件驱动恢复
+				if (!wasStreaming) {
+					streaming = false;
+				}
 				inflight = null;
 				refresh();
 			}
@@ -209,6 +233,17 @@ export async function openBtwPanel(opts: OpenPanelOptions): Promise<BtwPanelResu
 				if (matchesKey(data, Key.pageDown)) {
 					scrollBack = Math.max(0, scrollBack - 5);
 					refresh();
+					return;
+				}
+				if (matchesKey(data, Key.tab)) {
+					// Tab = follow-up：忙碌时排队到本轮全部结束，空闲时即普通提问
+					const value = editor.getText().trim();
+					editor.setText("");
+					if (value) {
+						void send(value, "tab");
+					} else {
+						refresh();
+					}
 					return;
 				}
 				editor.handleInput(data);
@@ -275,11 +310,17 @@ export async function openBtwPanel(opts: OpenPanelOptions): Promise<BtwPanelResu
 
 				// Footer
 				const hints = [
-					"Enter 发送",
+					"Enter 发送/打断",
+					"Tab 追加到队尾",
 					streaming ? "Esc 中断" : "Esc 关闭并丢弃",
 					"PgUp/PgDn 滚动",
 				];
 				if (allowKeep) hints.push(keep ? "已标记保存" : "/keep 保存");
+				if (queuedSteer + queuedFollow > 0) {
+					lines.push(
+						` ${theme.fg("muted", `⏳ 排队中：${queuedSteer} 条打断 · ${queuedFollow} 条追问`)}`,
+					);
+				}
 				lines.push(` ${theme.fg("dim", hints.join(" • "))}`);
 				lines.push(theme.fg("accent", "━".repeat(w)));
 

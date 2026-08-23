@@ -36,7 +36,7 @@ Edit `provider-routing.json` to change the primary Codex route:
 | `plan-mode` | Tool-enforced read-only planning with interactive approval |
 | `smart-subagents` | Concurrent task delegation with model routing |
 | `background-tasks` | Dynamic main-agent task plan plus managed long-command completion wakeups |
-| `btw` | Disposable multi-turn side conversations with optional `/keep` persistence |
+| `btw` | Ephemeral multi-turn side conversations with compaction-aware parent context, Enter-to-steer, Tab follow-ups, and optional `/keep` persistence |
 | `custom-statusline` | Provider, thinking, token, context, and Codex quota status |
 | `codex-web-search` | Live web search |
 | `weekly-usage-status` | Per-account Codex weekly quota tracking |

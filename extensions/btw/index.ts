@@ -25,7 +25,7 @@ import { createBtwSession, persistBtwSession, renderParentSnapshot } from "./ses
 const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 
 interface BtwSettings {
-	/** Character budget for the inherited main-thread snapshot. */
+	/** Character budget for the inherited parent context snapshot (摘要最多占一半，其余给消息正文)。 */
 	seedCharBudget: number;
 	/** Allow `/keep` to persist the side conversation (phase 2). */
 	allowKeep: boolean;
@@ -43,7 +43,7 @@ function loadSettings(): BtwSettings {
 	}
 	return {
 		seedCharBudget:
-			typeof raw.seedCharBudget === "number" && raw.seedCharBudget > 0 ? raw.seedCharBudget : 12_000,
+			typeof raw.seedCharBudget === "number" && raw.seedCharBudget > 0 ? raw.seedCharBudget : 150_000,
 		allowKeep: raw.allowKeep === true,
 	};
 }

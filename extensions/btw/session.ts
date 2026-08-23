@@ -12,25 +12,34 @@
  * Nothing here touches the TUI; see panel.ts for rendering.
  */
 
-const PI_ROOT_CANDIDATES = [
-	"/Users/wenwang/.nvm/versions/node/v22.22.2/lib/node_modules/@earendil-works/pi-coding-agent",
-	process.env.PI_ROOT ?? "",
-].filter(Boolean);
+import { execFileSync } from "node:child_process";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+export function resolveInstalledPiRoot(): string {
+	const override = process.env.PI_ROOT?.trim();
+	if (override) return override;
+	const globalRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
+	if (!globalRoot) throw new Error("npm root -g returned an empty path");
+	return join(globalRoot, "@earendil-works", "pi-coding-agent");
+}
 
 async function importPi(): Promise<any> {
-	let lastErr: unknown;
-	for (const root of PI_ROOT_CANDIDATES) {
-		try {
-			return await import(`${root}/dist/index.js`);
-		} catch (e) {
-			lastErr = e;
-		}
-	}
-	// Fall back to bare specifier resolution (works if extension host resolves it).
+	let bareError: unknown;
+	// Pi's extension loader provides this package as a virtual module. Prefer it
+	// so compiled/relocated installations never depend on a filesystem layout.
 	try {
 		return await import("@earendil-works/pi-coding-agent");
-	} catch {
-		throw lastErr ?? new Error("cannot locate pi-coding-agent");
+	} catch (error) {
+		bareError = error;
+	}
+	// Standalone Node tests do not have Pi's virtual-module aliases. Resolve the
+	// active global npm install dynamically instead of pinning an NVM/Homebrew path.
+	try {
+		const entry = join(resolveInstalledPiRoot(), "dist", "index.js");
+		return await import(pathToFileURL(entry).href);
+	} catch (error) {
+		throw new Error("cannot locate pi-coding-agent", { cause: error ?? bareError });
 	}
 }
 
@@ -58,40 +67,108 @@ export interface ParentSnapshot {
 	name: string | undefined;
 }
 
+function contentToText(content: any): string {
+	if (typeof content === "string") return content.trim();
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((c: any) => c?.type === "text")
+		.map((c: any) => c.text ?? "")
+		.join("")
+		.trim();
+}
+
+function renderAssistantContent(content: any): string {
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
+	for (const c of content) {
+		if (!c || typeof c !== "object") continue;
+		if (c.type === "text" && typeof c.text === "string" && c.text.trim()) {
+			parts.push(c.text.trim());
+		} else if (c.type === "thinking" && typeof c.thinking === "string" && c.thinking.trim()) {
+			const t = c.thinking.trim();
+			parts.push(`💭 ${t.slice(0, 200)}${t.length > 200 ? "…" : ""}`);
+		} else if (c.type === "toolCall") {
+			const raw = typeof c.arguments === "string" ? c.arguments : JSON.stringify(c.arguments ?? "");
+			parts.push(`⚙ ${c.name}(${raw.slice(0, 200)})`);
+		} else if (c.type === "image") {
+			parts.push("[图片]");
+		}
+	}
+	return parts.join("\n");
+}
+
 /**
- * Render the parent session branch into a compact text transcript for seeding.
- * Applies a rough character budget, keeping the most recent turns.
+ * Render the parent session's LLM-facing context into text for seeding.
+ *
+ * Uses the compaction-aware entry list (buildContextEntries) — the same
+ * entries the parent model sees: a compaction summary (if any) plus all
+ * messages kept since the last compaction. Older history is covered by the
+ * summary rather than dropped, so the side conversation inherits the whole
+ * thread, not just the recent tail.
  */
-export function renderParentSnapshot(ctx: any, charBudget = 12_000): ParentSnapshot {
+export function renderParentSnapshot(ctx: any, charBudget = 150_000): ParentSnapshot {
 	const sm = ctx.sessionManager;
 	const name = sm?.getSessionName?.();
 	let entries: any[] = [];
 	try {
-		entries = sm?.getBranch?.() ?? [];
+		entries = sm?.buildContextEntries?.() ?? [];
 	} catch {
 		entries = [];
 	}
-	const lines: string[] = [];
+	if (entries.length === 0) {
+		try {
+			entries = sm?.getBranch?.() ?? [];
+		} catch {
+			entries = [];
+		}
+	}
+
+	const summaryLines: string[] = [];
+	const bodyLines: string[] = [];
 	for (const entry of entries) {
-		if (entry?.type !== "message" || !entry.message) continue;
-		const m = entry.message;
-		const role = m.role;
-		if (role !== "user" && role !== "assistant") continue;
-		const text = (m.content ?? [])
-			.filter((c: any) => c.type === "text")
-			.map((c: any) => c.text)
-			.join("")
-			.trim();
-		if (!text) continue;
-		lines.push(`${role === "user" ? "User" : "Assistant"}: ${text}`);
+		switch (entry?.type) {
+			case "compaction":
+			case "branch_summary":
+				if (entry.summary?.trim()) summaryLines.push(`【历史摘要】${entry.summary.trim()}`);
+				break;
+			case "custom_message": {
+				const text = contentToText(entry.content);
+				if (text) bodyLines.push(`[注入上下文] ${text}`);
+				break;
+			}
+			case "message": {
+				const m = entry.message;
+				if (!m || !m.role || !Array.isArray(m.content)) break;
+				if (m.role === "user") {
+					const text = contentToText(m.content);
+					const hasImage = m.content.some((c: any) => c?.type === "image");
+					if (text || hasImage) bodyLines.push(`User: ${text}${hasImage ? " [图片]" : ""}`);
+				} else if (m.role === "assistant") {
+					const rendered = renderAssistantContent(m.content);
+					if (rendered) bodyLines.push(`Assistant: ${rendered}`);
+				} else if (m.role === "toolResult") {
+					const text = contentToText(m.content);
+					if (text) bodyLines.push(`  → ${text.length > 600 ? `${text.slice(0, 600)}…` : text}`);
+				}
+				break;
+			}
+			default:
+				break;
+		}
 	}
-	if (lines.length === 0) return { text: null, name };
-	// Keep the tail within budget.
-	let joined = lines.join("\n\n");
-	if (joined.length > charBudget) {
-		joined = "…(earlier turns omitted)…\n\n" + joined.slice(joined.length - charBudget);
+	if (summaryLines.length === 0 && bodyLines.length === 0) return { text: null, name };
+
+	// 预算分配：摘要最多占一半（保证旧上下文不被尾巴挤掉），其余给消息正文
+	const summary = summaryLines.join("\n\n");
+	const maxSummary = Math.floor(charBudget * 0.5);
+	const summaryKept = summary.length > maxSummary ? `${summary.slice(0, maxSummary)}…` : summary;
+	let body = bodyLines.join("\n\n");
+	const bodyBudget = Math.max(0, charBudget - summaryKept.length);
+	if (body.length > bodyBudget) {
+		body = `…(earlier turns omitted)…\n\n${body.slice(body.length - bodyBudget)}`;
 	}
-	return { text: joined, name };
+	const text = [summaryKept, body].filter(Boolean).join("\n\n");
+	return { text, name };
 }
 
 export interface BtwSessionHandle {

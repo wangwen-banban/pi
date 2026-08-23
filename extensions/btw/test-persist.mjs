@@ -1,8 +1,9 @@
-import { persistBtwSession } from "./session.ts";
+import { persistBtwSession, resolveInstalledPiRoot } from "./session.ts";
 import { readFileSync, rmSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
-const PI = "/Users/wenwang/.nvm/versions/node/v22.22.2/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js";
-const { SessionManager } = await import(PI);
+const { SessionManager } = await import(pathToFileURL(join(resolveInstalledPiRoot(), "dist", "index.js")).href);
 const cwd = "/tmp/btw-persist-test";
 mkdirSync(cwd, { recursive: true });
 
