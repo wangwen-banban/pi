@@ -94,6 +94,9 @@ const panelSource = readFileSync(new URL("./panel.ts", import.meta.url), "utf8")
 check("panel Enter can steer while streaming", /session\.steer\(text\)/.test(panelSource));
 check("panel Tab can queue follow-up", /session\.followUp\(text\)/.test(panelSource) && /Key\.tab/.test(panelSource));
 check("panel renders queue counts", /case "queue_update"/.test(panelSource) && /queuedFollow/.test(panelSource));
+check("panel uses injected PgUp/PgDn keybindings", /resolveBtwPagingInput\(data, keybindings\)/.test(panelSource));
+check("panel preserves history during streaming", /layoutBtwViewport\(scroll, body\.length, maxBody\)/.test(panelSource));
+check("panel documents macOS Fn paging", /Fn\+↑\/↓ \(PgUp\/PgDn\)/.test(panelSource));
 
 // ---------------------------------------------------------------------------
 console.log("\n=== 2. createBtwSession (real model, in-memory) ===");

@@ -13,6 +13,12 @@ import {
 	matchesKey,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import {
+	applyBtwPaging,
+	createBtwScrollState,
+	layoutBtwViewport,
+	resolveBtwPagingInput,
+} from "./panel-scroll.ts";
 
 export interface BtwPanelResult {
 	/** True if the user asked to keep (persist) the conversation. */
@@ -80,12 +86,12 @@ export async function openBtwPanel(opts: OpenPanelOptions): Promise<BtwPanelResu
 	const { ctx, session, parentName, initialQuestion, allowKeep = false } = opts;
 
 	return ctx.ui.custom<BtwPanelResult>(
-		(tui: any, theme: any, _kb: any, done: (r: BtwPanelResult) => void) => {
+		(tui: any, theme: any, keybindings: any, done: (r: BtwPanelResult) => void) => {
 			let cached: string[] | undefined;
 			let inflight: any = null;
 			let streaming = false;
 			let statusText = "";
-			let scrollBack = 0; // lines scrolled up from the bottom
+			const scroll = createBtwScrollState();
 			let turns = 0;
 			let keep = false;
 			let keepName: string | undefined;
@@ -146,7 +152,9 @@ export async function openBtwPanel(opts: OpenPanelOptions): Promise<BtwPanelResu
 						statusText = `error: ${String(ev.error?.message ?? ev.error ?? "unknown").slice(0, 80)}`;
 						break;
 				}
-				scrollBack = 0; // stick to bottom on new output
+				// In follow mode new output stays pinned to the bottom. While the user
+				// is reading history, layoutBtwViewport preserves the absolute view.
+				if (scroll.followOutput) scroll.scrollBack = 0;
 				refresh();
 			});
 
@@ -225,13 +233,9 @@ export async function openBtwPanel(opts: OpenPanelOptions): Promise<BtwPanelResu
 					}
 					return;
 				}
-				if (matchesKey(data, Key.pageUp)) {
-					scrollBack += 5;
-					refresh();
-					return;
-				}
-				if (matchesKey(data, Key.pageDown)) {
-					scrollBack = Math.max(0, scrollBack - 5);
+				const paging = resolveBtwPagingInput(data, keybindings);
+				if (paging) {
+					applyBtwPaging(scroll, paging);
 					refresh();
 					return;
 				}
@@ -287,15 +291,10 @@ export async function openBtwPanel(opts: OpenPanelOptions): Promise<BtwPanelResu
 				// The TUI object exposes no row count, so read the terminal directly.
 				const termRows = process.stdout.rows || 24;
 				const maxBody = Math.max(3, Math.floor(termRows * 0.8) - 9);
-				let view = body;
-				if (body.length > maxBody) {
-					const end = Math.max(maxBody, body.length - scrollBack);
-					view = body.slice(Math.max(0, end - maxBody), end);
-					if (scrollBack > 0) {
-						view = [theme.fg("dim", `  ↑ ${body.length - end} more line(s) below`), ...view];
-					}
-				} else {
-					scrollBack = 0;
+				const viewport = layoutBtwViewport(scroll, body.length, maxBody);
+				let view = body.slice(viewport.start, viewport.end);
+				if (!scroll.followOutput && scroll.scrollBack > 0) {
+					view = [theme.fg("dim", `  ↓ ${scroll.scrollBack} newer line(s) · history paused`), ...view];
 				}
 				lines.push(...view);
 
@@ -313,7 +312,7 @@ export async function openBtwPanel(opts: OpenPanelOptions): Promise<BtwPanelResu
 					"Enter 发送/打断",
 					"Tab 追加到队尾",
 					streaming ? "Esc 中断" : "Esc 关闭并丢弃",
-					"PgUp/PgDn 滚动",
+					"Fn+↑/↓ (PgUp/PgDn) 翻页",
 				];
 				if (allowKeep) hints.push(keep ? "已标记保存" : "/keep 保存");
 				if (queuedSteer + queuedFollow > 0) {
