@@ -12,6 +12,8 @@ assert.match(source, /deliverAs: "followUp"/);
 assert.equal((source.match(/executionMode: "sequential"/g) ?? []).length, 3);
 assert.match(source, /background-task:\$\{event\}/);
 assert.match(source, /run\.status === "completed" \? "completed"/);
+assert.match(source, /current user's goal, not permanent history/);
+assert.match(source, /omit terminal or obsolete tasks/);
 assert.doesNotMatch(source, /\/opt\/homebrew\/lib\/node_modules|\/Users\/[^/]+\/\.nvm/);
 
 const result = spawnSync(

@@ -80,12 +80,16 @@ while the command ran determines the next pending task.
 /tasks clear-completed
 ```
 
-The TUI widget shows pending, in-progress and terminal task history. A
-completed task remains in the compact TUI/PI WEB display for 60 seconds, then
-ages out so later pending work moves into view; the persisted plan and `/tasks`
-output still retain the completed history. Failed, blocked and cancelled tasks
-do not auto-hide. The PI WEB Activity panel reads a privacy-trimmed record and
-shows task ids/statuses plus managed-run timing.
+The task plan is a current-goal view, not a permanent history log. On each
+`update_task_plan`, the model should omit terminal or obsolete tasks that no
+longer materially affect the next analysis, retry, verification, or decision;
+omitted non-active tasks disappear from the latest marker, system prompt,
+`/tasks`, and PI WEB projection. An active managed run can never be omitted.
+Terminal tasks kept because they remain relevant stay in the compact TUI/PI WEB
+display briefly (completed rows age out visually after 60 seconds). The
+append-only transcript, completion message, and private result logs retain the
+audit trail. The PI WEB Activity panel reads a privacy-trimmed record and shows
+task ids/statuses plus managed-run timing.
 
 ## Storage and privacy
 

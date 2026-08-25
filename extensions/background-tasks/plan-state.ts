@@ -151,10 +151,10 @@ function activeRunTaskIds(plan: TaskPlan): Set<string> {
 }
 
 /**
- * Replace the desired ordered plan while retaining omitted history. Pending
- * tasks omitted by the model become cancelled; terminal history remains
- * visible. A task backed by a live managed run cannot be removed or assigned a
- * forged status through a plan update.
+ * Replace the current goal-oriented plan. Omitted non-active tasks are dropped:
+ * the transcript and private run results own history, while this list contains
+ * only work still relevant to the user's latest objective. A task backed by a
+ * live managed run cannot be removed or assigned a forged terminal status.
  */
 export function reconcileTaskPlan(
 	current: TaskPlan,
@@ -193,13 +193,9 @@ export function reconcileTaskPlan(
 	}
 
 	for (const old of current.tasks) {
-		if (included.has(old.id)) continue;
-		if (liveTaskIds.has(old.id)) {
+		if (!included.has(old.id) && liveTaskIds.has(old.id)) {
 			throw new Error(`task ${old.id} has an active background run and cannot be removed`);
 		}
-		next.push(old.status === "pending" || old.status === "in_progress"
-			? { ...old, status: "cancelled", updatedAt: now, result: "Removed from the active plan" }
-			: old);
 	}
 
 	return {
@@ -207,10 +203,7 @@ export function reconcileTaskPlan(
 		revision: current.revision + 1,
 		reason: boundedReason(reason),
 		updatedAt: now,
-		// Desired tasks are ordered first. When the board is full, retain only as
-		// much older terminal history as fits; never make a persisted plan that
-		// its own reload parser must reject.
-		tasks: next.slice(0, MAX_TASKS),
+		tasks: next,
 	};
 }
 

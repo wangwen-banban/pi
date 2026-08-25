@@ -17,7 +17,7 @@ import {
 const tasks = (...items) => items;
 const task = (id, title, status = "pending") => ({ id, title, status });
 
-test("dynamic plan revisions add, reorder, cancel omitted pending, and retain history", () => {
+test("dynamic plan is an authoritative current-goal view and drops omitted non-active work", () => {
 	const first = reconcileTaskPlan(emptyTaskPlan(1), 0, tasks(
 		task("benchmark", "Run benchmark", "in_progress"),
 		task("analyze", "Analyze results"),
@@ -36,8 +36,6 @@ test("dynamic plan revisions add, reorder, cancel omitted pending, and retain hi
 	assert.deepEqual(revised.tasks.map((item) => [item.id, item.status]), [
 		["report", "pending"],
 		["extra", "pending"],
-		["benchmark", "completed"],
-		["analyze", "cancelled"],
 	]);
 	assert.equal(revised.reason, "user reprioritized");
 	assert.equal(revised.revision, 2);
@@ -89,6 +87,22 @@ test("user may update and reorder pending work while a run remains active", () =
 	const completed = finishTaskRun(revised, "run", "bg-run-2", "completed", "exit 0", 300);
 	assert.equal(completed.revision, revised.revision + 1);
 	assert.equal(nextPendingTask(completed)?.id, "report", "completion must use the latest reordered plan");
+});
+
+test("terminal outcome is retained only when explicitly relevant, and omission drops it", () => {
+	let plan = reconcileTaskPlan(emptyTaskPlan(), 0, [task("failed", "Failed run")]);
+	plan = attachRunToTask(plan, "failed", "bg-failed", "Failed run");
+	plan = finishTaskRun(plan, "failed", "bg-failed", "failed", "exit 2", 100);
+	const retained = reconcileTaskPlan(plan, plan.revision, [task("failed", "Failed run", "failed")], "still needed for retry decision", 200);
+	assert.equal(retained.tasks[0].runId, "bg-failed");
+	assert.equal(retained.tasks[0].result, "exit 2");
+	const dropped = reconcileTaskPlan(retained, retained.revision, [], "no longer relevant", 300);
+	assert.deepEqual(dropped.tasks, []);
+	const reloaded = reconstructTaskPlan([
+		{ type: "custom", customType: TASK_PLAN_MARKER_TYPE, data: retained },
+		{ type: "custom", customType: TASK_PLAN_MARKER_TYPE, data: dropped },
+	]);
+	assert.deepEqual(reloaded.tasks, [], "latest marker keeps obsolete terminal work out after reload");
 });
 
 test("failed task can be explicitly reset before retry and gets a fresh run", () => {

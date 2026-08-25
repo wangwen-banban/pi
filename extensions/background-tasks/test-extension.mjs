@@ -141,6 +141,18 @@ test("dynamic prompt updates survive a running command and completion wakes the 
 	assert.match(wake.message.content, /Next pending task from the latest revision: report/);
 	assert.equal(wake.message.details.plan.tasks.find((task) => task.id === "benchmark").status, "completed");
 	assert.equal(wake.message.details.plan.tasks[1].id, "report");
+
+	// After integrating the result, the model can omit irrelevant terminal work
+	// from the current-goal plan instead of the extension forcing history back in.
+	const reconciled = await execute(update, {
+		baseRevision: 4,
+		explanation: "benchmark outcome integrated; continue current goal",
+		tasks: [
+			{ id: "report", title: "Publish quick report", status: "pending" },
+			{ id: "analyze", title: "Analyze results", status: "pending" },
+		],
+	}, h.ctx);
+	assert.equal(reconciled.details.plan.tasks.some((task) => task.id === "benchmark"), false);
 	await h.fire("session_shutdown", { reason: "quit" });
 });
 
