@@ -282,7 +282,9 @@ function viewState({
       ],
       runs: [{
         id: 'bg-run-1', taskId: 'benchmark', name: 'benchmark', status: 'running', stopping: false,
-        createdAt: NOW - 70_000, startedAt: NOW - 60_000, lastOutputAt: NOW - 5_000, timeoutAt: NOW + 60_000,
+        createdAt: NOW - 70_000, startedAt: NOW - 60_000, lastOutputAt: NOW - 5_000,
+        lastProgressAt: NOW - 3_000, lastHeartbeatAt: NOW - 1_000, healthStatus: 'healthy', healthDeadlineAt: NOW + 10_000,
+        timeoutAt: NOW + 60_000,
       }],
     }));
   }
@@ -471,7 +473,8 @@ describe('renderActivityPanelHtml — structure', () => {
     assert.ok(html.includes('Managed runs'));
     assert.ok(html.includes('background-run-card'));
     assert.ok(html.includes('task <code>benchmark</code>'));
-    assert.ok(html.includes('<span class="field-label">progress</span> 5s ago'));
+    assert.ok(html.includes('<span class="field-label">progress</span> 3s ago'));
+    assert.ok(html.includes('<span class="field-label">health</span> healthy'));
     // Background records are display-only in v1; only the smart job owns Stop.
     assert.equal((html.match(/data-stop-one=/g) ?? []).length, 1);
   });

@@ -11,6 +11,8 @@ function workspace(t) {
 	return root;
 }
 
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
 function options(root, id, command, overrides = {}) {
 	return {
 		id,
@@ -77,13 +79,14 @@ test("timeout escalates an uncooperative process group and always settles", asyn
 	const controller = await startManagedBackgroundRun(options(
 		root,
 		"timeout",
-		"trap '' TERM; while :; do sleep 1; done",
-		{ timeoutMs: 60, terminateGraceMs: 60 },
+		"trap '' TERM; while :; do :; done",
+		{ timeoutMs: 80, terminateGraceMs: 80 },
 	));
 	const result = await controller.completion;
 	assert.equal(result.status, "failed");
 	assert.equal(result.terminationReason, "timed_out");
 	assert.equal(result.timeoutEscalated, true);
+	assert.equal(result.terminationEscalated, true);
 	assert.equal(result.signal, "SIGKILL");
 	assert.match(result.error, /timed out/);
 });
@@ -107,6 +110,87 @@ test("shutdown stop is distinguishable so the task plan can become blocked", asy
 	assert.equal(result.status, "stopped");
 	assert.equal(result.terminationReason, "session_shutdown");
 	assert.equal(result.stopReason, "shutdown");
+});
+
+test("human log text saying unavailable remains backward-compatible and does not invent remote semantics", async (t) => {
+	const root = workspace(t);
+	const controller = await startManagedBackgroundRun(options(
+		root,
+		"legacy-unavailable",
+		"while :; do printf 'unavailable\\n'; sleep 0.02; done",
+	));
+	await sleep(120);
+	assert.equal(controller.snapshot().status, "running", "without opt-in policy only process lifecycle and wall timeout are authoritative");
+	assert.equal(controller.stop("user"), true);
+	assert.equal((await controller.completion).terminationReason, "explicit_stop");
+});
+
+test("structured unavailable reports fail closed while the monitor stays alive and the wall clock is frozen", async (t) => {
+	const root = workspace(t);
+	const controller = await startManagedBackgroundRun(options(
+		root,
+		"health-unavailable",
+		`while :; do printf '%s\\n' '{"version":1,"health":"unavailable"}' >&3; sleep 0.02; done`,
+		{
+			healthPolicy: { startupGraceMs: 1_500, heartbeatTimeoutMs: 300, unavailableTimeoutMs: 120 },
+			terminateGraceMs: 80,
+			now: () => 1_000_000,
+		},
+	));
+	const result = await controller.completion;
+	assert.equal(result.status, "failed");
+	assert.equal(result.terminationReason, "health_policy_failed");
+	assert.equal(result.healthFailure, "unavailable_timeout");
+	assert.match(result.error, /remained unavailable/);
+	assert.ok(result.lastHeartbeatAt >= result.startedAt);
+});
+
+test("transient health loss followed by structured progress recovery can complete normally", async (t) => {
+	const root = workspace(t);
+	const command = [
+		`printf '%s\\n' '{"version":1,"health":"unavailable"}' >&3`,
+		"sleep 0.03",
+		`printf '%s\\n' '{"version":1,"health":"healthy","progress":"phase-1"}' >&3`,
+		"sleep 0.03",
+		`printf '%s\\n' '{"version":1,"health":"healthy","progress":"phase-2"}' >&3`,
+	].join("; ");
+	const controller = await startManagedBackgroundRun(options(root, "health-recovery", command, {
+		healthPolicy: {
+			startupGraceMs: 1_500,
+			heartbeatTimeoutMs: 300,
+			unavailableTimeoutMs: 150,
+			staleProgressTimeoutMs: 150,
+		},
+	}));
+	const result = await controller.completion;
+	assert.equal(result.status, "completed");
+	assert.equal(result.terminationReason, "completed");
+	assert.equal(result.healthStatus, "healthy");
+	assert.equal(result.healthFailure, undefined);
+	assert.ok(result.lastProgressAt >= result.startedAt);
+});
+
+test("healthy heartbeats cannot mask sustained stale progress", async (t) => {
+	const root = workspace(t);
+	const controller = await startManagedBackgroundRun(options(
+		root,
+		"health-stale",
+		`while :; do printf '%s\\n' '{"version":1,"health":"healthy","progress":"unchanged"}' >&3; sleep 0.02; done`,
+		{
+			healthPolicy: {
+				startupGraceMs: 1_500,
+				heartbeatTimeoutMs: 300,
+				unavailableTimeoutMs: 200,
+				staleProgressTimeoutMs: 120,
+			},
+			terminateGraceMs: 80,
+		},
+	));
+	const result = await controller.completion;
+	assert.equal(result.status, "failed");
+	assert.equal(result.terminationReason, "health_policy_failed");
+	assert.equal(result.healthFailure, "stale_progress");
+	assert.match(result.error, /progress token did not change/);
 });
 
 test("console logs are capped while the latest output tail remains bounded", async (t) => {

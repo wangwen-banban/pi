@@ -447,6 +447,7 @@ function renderBackgroundRun(run, view) {
   if (run.timeoutAt != null && Number.isFinite(run.timeoutAt)) {
     fields.push(field('timeout', escapeHtml(run.timedOut ? 'timed out' : formatRelative(run.timeoutAt, view.now))));
   }
+  if (run.healthStatus) fields.push(field('health', escapeHtml(run.healthFailure || run.healthStatus)));
   if (run.exitCode != null) fields.push(field('exit', escapeHtml(String(run.exitCode))));
   if (run.signal) fields.push(field('signal', escapeHtml(run.signal)));
   if (run.terminationReason) fields.push(field('reason', escapeHtml(run.terminationReason)));

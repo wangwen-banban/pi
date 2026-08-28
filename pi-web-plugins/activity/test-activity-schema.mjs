@@ -107,7 +107,7 @@ function mkBackground(overrides = {}) {
       { id: 'next', name: 'next', status: 'pending', position: 1, updatedAt: 2500 },
     ],
     runs: [
-      { id: 'bg-run-1', taskId: 'run', name: 'run', status: 'running', stopping: false, createdAt: 2000, startedAt: 2100, lastOutputAt: 2900, timeoutAt: 9000 },
+      { id: 'bg-run-1', taskId: 'run', name: 'run', status: 'running', stopping: false, createdAt: 2000, startedAt: 2100, lastOutputAt: 2900, lastProgressAt: 2950, lastHeartbeatAt: 2990, healthStatus: 'healthy', healthDeadlineAt: 3500, timeoutAt: 9000 },
     ],
     ...overrides,
   };
@@ -542,6 +542,10 @@ describe('parseBackgroundTasks', () => {
     ]);
     assert.equal(result.runs[0].id, 'bg-run-1');
     assert.equal(result.runs[0].status, 'running');
+    assert.equal(result.runs[0].lastProgressAt, 2950);
+    assert.equal(result.runs[0].lastHeartbeatAt, 2990);
+    assert.equal(result.runs[0].healthStatus, 'healthy');
+    assert.equal(result.runs[0].healthDeadlineAt, 3500);
     assert.equal(isBackgroundRunActive(result.runs[0]), true);
   });
 
@@ -554,6 +558,8 @@ describe('parseBackgroundTasks', () => {
     }
     assert.throws(() => parseBackgroundTask({ id: 'task', name: 'task', status: 'mystery', position: 0, updatedAt: 1 }), /unknown status/);
     assert.throws(() => parseBackgroundRun({ id: 'run', taskId: 'task', name: 'run', status: 'mystery', createdAt: 1 }), /unknown status/);
+    assert.throws(() => parseBackgroundRun({ id: 'run', taskId: 'task', name: 'run', status: 'running', createdAt: 1, healthStatus: 'mystery' }), /unknown health status/);
+    assert.throws(() => parseBackgroundRun({ id: 'run', taskId: 'task', name: 'run', status: 'failed', createdAt: 1, healthFailure: 'mystery' }), /unknown health failure/);
   });
 
   it('rejects duplicate or unsafe ids and malformed revision/timestamps', () => {

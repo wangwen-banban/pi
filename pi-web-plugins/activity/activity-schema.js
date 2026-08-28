@@ -34,6 +34,8 @@ export const JOB_STATUSES = [...ACTIVE_JOB_STATUSES, ...TERMINAL_JOB_STATUSES];
 // Main-agent task plan and managed command lifecycle.
 export const TASK_PLAN_STATUSES = ['pending', 'in_progress', 'completed', 'failed', 'blocked', 'cancelled'];
 export const BACKGROUND_RUN_STATUSES = ['running', 'completed', 'failed', 'stopped'];
+export const BACKGROUND_HEALTH_STATUSES = ['awaiting', 'healthy', 'unavailable'];
+export const BACKGROUND_HEALTH_FAILURES = ['startup_timeout', 'heartbeat_timeout', 'unavailable_timeout', 'stale_progress', 'protocol_error'];
 
 // ---- Safe IDs -------------------------------------------------------------
 
@@ -318,7 +320,8 @@ export function parseAgents(raw) {
 // {schemaVersion, sessionId, runtimeId, generation, revision, updatedAt,
 //  tasks:[{id,name,status,position,updatedAt,runId?}],
 //  runs:[{id,taskId,name,status,stopping,createdAt,startedAt,finishedAt,
-//         lastOutputAt,timeoutAt,exitCode,signal,terminationReason}]}.
+//         lastOutputAt,lastProgressAt,lastHeartbeatAt,healthStatus,healthFailure,
+//         healthDeadlineAt,timeoutAt,exitCode,signal,terminationReason}]}.
 // Commands, full task titles, output, credentials and PID are deliberately absent.
 
 export function parseBackgroundTask(raw, idx = 0) {
@@ -355,6 +358,14 @@ export function parseBackgroundRun(raw, idx = 0) {
     throw new Error(`background run[${idx}]: unknown status ${String(raw.status)}`);
   }
   const exitCode = raw.exitCode == null ? undefined : finiteNum(raw.exitCode, `background run[${idx}].exitCode`);
+  const healthStatus = raw.healthStatus == null ? undefined : boundStr(raw.healthStatus, `background run[${idx}].healthStatus`, 32);
+  if (healthStatus !== undefined && !BACKGROUND_HEALTH_STATUSES.includes(healthStatus)) {
+    throw new Error(`background run[${idx}]: unknown health status ${String(raw.healthStatus)}`);
+  }
+  const healthFailure = raw.healthFailure == null ? undefined : boundStr(raw.healthFailure, `background run[${idx}].healthFailure`, 64);
+  if (healthFailure !== undefined && !BACKGROUND_HEALTH_FAILURES.includes(healthFailure)) {
+    throw new Error(`background run[${idx}]: unknown health failure ${String(raw.healthFailure)}`);
+  }
   return {
     id,
     taskId,
@@ -365,6 +376,11 @@ export function parseBackgroundRun(raw, idx = 0) {
     startedAt: optionalTs(raw.startedAt, `background run[${idx}].startedAt`),
     finishedAt: optionalTs(raw.finishedAt, `background run[${idx}].finishedAt`),
     lastOutputAt: optionalTs(raw.lastOutputAt, `background run[${idx}].lastOutputAt`),
+    lastProgressAt: optionalTs(raw.lastProgressAt, `background run[${idx}].lastProgressAt`),
+    lastHeartbeatAt: optionalTs(raw.lastHeartbeatAt, `background run[${idx}].lastHeartbeatAt`),
+    healthStatus,
+    healthFailure,
+    healthDeadlineAt: optionalTs(raw.healthDeadlineAt, `background run[${idx}].healthDeadlineAt`),
     timeoutAt: optionalTs(raw.timeoutAt, `background run[${idx}].timeoutAt`),
     exitCode,
     signal: optionalStr(raw.signal, `background run[${idx}].signal`, 64),

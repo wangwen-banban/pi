@@ -93,7 +93,7 @@ function mkBackground(overrides = {}) {
       { id: 'next', name: 'next', status: 'pending', position: 1, updatedAt: 4500 },
     ],
     runs: [
-      { id: 'bg-run-1', taskId: 'run', name: 'run', status: 'running', stopping: false, createdAt: 4000, startedAt: 4100, lastOutputAt: 4900, timeoutAt: 20_000 },
+      { id: 'bg-run-1', taskId: 'run', name: 'run', status: 'running', stopping: false, createdAt: 4000, startedAt: 4100, lastOutputAt: 4900, lastProgressAt: 4950, lastHeartbeatAt: 4990, healthStatus: 'healthy', healthDeadlineAt: 7000, timeoutAt: 20_000 },
     ],
     ...overrides,
   };
@@ -369,7 +369,10 @@ describe('buildViewModel — statuses and plan', () => {
     ]);
     assert.equal(session.background.runs[0].status, 'running');
     assert.equal(session.background.runs[0].elapsed, 1900);
-    assert.equal(session.background.runs[0].progressAge, 1100);
+    assert.equal(session.background.runs[0].progressAge, 1050);
+    assert.equal(session.background.runs[0].healthStatus, 'healthy');
+    assert.equal(session.background.runs[0].healthFailure, null);
+    assert.equal(session.background.runs[0].healthDeadlineAt, 7000);
     assert.equal(session.stop, null, 'read-only Web task display has no stop capability');
   });
 

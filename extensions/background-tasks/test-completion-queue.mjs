@@ -30,7 +30,7 @@ test("idle completions coalesce into one wake and duplicate ids are ignored", ()
 	assert.equal(queue.deliveredCount, 2);
 });
 
-test("completion while parent is busy waits for the safe agent_end boundary", () => {
+test("completion while parent is busy waits for the owner-reported settled boundary", () => {
 	const scheduler = new FakeScheduler();
 	const flushes = [];
 	const queue = createCompletionQueue({ scheduler, onFlush: (items) => flushes.push(items) });

@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -12,6 +13,10 @@ import {
 	WebActivityRegistry,
 } from "../web-activity/registry.ts";
 import { createCompletionQueue } from "./completion-queue.ts";
+import {
+	validateBackgroundHealthPolicy,
+	type BackgroundHealthPolicy,
+} from "./health-policy.ts";
 import {
 	COMPLETED_TASK_HOLD_MS,
 	TASK_PLAN_MARKER_TYPE,
@@ -30,10 +35,18 @@ import {
 	type TaskStatus,
 } from "./plan-state.ts";
 import {
+	BACKGROUND_RUN_RECORD_VERSION,
 	startManagedBackgroundRun,
 	type BackgroundRunController,
 	type BackgroundRunSnapshot,
 } from "./runner.ts";
+import { parseTerminalBackgroundRunSnapshot } from "./run-persistence.ts";
+import {
+	BACKGROUND_WAKE_MARKER_TYPE,
+	acknowledgedWakeMarker,
+	pendingWakeMarker,
+	reconstructWakeOutbox,
+} from "./wake-state.ts";
 import {
 	buildBackgroundRuntimeRecord,
 	buildBackgroundTasksRecord,
@@ -43,6 +56,8 @@ const DEFAULT_RUNS_DIR = path.join(getAgentDir(), "background-task-runs");
 const DEFAULT_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 const MIN_TIMEOUT_MS = 1_000;
 const MAX_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
+const MIN_HEALTH_WINDOW_MS = 1_000;
+const MAX_HEALTH_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const TERMINATE_GRACE_MS = 5_000;
 const MAX_LOG_BYTES = 32 * 1024 * 1024;
 const MAX_TAIL_BYTES = 32 * 1024;
@@ -64,12 +79,36 @@ const UpdateTaskPlanParams = Type.Object({
 	}), { maxItems: 50 }),
 });
 
+const HealthPolicyParams = Type.Object({
+	startupGraceMs: Type.Optional(Type.Integer({
+		minimum: MIN_HEALTH_WINDOW_MS,
+		maximum: MAX_HEALTH_WINDOW_MS,
+		description: "Time allowed for the first valid fd-3 health record. Defaults to heartbeatTimeoutMs.",
+	})),
+	heartbeatTimeoutMs: Type.Integer({
+		minimum: MIN_HEALTH_WINDOW_MS,
+		maximum: MAX_HEALTH_WINDOW_MS,
+		description: "Fail if no valid machine-readable health record arrives for this long.",
+	}),
+	unavailableTimeoutMs: Type.Integer({
+		minimum: MIN_HEALTH_WINDOW_MS,
+		maximum: MAX_HEALTH_WINDOW_MS,
+		description: "Fail if records continuously report health=unavailable for this long.",
+	}),
+	staleProgressTimeoutMs: Type.Optional(Type.Integer({
+		minimum: MIN_HEALTH_WINDOW_MS,
+		maximum: MAX_HEALTH_WINDOW_MS,
+		description: "Fail if the opaque progress token does not change for this long while health is healthy.",
+	})),
+}, { additionalProperties: false });
+
 const RunBackgroundTaskParams = Type.Object({
 	taskId: Type.String({ description: "Task-plan id to mark in_progress and bind to this run." }),
 	name: Type.Optional(Type.String({ description: "Short run name shown in activity; defaults to taskId." })),
 	command: Type.String({ description: "Shell command to run under the managed background monitor." }),
 	cwd: Type.Optional(Type.String({ description: "Working directory, relative to the session cwd unless absolute." })),
 	timeoutMs: Type.Optional(Type.Number({ description: "Wall-clock timeout in milliseconds. Default 6 hours; range 1 second–7 days." })),
+	healthPolicy: Type.Optional(HealthPolicyParams),
 });
 
 const StopBackgroundTaskParams = Type.Object({
@@ -93,6 +132,7 @@ interface CompletionNotice {
 interface CompletionBatchDetails {
 	runs: BackgroundRunSnapshot[];
 	plan: TaskPlan;
+	wakeRunIds: string[];
 }
 
 function safeRunName(value: string): string {
@@ -108,6 +148,31 @@ function clampTimeout(value: number | undefined): number {
 	if (value === undefined) return DEFAULT_TIMEOUT_MS;
 	if (!Number.isFinite(value)) throw new Error("timeoutMs must be finite");
 	return Math.max(MIN_TIMEOUT_MS, Math.min(MAX_TIMEOUT_MS, Math.floor(value)));
+}
+
+function healthWindow(value: number, field: string): number {
+	if (!Number.isSafeInteger(value) || value < MIN_HEALTH_WINDOW_MS || value > MAX_HEALTH_WINDOW_MS) {
+		throw new Error(`${field} must be an integer from ${MIN_HEALTH_WINDOW_MS} to ${MAX_HEALTH_WINDOW_MS} milliseconds`);
+	}
+	return value;
+}
+
+function normalizeHealthPolicy(value: {
+	startupGraceMs?: number;
+	heartbeatTimeoutMs: number;
+	unavailableTimeoutMs: number;
+	staleProgressTimeoutMs?: number;
+} | undefined): BackgroundHealthPolicy | undefined {
+	if (value === undefined) return undefined;
+	const heartbeatTimeoutMs = healthWindow(value.heartbeatTimeoutMs, "healthPolicy.heartbeatTimeoutMs");
+	return validateBackgroundHealthPolicy({
+		startupGraceMs: healthWindow(value.startupGraceMs ?? heartbeatTimeoutMs, "healthPolicy.startupGraceMs"),
+		heartbeatTimeoutMs,
+		unavailableTimeoutMs: healthWindow(value.unavailableTimeoutMs, "healthPolicy.unavailableTimeoutMs"),
+		...(value.staleProgressTimeoutMs === undefined
+			? {}
+			: { staleProgressTimeoutMs: healthWindow(value.staleProgressTimeoutMs, "healthPolicy.staleProgressTimeoutMs") }),
+	});
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {
@@ -145,6 +210,10 @@ function runIsActive(run: BackgroundRunSnapshot): boolean {
 	return run.status === "running";
 }
 
+function runShouldWake(run: BackgroundRunSnapshot): boolean {
+	return run.terminationReason !== "session_shutdown" && run.stopReason !== "shutdown";
+}
+
 export interface BackgroundTasksExtensionOptions {
 	runsDir?: string;
 	startRun?: typeof startManagedBackgroundRun;
@@ -176,6 +245,11 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 	const controllers = new Map<string, BackgroundRunController>();
 	const runs = new Map<string, BackgroundRunSnapshot>();
 	const lastProgressEventAt = new Map<string, number>();
+	const pendingWakeRuns = new Map<string, BackgroundRunSnapshot>();
+	const knownWakeRunIds = new Set<string>();
+	const awaitingWakeMessageStart = new Set<string>();
+	const activeWakeRunIds = new Set<string>();
+	let activeWakeResponded = false;
 
 	let webRegistry: WebActivityRegistry | undefined;
 	let webRuntimeId = "";
@@ -324,12 +398,42 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		}
 	};
 
+	const appendWakeMarker = (marker: ReturnType<typeof pendingWakeMarker> | ReturnType<typeof acknowledgedWakeMarker>): boolean => {
+		try {
+			pi.appendEntry(BACKGROUND_WAKE_MARKER_TYPE, marker);
+			return true;
+		} catch (error) {
+			try { latestCtx?.ui.notify(`Could not persist background wake state: ${error instanceof Error ? error.message : String(error)}`, "error"); } catch { /* best effort */ }
+			return false;
+		}
+	};
+
+	const recordPendingWake = (run: BackgroundRunSnapshot, persist = true): boolean => {
+		if (run.status === "running" || pendingWakeRuns.has(run.id)) return false;
+		const persisted = !persist || appendWakeMarker(pendingWakeMarker(run));
+		knownWakeRunIds.add(run.id);
+		pendingWakeRuns.set(run.id, { ...run });
+		return persisted;
+	};
+
+	const acknowledgeWakeRuns = (runIds: Iterable<string>) => {
+		for (const runId of runIds) {
+			if (!pendingWakeRuns.has(runId)) continue;
+			if (!appendWakeMarker(acknowledgedWakeMarker(runId))) continue;
+			pendingWakeRuns.delete(runId);
+			knownWakeRunIds.add(runId);
+		}
+	};
+
 	const completionQueue = createCompletionQueue<CompletionNotice>({
 		debounceMs: extensionOptions.completionDebounceMs,
 		onFlush: (items) => {
 			if (shuttingDown || items.length === 0) return;
+			const deliverable = items.filter(({ id }) => pendingWakeRuns.has(id));
+			if (deliverable.length === 0) return;
+			const wakeRunIds = deliverable.map((item) => item.id);
 			const next = nextPendingTask(plan);
-			const runSections = items.map(({ run }) => [
+			const runSections = deliverable.map(({ run }) => [
 				`Background task ${run.status}: ${run.name} (${run.id})`,
 				`Task: ${run.taskId}`,
 				`Termination: ${run.terminationReason ?? "unknown"}`,
@@ -340,6 +444,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 			].join("\n"));
 			const content = [
 				"[Background task lifecycle update — continue the original user work]",
+				`Durable wake id(s): ${wakeRunIds.join(", ")}`,
 				...runSections,
 				"",
 				taskPlanText(plan, { includeResults: true }),
@@ -347,21 +452,27 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 				next
 					? `Next pending task from the latest revision: ${next.id} — ${next.title}`
 					: "No pending task remains in the latest revision.",
-				"This is completion context, not a new user request. Reconcile any user prompts received while the command ran, analyze the result, then update the task plan with the current revision. Retain this terminal task only if its outcome still affects retry, verification, or the next decision; otherwise omit it from the current plan. Continue without polling the finished run.",
+				"This is completion context, not a new user request. A wake may be safely replayed after a runtime restart with the same durable id; reconcile each run idempotently. Reconcile any user prompts received while the command ran, analyze the result, then update the task plan with the current revision. Retain this terminal task only if its outcome still affects retry, verification, or the next decision; otherwise omit it from the current plan. Continue without polling the finished run.",
 			].join("\n");
-			pi.sendMessage<CompletionBatchDetails>(
-				{
-					customType: "background-task-completion",
-					content,
-					display: true,
-					details: { runs: items.map((item) => item.run), plan },
-				},
-				{ triggerTurn: true, deliverAs: "followUp" },
-			);
+			for (const runId of wakeRunIds) awaitingWakeMessageStart.add(runId);
+			try {
+				pi.sendMessage<CompletionBatchDetails>(
+					{
+						customType: "background-task-completion",
+						content,
+						display: true,
+						details: { runs: deliverable.map((item) => item.run), plan, wakeRunIds },
+					},
+					{ triggerTurn: true, deliverAs: "followUp" },
+				);
+			} catch (error) {
+				for (const runId of wakeRunIds) awaitingWakeMessageStart.delete(runId);
+				throw error;
+			}
 		},
 		onError: (error) => {
 			try {
-				latestCtx?.ui.notify(`Could not wake main agent for background completion: ${error instanceof Error ? error.message : String(error)}`, "error");
+				latestCtx?.ui.notify(`Could not wake main agent for background completion: ${error instanceof Error ? error.message : String(error)}. The durable wake remains pending for replay.`, "error");
 			} catch { /* best effort */ }
 		},
 	});
@@ -377,7 +488,8 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 			flushWebTasks();
 		}
 		const previous = lastProgressEventAt.get(snapshot.id) ?? 0;
-		if (snapshot.status === "running" && snapshot.lastOutputAt && now - previous >= WEB_PROGRESS_FLUSH_MS) {
+		const progressAt = Math.max(snapshot.lastOutputAt ?? 0, snapshot.lastProgressAt ?? 0);
+		if (snapshot.status === "running" && progressAt > 0 && now - previous >= WEB_PROGRESS_FLUSH_MS) {
 			lastProgressEventAt.set(snapshot.id, now);
 			emitLifecycle("progress", snapshot);
 		}
@@ -420,12 +532,81 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		lastProgressEventAt.delete(run.id);
 		runs.set(run.id, run);
 		finalizePlanForRun(run);
+		const shouldWake = runShouldWake(run);
+		if (shouldWake && !pendingWakeRuns.has(run.id)) recordPendingWake(run);
 		updateUi();
 		flushWebRuntime("active");
 		flushWebTasks();
 		emitLifecycle(run.status === "completed" ? "completed" : run.status === "failed" ? "failed" : "stopped", run);
-		if (!shuttingDown) completionQueue.enqueue({ id: run.id, run });
-		scheduleDismiss(run.id);
+		if (!shuttingDown && pendingWakeRuns.has(run.id)) completionQueue.enqueue({ id: run.id, run });
+		if (!shuttingDown) scheduleDismiss(run.id);
+	};
+
+	const readDurableRunResult = async (sessionId: string, taskId: string, runId: string): Promise<BackgroundRunSnapshot | undefined> => {
+		const runDir = path.join(extensionOptions.runsDir, sessionId, runId);
+		const resultPath = path.join(runDir, "result.json");
+		try {
+			const stat = await fs.promises.stat(resultPath);
+			if (!stat.isFile() || stat.size > 2 * 1024 * 1024) return undefined;
+			const parsed = parseTerminalBackgroundRunSnapshot(JSON.parse(await fs.promises.readFile(resultPath, "utf8")));
+			if (!parsed || parsed.id !== runId || parsed.taskId !== taskId) return undefined;
+			if (path.resolve(parsed.resultPath) !== path.resolve(resultPath)) return undefined;
+			if (path.resolve(parsed.stdoutPath) !== path.resolve(runDir, "stdout.log")) return undefined;
+			if (path.resolve(parsed.stderrPath) !== path.resolve(runDir, "stderr.log")) return undefined;
+			return parsed;
+		} catch {
+			return undefined;
+		}
+	};
+
+	const lostMonitorRun = (ctx: ExtensionContext, task: TaskPlan["tasks"][number]): BackgroundRunSnapshot => {
+		const now = Date.now();
+		const runId = task.runId!;
+		const runDir = path.join(extensionOptions.runsDir, ctx.sessionManager.getSessionId(), runId);
+		return {
+			recordVersion: BACKGROUND_RUN_RECORD_VERSION,
+			id: runId,
+			taskId: task.id,
+			name: task.id,
+			status: "failed",
+			cwd: ctx.cwd,
+			createdAt: task.updatedAt,
+			startedAt: task.updatedAt,
+			finishedAt: now,
+			timeoutAt: now,
+			terminationReason: "monitor_restarted",
+			stdoutTail: "",
+			stderrTail: "",
+			stdoutPath: path.join(runDir, "stdout.log"),
+			stderrPath: path.join(runDir, "stderr.log"),
+			resultPath: path.join(runDir, "result.json"),
+			logTruncated: false,
+			error: "The Pi runtime restarted before this managed command recorded a terminal result. Process ownership cannot be safely reattached; verify and clean up any orphaned external work before retrying.",
+		};
+	};
+
+	const recoverDurableRuns = async (ctx: ExtensionContext) => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		for (const task of [...plan.tasks]) {
+			if (!task.runId) continue;
+			const pending = pendingWakeRuns.get(task.runId);
+			if (pending) {
+				runs.set(pending.id, pending);
+				if (task.status === "in_progress") handleCompletion(pending);
+				continue;
+			}
+			const result = await readDurableRunResult(sessionId, task.id, task.runId);
+			if (task.status === "in_progress") {
+				handleCompletion(result ?? lostMonitorRun(ctx, task));
+				continue;
+			}
+			// For v2 runs, a terminal plan without any wake marker is the crash
+			// window between plan persistence and outbox persistence. Legacy v1
+			// completions are not replayed merely because the extension upgraded.
+			if (result?.recordVersion === BACKGROUND_RUN_RECORD_VERSION && runShouldWake(result) && !knownWakeRunIds.has(task.runId)) {
+				handleCompletion(result);
+			}
+		}
 	};
 
 	const findController = (id: string): { id: string; controller: BackgroundRunController } | undefined => {
@@ -512,11 +693,12 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 	pi.registerTool({
 		name: "run_background_task",
 		label: "Run Background Task",
-		description: "Start a long shell command under the main-agent background monitor. Returns immediately; exit, failure, signal or timeout updates the task plan and wakes the main LLM automatically.",
-		promptSnippet: "Launch a managed background command with completion hook and automatic main-agent wake",
+		description: "Start a long shell command under the main-agent background monitor. Returns immediately; exit, failure, signal, wall timeout, or an opt-in fail-closed health policy updates the task plan and durably wakes the main LLM.",
+		promptSnippet: "Launch a managed background command with durable completion wake and optional health lease",
 		promptGuidelines: [
 			"Use run_background_task for long benchmarks, tests, builds, deployments, training or data jobs that should continue after the current turn. The command must stay in the foreground of its managed shell; never use raw '&', nohup, disown, daemonize flags, or PID polling for such work.",
 			"Create/update the task plan first and bind the exact taskId. The tool returns immediately; do not poll. Continue only useful non-conflicting work or end the turn and wait for the lifecycle wake.",
+			"For adoption watchers, remote supervisors, or other commands that can stay alive while observed work is unavailable or stale, pass run_background_task.healthPolicy and emit JSON Lines health records on dedicated fd 3. Do not rely on human log parsing; report version=1, health=healthy|unavailable, and an opaque progress token when staleness is bounded.",
 			"User prompts received while a background task runs may dynamically change pending tasks. Keep the active task unless the user explicitly asks to stop or replace it.",
 		],
 		parameters: RunBackgroundTaskParams,
@@ -534,6 +716,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 			const id = `bg-${Date.now().toString(36)}-${(++sequence).toString(36)}`;
 			const cwd = params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd;
 			const timeoutMs = clampTimeout(params.timeoutMs);
+			const healthPolicy = normalizeHealthPolicy(params.healthPolicy);
 			plan = attachRunToTask(plan, taskId, id, plan.tasks.find((task) => task.id === taskId)?.title ?? name);
 			persistPlan();
 			const runDir = path.join(extensionOptions.runsDir, ctx.sessionManager.getSessionId(), id);
@@ -547,6 +730,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 					cwd,
 					runDir,
 					timeoutMs,
+					healthPolicy,
 					terminateGraceMs: TERMINATE_GRACE_MS,
 					maxLogBytes: MAX_LOG_BYTES,
 					maxTailBytes: MAX_TAIL_BYTES,
@@ -554,6 +738,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 				});
 			} catch (error) {
 				const failed: BackgroundRunSnapshot = {
+					recordVersion: BACKGROUND_RUN_RECORD_VERSION,
 					id,
 					taskId,
 					name,
@@ -563,6 +748,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 					startedAt: Date.now(),
 					finishedAt: Date.now(),
 					timeoutAt: Date.now() + timeoutMs,
+					...(healthPolicy ? { healthPolicy, healthStatus: "awaiting" as const } : {}),
 					terminationReason: "spawn_error",
 					stdoutTail: "",
 					stderrTail: "",
@@ -584,7 +770,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 			emitLifecycle("started", initial);
 			void controller.completion.then(handleCompletion);
 			onUpdate?.({
-				content: [{ type: "text", text: `Managed background task ${name} started (${id}). Monitoring exit, failure, signal and timeout.` }],
+				content: [{ type: "text", text: `Managed background task ${name} started (${id}). Monitoring exit, failure, signal, wall timeout${healthPolicy ? ", health availability and structured progress" : ""}.` }],
 				details: { run: initial, plan } satisfies RunDetails,
 			});
 			return {
@@ -595,8 +781,12 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 						`Task plan id: ${taskId}`,
 						`Plan revision: ${plan.revision}`,
 						`Timeout: ${timeoutMs}ms`,
+						...(healthPolicy ? [
+							`Health policy: startup ${healthPolicy.startupGraceMs}ms · heartbeat ${healthPolicy.heartbeatTimeoutMs}ms · unavailable ${healthPolicy.unavailableTimeoutMs}ms${healthPolicy.staleProgressTimeoutMs ? ` · stale progress ${healthPolicy.staleProgressTimeoutMs}ms` : ""}`,
+							"Health protocol: write one JSON object per line to fd 3 (also exposed as PI_BACKGROUND_TASK_HEALTH_FD).",
+						] : []),
 						`Logs: ${initial.stdoutPath} · ${initial.stderrPath}`,
-						"Completion will update the plan and wake the main agent automatically. Do not poll.",
+						"Completion is durably recorded, updates the plan, and wakes the main agent automatically. Do not poll.",
 					].join("\n"),
 				}],
 				details: { run: initial, plan } satisfies RunDetails,
@@ -673,8 +863,12 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 	});
 
 	const blockBranchChange = (ctx: ExtensionContext, action: string) => {
-		if (activeRuns().length === 0) return false;
-		try { ctx.ui.notify(`Cannot ${action} while a managed background task is running. Stop it with /tasks stop first.`, "warning"); } catch { /* best effort */ }
+		const active = activeRuns().length;
+		if (active === 0 && pendingWakeRuns.size === 0) return false;
+		const reason = active > 0
+			? "a managed background task is running. Stop it with /tasks stop first"
+			: "a durable background completion wake is awaiting acknowledgement";
+		try { ctx.ui.notify(`Cannot ${action} while ${reason}.`, "warning"); } catch { /* best effort */ }
 		return true;
 	};
 
@@ -689,11 +883,27 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		flushWebTasks();
 	});
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
 		shuttingDown = false;
 		completionQueue.setParentActive(false);
-		plan = reconstructTaskPlan(ctx.sessionManager.getBranch() as any[]);
+		const branch = ctx.sessionManager.getBranch() as any[];
+		plan = reconstructTaskPlan(branch);
+		const wakeState = reconstructWakeOutbox(branch);
+		pendingWakeRuns.clear();
+		knownWakeRunIds.clear();
+		awaitingWakeMessageStart.clear();
+		activeWakeRunIds.clear();
+		activeWakeResponded = false;
+		runs.clear();
+		for (const runId of wakeState.knownRunIds) knownWakeRunIds.add(runId);
+		for (const run of wakeState.pending.values()) {
+			recordPendingWake(run, false);
+			runs.set(run.id, run);
+		}
+		for (const runId of wakeState.implicitlyAcknowledged) appendWakeMarker(acknowledgedWakeMarker(runId));
+		await recoverDurableRuns(ctx);
+		for (const run of pendingWakeRuns.values()) completionQueue.enqueue({ id: run.id, run });
 		updateUi();
 		void startWebActivity(ctx);
 	});
@@ -702,7 +912,29 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		completionQueue.setParentActive(true);
 	});
 
-	pi.on("agent_end", () => {
+	pi.on("message_start", (event) => {
+		if (event.message.role !== "custom" || event.message.customType !== "background-task-completion") return;
+		const details = event.message.details as CompletionBatchDetails | undefined;
+		if (!details?.wakeRunIds) return;
+		if (activeWakeRunIds.size === 0) activeWakeResponded = false;
+		for (const runId of details.wakeRunIds) {
+			if (!pendingWakeRuns.has(runId)) continue;
+			awaitingWakeMessageStart.delete(runId);
+			activeWakeRunIds.add(runId);
+		}
+	});
+
+	pi.on("message_end", (event) => {
+		if (activeWakeRunIds.size === 0 || event.message.role !== "assistant") return;
+		if (event.message.stopReason !== "error" && event.message.stopReason !== "aborted") activeWakeResponded = true;
+	});
+
+	pi.on("agent_settled", () => {
+		if (activeWakeResponded && activeWakeRunIds.size > 0) {
+			acknowledgeWakeRuns(activeWakeRunIds);
+			activeWakeRunIds.clear();
+			activeWakeResponded = false;
+		}
 		completionQueue.setParentActive(false);
 	});
 

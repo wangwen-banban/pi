@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -23,17 +23,19 @@ async function waitFor(predicate, message, timeoutMs = 2_000) {
 	assert.fail(message);
 }
 
-async function harness(t) {
-	const root = mkdtempSync(join(tmpdir(), "pi-background-extension-"));
-	t.after(() => rmSync(root, { recursive: true, force: true }));
-	const wrapperPath = join(root, "background-test-wrapper.ts");
+let harnessSequence = 0;
+
+async function harness(t, options = {}) {
+	const root = options.root ?? mkdtempSync(join(tmpdir(), "pi-background-extension-"));
+	if (!options.root) t.after(() => rmSync(root, { recursive: true, force: true }));
+	const wrapperPath = join(root, `background-test-wrapper-${++harnessSequence}.ts`);
 	writeFileSync(wrapperPath, [
 		`import { createBackgroundTasksExtension } from ${JSON.stringify(extensionIndexPath)};`,
 		`export default createBackgroundTasksExtension({ runsDir: ${JSON.stringify(join(root, "runs"))}, completionDebounceMs: 0, completedTaskHoldMs: 30 });`,
 		"",
 	].join("\n"));
 
-	const entries = [];
+	const entries = options.entries ?? [];
 	const messages = [];
 	const lifecycle = [];
 	const notifications = [];
@@ -58,7 +60,7 @@ async function harness(t) {
 		mode: "tui",
 		hasUI: false,
 		sessionManager: {
-			getSessionId: () => "session-test",
+			getSessionId: () => options.sessionId ?? "session-test",
 			getBranch: () => entries,
 		},
 		ui: {
@@ -131,6 +133,8 @@ test("dynamic prompt updates survive a running command and completion wakes the 
 	);
 	assert.equal(h.messages.length, 0, "completion must wait while the parent agent is active");
 	await h.fire("agent_end");
+	assert.equal(h.messages.length, 0, "low-level agent_end may still retry and is not a safe wake boundary");
+	await h.fire("agent_settled");
 	await waitFor(() => h.messages.length === 1, "main-agent wake was not delivered");
 	const wake = h.messages[0];
 	assert.equal(wake.options.triggerTurn, true);
@@ -176,6 +180,7 @@ test("non-zero exit also wakes the main agent and marks the linked task failed",
 	}, h.ctx);
 	await waitFor(() => h.lifecycle.some((event) => event.event === "background-task:failed"), "failure hook missing");
 	await h.fire("agent_end");
+	await h.fire("agent_settled");
 	await waitFor(() => h.messages.length === 1, "failure did not wake main agent");
 	assert.match(h.messages[0].message.content, /Background task failed/);
 	assert.match(h.messages[0].message.content, /compile failed/);
@@ -206,6 +211,13 @@ test("active background task blocks branch changes and shutdown marks it blocked
 	assert.equal(h.messages.length, 0);
 	const latestPlan = [...h.entries].reverse().find((entry) => entry.customType === "background-task-plan-v1").data;
 	assert.equal(latestPlan.tasks[0].status, "blocked");
+	const resumed = await harness(t, { root: h.root, entries: h.entries });
+	await resumed.fire("session_start", { reason: "reload" });
+	await sleep(30);
+	assert.equal(resumed.messages.length, 0, "intentional shutdown results must not be replayed as completions");
+	const resumedPlan = [...h.entries].reverse().find((entry) => entry.customType === "background-task-plan-v1").data;
+	assert.equal(resumedPlan.revision, latestPlan.revision, "blocked shutdown result must not be re-finalized on every restart");
+	await resumed.fire("session_shutdown", { reason: "quit" });
 });
 
 test("TUI widget keeps pending, in-progress and completed work visible", async (t) => {
@@ -284,5 +296,162 @@ test("system prompt always carries the latest dynamic revision", async (t) => {
 	assert.match(result.systemPrompt, /^BASE/);
 	assert.match(result.systemPrompt, /Task plan revision 1/);
 	assert.match(result.systemPrompt, /User prompts may change scope/);
+	await h.fire("session_shutdown", { reason: "quit" });
+});
+
+test("durable terminal wake replays after restart, uses the latest plan revision, and acknowledges exactly once", async (t) => {
+	const previousWeb = process.env.PI_WEB_SESSION;
+	process.env.PI_WEB_SESSION = "0";
+	t.after(() => {
+		if (previousWeb === undefined) delete process.env.PI_WEB_SESSION;
+		else process.env.PI_WEB_SESSION = previousWeb;
+	});
+	const root = mkdtempSync(join(tmpdir(), "pi-background-restart-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const runId = "bg-recovered-1";
+	const runDir = join(root, "runs", "session-test", runId);
+	const resultPath = join(runDir, "result.json");
+	mkdirSync(runDir, { recursive: true });
+	writeFileSync(resultPath, `${JSON.stringify({
+		recordVersion: 2,
+		id: runId,
+		taskId: "benchmark",
+		name: "benchmark",
+		status: "completed",
+		cwd: root,
+		createdAt: 10,
+		startedAt: 10,
+		finishedAt: 20,
+		timeoutAt: 10_000,
+		exitCode: 0,
+		terminationReason: "completed",
+		stdoutTail: "recovered score=42",
+		stderrTail: "",
+		stdoutPath: join(runDir, "stdout.log"),
+		stderrPath: join(runDir, "stderr.log"),
+		resultPath,
+		logTruncated: false,
+	})}\n`);
+	const entries = [{
+		type: "custom",
+		customType: "background-task-plan-v1",
+		data: {
+			version: 1,
+			revision: 7,
+			reason: "running before crash",
+			updatedAt: 10,
+			tasks: [
+				{ id: "benchmark", title: "Benchmark", status: "in_progress", updatedAt: 10, runId },
+				{ id: "analyze", title: "Analyze", status: "pending", updatedAt: 10 },
+				{ id: "report", title: "Report", status: "pending", updatedAt: 10 },
+			],
+		},
+	}];
+
+	const first = await harness(t, { root, entries });
+	await first.fire("session_start", { reason: "startup" });
+	await waitFor(() => first.messages.length === 1, "recovered terminal result did not wake");
+	assert.deepEqual(first.messages[0].message.details.wakeRunIds, [runId]);
+	assert.equal(first.messages[0].message.details.plan.revision, 8);
+	assert.equal(first.messages[0].message.details.plan.tasks[0].status, "completed");
+	assert.match(first.messages[0].message.content, /recovered score=42/);
+
+	// A user revision can race the not-yet-acknowledged wake. Replay must use
+	// this newest current-goal order rather than the completion-time order.
+	const revised = await execute(first.tools.get("update_task_plan"), {
+		baseRevision: 8,
+		explanation: "publish before analysis",
+		tasks: [
+			{ id: "report", title: "Report first", status: "pending" },
+			{ id: "analyze", title: "Analyze second", status: "pending" },
+		],
+	}, first.ctx);
+	assert.equal(revised.details.plan.revision, 9);
+	await first.fire("session_shutdown", { reason: "reload" });
+
+	const second = await harness(t, { root, entries });
+	await second.fire("session_start", { reason: "reload" });
+	await waitFor(() => second.messages.length === 1, "pending durable wake was not replayed");
+	assert.deepEqual(second.messages[0].message.details.wakeRunIds, [runId]);
+	assert.equal(second.messages[0].message.details.plan.revision, 9);
+	assert.match(second.messages[0].message.content, /Next pending task from the latest revision: report/);
+
+	// An unrelated successful turn cannot acknowledge a fire-and-forget send
+	// that never reached message_start.
+	await second.fire("agent_start");
+	await second.fire("message_end", { message: { role: "assistant", stopReason: "stop", content: [] } });
+	await second.fire("agent_end", { messages: [] });
+	await second.fire("agent_settled");
+	assert.equal(entries.some((entry) => entry.customType === "background-task-wake-v1" && entry.data?.state === "acknowledged"), false);
+
+	await second.fire("agent_start");
+	await second.fire("message_start", { message: { role: "custom", ...second.messages[0].message } });
+	await second.fire("message_end", { message: { role: "assistant", stopReason: "stop", content: [] } });
+	await second.fire("agent_end", { messages: [] });
+	await second.fire("agent_settled");
+	assert.equal(entries.filter((entry) => entry.customType === "background-task-wake-v1" && entry.data?.state === "acknowledged").length, 1);
+	await second.fire("session_shutdown", { reason: "reload" });
+
+	const third = await harness(t, { root, entries });
+	await third.fire("session_start", { reason: "reload" });
+	await sleep(50);
+	assert.equal(third.messages.length, 0, "acknowledged wake must not be delivered again");
+	await third.fire("session_shutdown", { reason: "quit" });
+});
+
+test("restart without a terminal result fails closed instead of leaving an orphaned plan in progress", async (t) => {
+	const previousWeb = process.env.PI_WEB_SESSION;
+	process.env.PI_WEB_SESSION = "0";
+	t.after(() => {
+		if (previousWeb === undefined) delete process.env.PI_WEB_SESSION;
+		else process.env.PI_WEB_SESSION = previousWeb;
+	});
+	const entries = [{
+		type: "custom",
+		customType: "background-task-plan-v1",
+		data: {
+			version: 1,
+			revision: 3,
+			reason: "runtime disappeared",
+			updatedAt: 10,
+			tasks: [{ id: "remote", title: "Watch remote work", status: "in_progress", updatedAt: 10, runId: "bg-lost-owner" }],
+		},
+	}];
+	const h = await harness(t, { entries });
+	await h.fire("session_start", { reason: "startup" });
+	await waitFor(() => h.messages.length === 1, "lost monitor ownership did not wake recovery");
+	const recovered = h.messages[0].message.details.runs[0];
+	assert.equal(recovered.status, "failed");
+	assert.equal(recovered.terminationReason, "monitor_restarted");
+	assert.match(recovered.error, /cannot be safely reattached/);
+	assert.equal(h.messages[0].message.details.plan.tasks[0].status, "failed");
+	await h.fire("session_shutdown", { reason: "quit" });
+});
+
+test("explicit stop reaches a terminal state and uses the ordinary durable wake path", async (t) => {
+	const previousWeb = process.env.PI_WEB_SESSION;
+	process.env.PI_WEB_SESSION = "0";
+	t.after(() => {
+		if (previousWeb === undefined) delete process.env.PI_WEB_SESSION;
+		else process.env.PI_WEB_SESSION = previousWeb;
+	});
+	const h = await harness(t);
+	await h.fire("session_start", { reason: "startup" });
+	await execute(h.tools.get("update_task_plan"), {
+		baseRevision: 0,
+		tasks: [{ id: "watch", title: "Watch", status: "pending" }],
+	}, h.ctx);
+	await h.fire("agent_start");
+	await execute(h.tools.get("run_background_task"), {
+		taskId: "watch",
+		command: "while :; do sleep 1; done",
+	}, h.ctx);
+	await execute(h.tools.get("stop_background_task"), { id: "watch" }, h.ctx);
+	await waitFor(() => h.lifecycle.some((event) => event.event === "background-task:stopped"), "stop did not become terminal");
+	await h.fire("agent_end", { messages: [] });
+	await h.fire("agent_settled");
+	await waitFor(() => h.messages.length === 1, "explicit stop did not wake");
+	assert.equal(h.messages[0].message.details.runs[0].terminationReason, "explicit_stop");
+	assert.equal(h.messages[0].message.details.plan.tasks[0].status, "cancelled");
 	await h.fire("session_shutdown", { reason: "quit" });
 });

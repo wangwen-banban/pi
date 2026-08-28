@@ -16,8 +16,8 @@ function unref(handle: unknown): void {
 
 /**
  * Coalesces background completions into one main-agent wake. While the parent
- * is inside an agent turn, completions remain queued and flush only after the
- * next safe agent_end boundary.
+ * is inside an agent run, completions remain queued until the owner reports a
+ * fully settled boundary (after retries and queued continuations).
  */
 export function createCompletionQueue<T extends { id: string }>(options: {
 	onFlush: (items: T[]) => void;

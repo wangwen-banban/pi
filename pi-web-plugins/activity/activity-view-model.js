@@ -185,6 +185,9 @@ function backgroundRunView(run, runtimeStatus) {
     exitCode: run.exitCode ?? null,
     signal: boundStr(run.signal),
     terminationReason: boundStr(run.terminationReason),
+    healthStatus: boundStr(run.healthStatus),
+    healthFailure: boundStr(run.healthFailure),
+    healthDeadlineAt: run.healthDeadlineAt ?? null,
     canStop: false,
   };
 }
