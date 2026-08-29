@@ -18,6 +18,7 @@
 - [x] 最终验收 — diff/credential scan、rewind 6/6、smart 23/23、history 9/9、两个 package patch check 全过。
 - [x] Claude 风格 Plan Mode — 收窄自动触发、取消固定双确认、enter sequential、inactive exit 无 UI；独立 QA PASS，0 blocker/major。
 - [x] Background Tasks PR #1 — 保留 health/recovery，修复 durable 隐私、wake ack/retry、symlink 与 TERM→KILL 真实性；最终 gate 0 blocker/major。
+- [x] Activity widget 稳定顺序 — 共享 stack 固定 Tasks→Sub Agents；独立 QA 156/156，0 blocker/major/minor。
 
 ## 失败/搁置
 - [ ] `codex_rewind_semantics` — runtime 中断，仅留 context.md。

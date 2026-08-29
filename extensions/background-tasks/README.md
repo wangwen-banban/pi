@@ -164,10 +164,13 @@ longer materially affect the next analysis, retry, verification, or decision;
 omitted non-active tasks disappear from the latest marker, system prompt,
 `/tasks`, and PI WEB projection. An active managed run can never be omitted.
 Terminal tasks kept because they remain relevant stay in the compact TUI/PI WEB
-display briefly (completed rows age out visually after 60 seconds). The
-append-only transcript and bounded completion message retain the model-facing
-audit trail. The PI WEB Activity panel reads a privacy-trimmed record and shows
-task ids/statuses plus managed-run timing.
+display briefly (completed rows age out visually after 60 seconds). In the TUI,
+Tasks shares one editor-above activity stack with Smart Sub Agents: Tasks is
+always first and Sub Agents follows immediately, regardless of which extension
+refreshes most recently. Each section retains its independent 10-line widget
+limit and truncation notice. The append-only transcript and bounded completion
+message retain the model-facing audit trail. The PI WEB Activity panel reads a
+privacy-trimmed record and shows task ids/statuses plus managed-run timing.
 
 ## Storage and privacy
 

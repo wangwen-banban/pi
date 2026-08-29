@@ -15,3 +15,4 @@
 2026-08-29 | Claude 风格 Plan Mode 实施与独立 QA | PASS：24/24 workflow、79/79 分类、91/91 对抗；0 blocker/major，1 minor 覆盖缺口。
 2026-08-29 | Background Tasks PR #1 双重审计 | 原 PR FAIL：隐私持久化、wake 误 ack/未持久化发送、TERM→KILL 假终态；转为兼容补丁。
 2026-08-29 | Background Tasks PR #1 最终 gate | PASS：75/75 background、313/313 Activity、24/24 Plan；0 blocker/major。
+2026-08-29 | Tasks/Sub Agents widget 顺序修复 | PASS：共享 aboveEditor stack 固定顺序；独立 QA 156/156，无 blocker/major/minor。

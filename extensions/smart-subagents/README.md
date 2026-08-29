@@ -12,6 +12,7 @@ Global pi extension for asynchronous, automatically routed sub-agents.
 - Shares the parent's working directory while keeping conversation context isolated.
 - Delivers completion immediately through lifecycle events and a visible `steer` message instead of polling. It enters at the next safe agent-loop boundary without aborting an in-flight response or tool call.
 - Shows the effective model, thinking level, context mode, permission, status, and a live duration in the TUI; active rows refresh once per second and completed rows disappear after 60 seconds.
+- Shares one stable editor-above activity stack with Background Tasks. Tasks is always above Sub Agents (with independent 10-line truncation), so timer refreshes cannot swap the two sections.
 - Enforces a configurable hard wall-clock timeout, with `SIGTERM` then bounded `SIGKILL` escalation.
 - Serializes write agents whose declared `writeScope` values overlap.
 

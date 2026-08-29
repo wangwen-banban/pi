@@ -27,3 +27,4 @@
 - 2026-08-29：本地 Plan Mode 高频触发根因是 `AGENTS.md` 与扩展 promptGuidelines 的重复宽泛策略，不是状态机定时自动进入。
 - 2026-08-29：PR #1 的 health/recovery 方向已兼容集成；durable run 使用严格 session-bound 最小 manifest，不持久化 command/task/cwd/output/path/PID，wake 采用显式 pending→delivery→ack 顺序与至少一次重试。
 - 2026-08-29：Background stop/timeout 只有 child `close` 后才确认终态；KILL 后未确认退出必须报告 `termination_unconfirmed`，不能伪装 stopped/timed_out。
+- 2026-08-29：Pi 0.84.1 `setWidget` 更新会 delete→set 并改变 Map 顺序；Tasks/Sub Agents 改用共享 aboveEditor stack，固定 Tasks 在上、Sub Agents 在下。

@@ -31,6 +31,11 @@ import {
 	ControlDispatcher,
 	WebActivityRegistry,
 } from "../web-activity/registry.ts";
+import {
+	createActivityWidgetOwner,
+	releaseActivityWidgetSection,
+	setActivityWidgetSection,
+} from "../shared/activity-widget-stack.ts";
 import { buildWebAgentsRecord, buildWebRuntimeRecord, isWebActivityStartCurrent } from "./web-record.ts";
 import {
 	applyFinalOutcome,
@@ -651,6 +656,7 @@ const DelegateParams = Type.Object({
 });
 
 export default function smartSubagents(pi: ExtensionAPI) {
+	const activityWidgetOwner = createActivityWidgetOwner("subagents");
 	const jobs = new Map<string, Job>();
 	const queue: string[] = [];
 	let latestCtx: ExtensionContext | undefined;
@@ -738,7 +744,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			return aFinal - bFinal || b.createdAt - a.createdAt;
 		});
 		if (all.length === 0) {
-			ctx.ui.setWidget("smart-subagents", undefined);
+			setActivityWidgetSection(ctx.ui, activityWidgetOwner);
 			ctx.ui.setStatus("smart-subagents", undefined);
 			return;
 		}
@@ -758,7 +764,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 				lines.push(`${child} selecting model, thinking and context...`);
 			}
 		});
-		ctx.ui.setWidget("smart-subagents", lines, { placement: "aboveEditor" });
+		setActivityWidgetSection(ctx.ui, activityWidgetOwner, lines);
 		const active = all.filter((job) => job.status === "running").length;
 		const queued = all.filter((job) => job.status === "queued" || job.status === "routing").length;
 		ctx.ui.setStatus(
@@ -1844,6 +1850,12 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		deferredCompletionMessages.splice(0);
 		parentAgentActive = false;
 		queue.splice(0, queue.length);
+		if (latestCtx?.hasUI) {
+			try {
+				releaseActivityWidgetSection(latestCtx.ui, activityWidgetOwner);
+				latestCtx.ui.setStatus("smart-subagents", undefined);
+			} catch { /* UI already gone */ }
+		}
 		await shutdownJobs(jobs.values(), {
 			markStopping(job) {
 				job.stopRequest = "shutdown";

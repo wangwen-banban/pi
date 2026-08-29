@@ -11,6 +11,11 @@ import { Type } from "typebox";
 import {
 	WebActivityRegistry,
 } from "../web-activity/registry.ts";
+import {
+	createActivityWidgetOwner,
+	releaseActivityWidgetSection,
+	setActivityWidgetSection,
+} from "../shared/activity-widget-stack.ts";
 import { createCompletionQueue } from "./completion-queue.ts";
 import {
 	validateBackgroundHealthPolicy,
@@ -349,6 +354,7 @@ export function createBackgroundTasksExtension(options: BackgroundTasksExtension
 }
 
 function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBackgroundTasksExtensionOptions) {
+	const activityWidgetOwner = createActivityWidgetOwner("tasks");
 	let plan = emptyTaskPlan();
 	let latestCtx: ExtensionContext | undefined;
 	let shuttingDown = false;
@@ -402,7 +408,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		const now = Date.now();
 		const compactTasks = visibleTaskPlanItems(plan, now, extensionOptions.completedTaskHoldMs);
 		if (compactTasks.length === 0) {
-			ctx.ui.setWidget("background-tasks", undefined);
+			setActivityWidgetSection(ctx.ui, activityWidgetOwner);
 			ctx.ui.setStatus("background-tasks", undefined);
 			return;
 		}
@@ -421,7 +427,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 			lines.push(`${icons[task.status]} ${task.id} · ${title}`);
 		}
 		if (compactTasks.length > visible.length) lines.push(`… ${compactTasks.length - visible.length} more · /tasks`);
-		ctx.ui.setWidget("background-tasks", lines, { placement: "aboveEditor" });
+		setActivityWidgetSection(ctx.ui, activityWidgetOwner, lines);
 		const active = activeRuns().length;
 		const pending = plan.tasks.filter((task) => task.status === "pending").length;
 		ctx.ui.setStatus(
@@ -1412,7 +1418,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		}
 		if (latestCtx?.hasUI) {
 			try {
-				latestCtx.ui.setWidget("background-tasks", undefined);
+				releaseActivityWidgetSection(latestCtx.ui, activityWidgetOwner);
 				latestCtx.ui.setStatus("background-tasks", undefined);
 			} catch { /* UI already gone */ }
 		}
