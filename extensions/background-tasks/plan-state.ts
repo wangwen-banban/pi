@@ -1,5 +1,7 @@
-export const TASK_PLAN_MARKER_TYPE = "background-task-plan-v1";
+export const LEGACY_TASK_PLAN_MARKER_TYPE = "background-task-plan-v1";
+export const TASK_PLAN_MARKER_TYPE = "background-task-plan-v2";
 export const TASK_PLAN_VERSION = 1;
+export const TASK_PLAN_MARKER_VERSION = 2;
 export const MAX_TASKS = 50;
 export const MAX_TASK_TITLE_CHARS = 240;
 export const COMPLETED_TASK_HOLD_MS = 60_000;
@@ -44,6 +46,21 @@ export interface TaskPlanBranchEntry {
 	customType?: unknown;
 	data?: unknown;
 }
+
+export interface DurableTaskPlanMarker {
+	version: typeof TASK_PLAN_MARKER_VERSION;
+	sessionId: string;
+	revision: number;
+	updatedAt: number;
+	tasks: Array<{
+		id: string;
+		status: TaskStatus;
+		updatedAt: number;
+		runId?: string;
+	}>;
+}
+
+const SAFE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 export function emptyTaskPlan(now = Date.now()): TaskPlan {
 	return {
@@ -119,12 +136,72 @@ export function parseStoredTaskPlan(value: unknown): TaskPlan | undefined {
 	};
 }
 
-export function reconstructTaskPlan(entries: TaskPlanBranchEntry[], now = Date.now()): TaskPlan {
+export function durableTaskPlanMarker(plan: TaskPlan, sessionId: string): DurableTaskPlanMarker {
+	if (!SAFE_SESSION_ID.test(sessionId)) throw new Error("secure session binding unavailable");
+	return {
+		version: TASK_PLAN_MARKER_VERSION,
+		sessionId,
+		revision: plan.revision,
+		updatedAt: plan.updatedAt,
+		tasks: plan.tasks.map((task) => ({
+			id: task.id,
+			status: task.status,
+			updatedAt: task.updatedAt,
+			...(task.runId ? { runId: task.runId } : {}),
+		})),
+	};
+}
+
+export function parseDurableTaskPlanMarker(value: unknown, sessionId: string): TaskPlan | undefined {
+	if (!SAFE_SESSION_ID.test(sessionId) || !isRecord(value)) return undefined;
+	const allowed = new Set(["version", "sessionId", "revision", "updatedAt", "tasks"]);
+	if (Object.keys(value).some((key) => !allowed.has(key))) return undefined;
+	if (value.version !== TASK_PLAN_MARKER_VERSION || value.sessionId !== sessionId) return undefined;
+	if (typeof value.revision !== "number" || !Number.isSafeInteger(value.revision) || value.revision < 0) return undefined;
+	if (typeof value.updatedAt !== "number" || !Number.isSafeInteger(value.updatedAt) || value.updatedAt < 0) return undefined;
+	if (!Array.isArray(value.tasks) || value.tasks.length > MAX_TASKS) return undefined;
+	const ids = new Set<string>();
+	const tasks: TaskPlanItem[] = [];
+	for (const raw of value.tasks) {
+		if (!isRecord(raw)) return undefined;
+		const taskKeys = new Set(["id", "status", "updatedAt", "runId"]);
+		if (Object.keys(raw).some((key) => !taskKeys.has(key))) return undefined;
+		if (typeof raw.id !== "string" || !SAFE_TASK_ID.test(raw.id) || ids.has(raw.id)) return undefined;
+		if (!isTaskStatus(raw.status)) return undefined;
+		if (typeof raw.updatedAt !== "number" || !Number.isSafeInteger(raw.updatedAt) || raw.updatedAt < 0) return undefined;
+		if (raw.runId !== undefined && (typeof raw.runId !== "string" || !SAFE_TASK_ID.test(raw.runId))) return undefined;
+		ids.add(raw.id);
+		tasks.push({
+			id: raw.id,
+			// Human task text and result summaries are live/session-message data, not
+			// durable extension markers. The stable id is the recovery-safe label.
+			title: raw.id,
+			status: raw.status,
+			updatedAt: raw.updatedAt,
+			...(raw.runId === undefined ? {} : { runId: raw.runId }),
+		});
+	}
+	return {
+		version: TASK_PLAN_VERSION,
+		revision: value.revision,
+		reason: "",
+		updatedAt: value.updatedAt,
+		tasks,
+	};
+}
+
+export function reconstructTaskPlan(entries: TaskPlanBranchEntry[], now = Date.now(), sessionId?: string): TaskPlan {
 	for (let index = entries.length - 1; index >= 0; index -= 1) {
 		const entry = entries[index];
-		if (!entry || entry.type !== "custom" || entry.customType !== TASK_PLAN_MARKER_TYPE) continue;
-		const parsed = parseStoredTaskPlan(entry.data);
-		if (parsed) return parsed;
+		if (!entry || entry.type !== "custom") continue;
+		if (entry.customType === TASK_PLAN_MARKER_TYPE) {
+			if (!sessionId) return emptyTaskPlan(now);
+			return parseDurableTaskPlanMarker(entry.data, sessionId) ?? emptyTaskPlan(now);
+		}
+		if (entry.customType === LEGACY_TASK_PLAN_MARKER_TYPE) {
+			const parsed = parseStoredTaskPlan(entry.data);
+			if (parsed) return parsed;
+		}
 	}
 	return emptyTaskPlan(now);
 }
@@ -261,6 +338,27 @@ export function finishTaskRun(
 		updatedAt: now,
 		tasks: current.tasks.map((candidate) => candidate.id === taskId
 			? { ...candidate, status, result: boundedResult(result), updatedAt: now }
+			: candidate),
+	};
+}
+
+export function blockTaskRecovery(
+	current: TaskPlan,
+	taskId: string,
+	runId: string,
+	result = "secure recovery blocked",
+	now = Date.now(),
+): TaskPlan {
+	const task = current.tasks.find((candidate) => candidate.id === taskId);
+	if (!task || task.runId !== runId) throw new Error(`run identity mismatch for task ${taskId}`);
+	if (task.status === "blocked" && task.result === boundedResult(result)) return current;
+	return {
+		version: TASK_PLAN_VERSION,
+		revision: current.revision + 1,
+		reason: `Background task ${taskId} recovery blocked`,
+		updatedAt: now,
+		tasks: current.tasks.map((candidate) => candidate.id === taskId
+			? { ...candidate, status: "blocked" as const, result: boundedResult(result), updatedAt: now }
 			: candidate),
 	};
 }

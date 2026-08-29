@@ -1,5 +1,4 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -22,7 +21,9 @@ import {
 	TASK_PLAN_MARKER_TYPE,
 	TASK_STATUSES,
 	attachRunToTask,
+	blockTaskRecovery,
 	clearCompletedTaskHistory,
+	durableTaskPlanMarker,
 	emptyTaskPlan,
 	finishTaskRun,
 	nextPendingTask,
@@ -40,16 +41,27 @@ import {
 	type BackgroundRunController,
 	type BackgroundRunSnapshot,
 } from "./runner.ts";
-import { parseTerminalBackgroundRunSnapshot } from "./run-persistence.ts";
+import {
+	SAFE_SESSION_ID,
+	readTerminalRunManifest,
+	snapshotFromTerminalManifest,
+	terminalManifestFromSnapshot,
+	type TerminalManifestFailureCode,
+	type TerminalRunManifest,
+} from "./run-persistence.ts";
 import {
 	BACKGROUND_WAKE_MARKER_TYPE,
 	acknowledgedWakeMarker,
+	deliveryWakeMarker,
 	pendingWakeMarker,
 	reconstructWakeOutbox,
+	type DeliveryBackgroundWakeMarker,
+	type WakeDeliveryItem,
 } from "./wake-state.ts";
 import {
 	buildBackgroundRuntimeRecord,
 	buildBackgroundTasksRecord,
+	writeBackgroundWebRecord,
 } from "./web-record.ts";
 
 const DEFAULT_RUNS_DIR = path.join(getAgentDir(), "background-task-runs");
@@ -59,8 +71,11 @@ const MAX_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
 const MIN_HEALTH_WINDOW_MS = 1_000;
 const MAX_HEALTH_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const TERMINATE_GRACE_MS = 5_000;
-const MAX_LOG_BYTES = 32 * 1024 * 1024;
+const KILL_CONFIRM_MS = 5_000;
 const MAX_TAIL_BYTES = 32 * 1024;
+const WAKE_WATCHDOG_MS = 30_000;
+const WAKE_RETRY_BASE_MS = 500;
+const WAKE_RETRY_MAX_MS = 30_000;
 const COMPLETION_OUTPUT_BYTES = 12 * 1024;
 const MAX_COMMAND_CHARS = 32 * 1024;
 const MAX_RECENT_RUNS = 50;
@@ -120,8 +135,18 @@ interface UpdatePlanDetails {
 }
 
 interface RunDetails {
-	run: BackgroundRunSnapshot;
-	plan: TaskPlan;
+	run: {
+		id: string;
+		taskId: string;
+		name: string;
+		status: BackgroundRunSnapshot["status"];
+		createdAt: number;
+		startedAt: number;
+		timeoutAt: number;
+		healthStatus?: BackgroundRunSnapshot["healthStatus"];
+		healthDeadlineAt?: number;
+	};
+	planRevision: number;
 }
 
 interface CompletionNotice {
@@ -129,10 +154,45 @@ interface CompletionNotice {
 	run: BackgroundRunSnapshot;
 }
 
+interface CompletionRunDetails {
+	id: string;
+	taskId: string;
+	name: string;
+	status: BackgroundRunSnapshot["status"];
+	startedAt: number;
+	finishedAt?: number;
+	terminationReason?: BackgroundRunSnapshot["terminationReason"];
+}
+
 interface CompletionBatchDetails {
-	runs: BackgroundRunSnapshot[];
-	plan: TaskPlan;
-	wakeRunIds: string[];
+	runs: CompletionRunDetails[];
+	planRevision: number;
+	nextTaskId?: string;
+	wake: {
+		sessionId: string;
+		deliveryId: string;
+		attempt: number;
+		items: WakeDeliveryItem[];
+	};
+}
+
+interface PendingWakeState {
+	run: BackgroundRunSnapshot;
+	terminal: TerminalRunManifest;
+	sequence: number;
+	pendingPersisted: boolean;
+	planPersisted: boolean;
+}
+
+interface ActiveWakeDelivery {
+	marker: DeliveryBackgroundWakeMarker;
+	notices: CompletionNotice[];
+	sentAgentGeneration: number;
+	boundAgentGeneration?: number;
+	messageStarted: boolean;
+	successfulStop: boolean;
+	failedResponse: boolean;
+	watchdog: ReturnType<typeof setTimeout>;
 }
 
 function safeRunName(value: string): string {
@@ -188,7 +248,24 @@ function resultSummary(run: BackgroundRunSnapshot): string {
 	return run.error || (run.signal ? `signal ${run.signal}` : `exit ${run.exitCode ?? "unknown"}`);
 }
 
-function runDuration(run: BackgroundRunSnapshot): string {
+function runDetails(run: BackgroundRunSnapshot, planRevision: number): RunDetails {
+	return {
+		run: {
+			id: run.id,
+			taskId: run.taskId,
+			name: run.taskId,
+			status: run.status,
+			createdAt: run.createdAt,
+			startedAt: run.startedAt,
+			timeoutAt: run.timeoutAt,
+			...(run.healthStatus === undefined ? {} : { healthStatus: run.healthStatus }),
+			...(run.healthDeadlineAt === undefined ? {} : { healthDeadlineAt: run.healthDeadlineAt }),
+		},
+		planRevision,
+	};
+}
+
+function runDuration(run: BackgroundRunSnapshot | CompletionRunDetails): string {
 	const end = run.finishedAt ?? Date.now();
 	const seconds = Math.max(0, Math.round((end - run.startedAt) / 1000));
 	if (seconds < 60) return `${seconds}s`;
@@ -214,11 +291,32 @@ function runShouldWake(run: BackgroundRunSnapshot): boolean {
 	return run.terminationReason !== "session_shutdown" && run.stopReason !== "shutdown";
 }
 
+export interface WakeRetryScheduler {
+	setTimeout(callback: () => void, delayMs: number): unknown;
+	clearTimeout(handle: unknown): void;
+}
+
+const nativeWakeRetryScheduler: WakeRetryScheduler = {
+	setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+	clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
+function unrefTimer(handle: unknown): void {
+	if (handle && typeof handle === "object" && "unref" in handle) {
+		(handle as { unref?: () => void }).unref?.();
+	}
+}
+
 export interface BackgroundTasksExtensionOptions {
 	runsDir?: string;
 	startRun?: typeof startManagedBackgroundRun;
 	completionDebounceMs?: number;
 	completedTaskHoldMs?: number;
+	wakeWatchdogMs?: number;
+	wakeRetryBaseMs?: number;
+	wakeRetryMaxMs?: number;
+	wakeRetryScheduler?: WakeRetryScheduler;
+	killConfirmMs?: number;
 }
 
 type ResolvedBackgroundTasksExtensionOptions = Required<BackgroundTasksExtensionOptions>;
@@ -231,6 +329,19 @@ export function createBackgroundTasksExtension(options: BackgroundTasksExtension
 		completedTaskHoldMs: Number.isFinite(options.completedTaskHoldMs)
 			? Math.max(0, Math.floor(options.completedTaskHoldMs!))
 			: COMPLETED_TASK_HOLD_MS,
+		wakeWatchdogMs: Number.isFinite(options.wakeWatchdogMs)
+			? Math.max(1, Math.floor(options.wakeWatchdogMs!))
+			: WAKE_WATCHDOG_MS,
+		wakeRetryBaseMs: Number.isFinite(options.wakeRetryBaseMs)
+			? Math.max(1, Math.floor(options.wakeRetryBaseMs!))
+			: WAKE_RETRY_BASE_MS,
+		wakeRetryMaxMs: Number.isFinite(options.wakeRetryMaxMs)
+			? Math.max(1, Math.floor(options.wakeRetryMaxMs!))
+			: WAKE_RETRY_MAX_MS,
+		wakeRetryScheduler: options.wakeRetryScheduler ?? nativeWakeRetryScheduler,
+		killConfirmMs: Number.isFinite(options.killConfirmMs)
+			? Math.max(1, Math.floor(options.killConfirmMs!))
+			: KILL_CONFIRM_MS,
 	};
 	return function backgroundTasks(pi: ExtensionAPI) {
 		registerBackgroundTasks(pi, resolved);
@@ -241,15 +352,22 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 	let plan = emptyTaskPlan();
 	let latestCtx: ExtensionContext | undefined;
 	let shuttingDown = false;
-	let sequence = 0;
+	let branchChanging = false;
+	let boundSessionId = "";
+	let sessionEpoch = 0;
+	let agentGeneration = 0;
+	let nextWakeSequence = 1;
+	let nextWakeAttempt = 1;
+	let wakeRetryRound = 0;
+	let wakeRetryTimer: { handle: unknown } | undefined;
+	let lastWakeDiagnosticAt = 0;
+	let activeWakeDelivery: ActiveWakeDelivery | undefined;
 	const controllers = new Map<string, BackgroundRunController>();
 	const runs = new Map<string, BackgroundRunSnapshot>();
 	const lastProgressEventAt = new Map<string, number>();
-	const pendingWakeRuns = new Map<string, BackgroundRunSnapshot>();
+	const pendingWakes = new Map<string, PendingWakeState>();
+	const acknowledgedWakeTerminals = new Map<string, TerminalRunManifest>();
 	const knownWakeRunIds = new Set<string>();
-	const awaitingWakeMessageStart = new Set<string>();
-	const activeWakeRunIds = new Set<string>();
-	let activeWakeResponded = false;
 
 	let webRegistry: WebActivityRegistry | undefined;
 	let webRuntimeId = "";
@@ -258,10 +376,11 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 	let webEpoch = 0;
 	let webHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	let lastWebProgressFlushAt = 0;
+	let webWriteChain: Promise<boolean> = Promise.resolve(true);
 	let webDirty = false;
 	let uiExpiryTimer: ReturnType<typeof setTimeout> | undefined;
 
-	const currentSessionId = () => latestCtx?.sessionManager.getSessionId() ?? "";
+	const currentSessionId = () => boundSessionId;
 	const activeRuns = () => [...runs.values()].filter(runIsActive);
 
 	const pruneRuns = () => {
@@ -330,15 +449,32 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		generation: webGeneration,
 	});
 
+	const enqueueWebWrite = (
+		registry: WebActivityRegistry,
+		name: "runtime" | "background-tasks",
+		record: Record<string, unknown>,
+	): Promise<boolean> => {
+		const write = webWriteChain.then(() => writeBackgroundWebRecord(
+			registry.root,
+			registry.worktreeRoot,
+			name,
+			record,
+		));
+		webWriteChain = write.catch(() => false);
+		return write;
+	};
+
 	const flushWebTasks = (): Promise<boolean> | undefined => {
 		webDirty = false;
-		if (!webRegistry || !latestCtx) return undefined;
-		return webRegistry.write("background-tasks", buildBackgroundTasksRecord(plan, [...runs.values()], webIdentity()));
+		const registry = webRegistry;
+		if (!registry || !latestCtx) return undefined;
+		return enqueueWebWrite(registry, "background-tasks", buildBackgroundTasksRecord(plan, [...runs.values()], webIdentity()));
 	};
 
 	const flushWebRuntime = (state: "active" | "shutdown" = "active"): Promise<boolean> | undefined => {
-		if (!webRegistry || !latestCtx) return undefined;
-		return webRegistry.write("runtime", buildBackgroundRuntimeRecord(
+		const registry = webRegistry;
+		if (!registry || !latestCtx) return undefined;
+		return enqueueWebWrite(registry, "runtime", buildBackgroundRuntimeRecord(
 			webIdentity(),
 			state,
 			{ startedAt: webStartedAt, total: runs.size, active: activeRuns().length },
@@ -379,10 +515,25 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		flushWebTasks();
 	};
 
-	const persistPlan = () => {
-		try { pi.appendEntry(TASK_PLAN_MARKER_TYPE, plan); } catch { /* stale session during teardown */ }
+	const notifyWakeDiagnostic = (message: string) => {
+		const now = Date.now();
+		if (now - lastWakeDiagnosticAt < 5_000) return;
+		lastWakeDiagnosticAt = now;
+		try { latestCtx?.ui.notify(message.slice(0, 240), "error"); } catch { /* bounded observation */ }
+	};
+
+	const persistPlan = (): boolean => {
+		let persisted = false;
+		try {
+			if (!SAFE_SESSION_ID.test(boundSessionId)) throw new Error("invalid session binding");
+			pi.appendEntry(TASK_PLAN_MARKER_TYPE, durableTaskPlanMarker(plan, boundSessionId));
+			persisted = true;
+		} catch {
+			notifyWakeDiagnostic("Background task state could not be securely persisted; delivery remains blocked and will retry.");
+		}
 		updateUi();
 		flushWebTasks();
+		return persisted;
 	};
 
 	const emitLifecycle = (event: "started" | "progress" | "completed" | "failed" | "stopped", run: BackgroundRunSnapshot) => {
@@ -398,53 +549,140 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		}
 	};
 
-	const appendWakeMarker = (marker: ReturnType<typeof pendingWakeMarker> | ReturnType<typeof acknowledgedWakeMarker>): boolean => {
+	type WakeMarker = ReturnType<typeof pendingWakeMarker>
+		| ReturnType<typeof deliveryWakeMarker>
+		| ReturnType<typeof acknowledgedWakeMarker>;
+	const appendWakeMarker = (marker: WakeMarker): boolean => {
+		if (shuttingDown || marker.sessionId !== boundSessionId) return false;
 		try {
 			pi.appendEntry(BACKGROUND_WAKE_MARKER_TYPE, marker);
 			return true;
-		} catch (error) {
-			try { latestCtx?.ui.notify(`Could not persist background wake state: ${error instanceof Error ? error.message : String(error)}`, "error"); } catch { /* best effort */ }
+		} catch {
+			notifyWakeDiagnostic("Background completion state could not be securely persisted; no wake was sent and retry remains pending.");
 			return false;
 		}
 	};
 
-	const recordPendingWake = (run: BackgroundRunSnapshot, persist = true): boolean => {
-		if (run.status === "running" || pendingWakeRuns.has(run.id)) return false;
-		const persisted = !persist || appendWakeMarker(pendingWakeMarker(run));
-		knownWakeRunIds.add(run.id);
-		pendingWakeRuns.set(run.id, { ...run });
-		return persisted;
+	const clearWakeRetryTimer = () => {
+		if (wakeRetryTimer !== undefined) extensionOptions.wakeRetryScheduler.clearTimeout(wakeRetryTimer.handle);
+		wakeRetryTimer = undefined;
 	};
 
-	const acknowledgeWakeRuns = (runIds: Iterable<string>) => {
-		for (const runId of runIds) {
-			if (!pendingWakeRuns.has(runId)) continue;
-			if (!appendWakeMarker(acknowledgedWakeMarker(runId))) continue;
-			pendingWakeRuns.delete(runId);
-			knownWakeRunIds.add(runId);
+	const recordPendingWake = (
+		run: BackgroundRunSnapshot,
+		options: { terminal?: TerminalRunManifest; restored?: boolean; sequence?: number; planPersisted?: boolean; replace?: boolean } = {},
+	): PendingWakeState | undefined => {
+		if (run.status === "running" || shuttingDown || !SAFE_SESSION_ID.test(boundSessionId)) return undefined;
+		if (pendingWakes.has(run.id) && !options.replace) return pendingWakes.get(run.id);
+		let terminal: TerminalRunManifest;
+		try { terminal = options.terminal ?? terminalManifestFromSnapshot(run, boundSessionId); } catch { return undefined; }
+		const state: PendingWakeState = {
+			run: { ...run },
+			terminal,
+			sequence: options.sequence ?? nextWakeSequence++,
+			pendingPersisted: Boolean(options.restored),
+			planPersisted: options.planPersisted ?? Boolean(options.restored),
+		};
+		knownWakeRunIds.add(run.id);
+		pendingWakes.set(run.id, state);
+		return state;
+	};
+
+	let completionQueue: ReturnType<typeof createCompletionQueue<CompletionNotice>>;
+
+	const scheduleWakeRetry = () => {
+		if (shuttingDown || wakeRetryTimer !== undefined || pendingWakes.size === 0) return;
+		completionQueue?.setParentActive(true);
+		const exponent = wakeRetryRound++;
+		const delay = Math.min(extensionOptions.wakeRetryMaxMs, extensionOptions.wakeRetryBaseMs * (2 ** exponent));
+		const epoch = sessionEpoch;
+		const scheduled = { handle: undefined as unknown };
+		wakeRetryTimer = scheduled;
+		scheduled.handle = extensionOptions.wakeRetryScheduler.setTimeout(() => {
+			if (wakeRetryTimer !== scheduled) return;
+			wakeRetryTimer = undefined;
+			if (shuttingDown || epoch !== sessionEpoch) return;
+			preparePendingForDelivery();
+			if (latestCtx?.isIdle()) {
+				completionQueue.setParentActive(false);
+				completionQueue.rearm();
+			} else {
+				scheduleWakeRetry();
+			}
+		}, delay);
+		unrefTimer(scheduled.handle);
+	};
+
+	const preparePendingForDelivery = () => {
+		if (shuttingDown || !SAFE_SESSION_ID.test(boundSessionId)) return;
+		const needsPlan = [...pendingWakes.values()].some((state) => !state.planPersisted);
+		if (needsPlan) {
+			if (!persistPlan()) {
+				scheduleWakeRetry();
+				return;
+			}
+			for (const state of pendingWakes.values()) state.planPersisted = true;
+		}
+		for (const state of pendingWakes.values()) {
+			if (!state.pendingPersisted) {
+				if (!appendWakeMarker(pendingWakeMarker(state.terminal, state.sequence))) {
+					scheduleWakeRetry();
+					continue;
+				}
+				state.pendingPersisted = true;
+			}
+			if (state.planPersisted && state.pendingPersisted) {
+				completionQueue.enqueue({ id: state.run.id, run: state.run });
+			}
 		}
 	};
 
-	const completionQueue = createCompletionQueue<CompletionNotice>({
+	const releaseActiveDelivery = () => {
+		const active = activeWakeDelivery;
+		if (!active) return;
+		clearTimeout(active.watchdog);
+		activeWakeDelivery = undefined;
+		completionQueue.release(active.notices.map((notice) => {
+			const current = pendingWakes.get(notice.id);
+			return { id: notice.id, run: current?.run ?? notice.run };
+		}));
+		scheduleWakeRetry();
+	};
+
+	completionQueue = createCompletionQueue<CompletionNotice>({
 		debounceMs: extensionOptions.completionDebounceMs,
 		onFlush: (items) => {
-			if (shuttingDown || items.length === 0) return;
-			const deliverable = items.filter(({ id }) => pendingWakeRuns.has(id));
-			if (deliverable.length === 0) return;
-			const wakeRunIds = deliverable.map((item) => item.id);
+			if (shuttingDown || items.length === 0 || activeWakeDelivery) throw new Error("wake delivery unavailable");
+			const deliverable = items.filter(({ id }) => {
+				const state = pendingWakes.get(id);
+				return Boolean(state?.pendingPersisted && state.planPersisted);
+			});
+			if (deliverable.length === 0) throw new Error("wake durability prerequisite missing");
+			const deliveryId = `wake-${randomBytes(24).toString("hex")}`;
+			const attempt = nextWakeAttempt++;
+			const deliveryItems = deliverable.map(({ id }) => ({
+				runId: id,
+				sequence: pendingWakes.get(id)!.sequence,
+			}));
+			const marker = deliveryWakeMarker(boundSessionId, deliveryId, attempt, deliveryItems);
+			if (!appendWakeMarker(marker)) throw new Error("wake delivery marker unavailable");
 			const next = nextPendingTask(plan);
 			const runSections = deliverable.map(({ run }) => [
-				`Background task ${run.status}: ${run.name} (${run.id})`,
+				`Background task ${run.status}: ${run.taskId} (${run.id})`,
 				`Task: ${run.taskId}`,
 				`Termination: ${run.terminationReason ?? "unknown"}`,
+				...(run.healthStatus || run.healthFailure
+					? [`Health: ${run.healthFailure ?? run.healthStatus ?? "unknown"}`]
+					: []),
 				`Exit: ${run.exitCode ?? "none"}${run.signal ? ` · signal ${run.signal}` : ""}`,
 				`Duration: ${runDuration(run)}`,
-				`Logs: ${run.stdoutPath} · ${run.stderrPath}`,
+				`Result: ${resultSummary(run)}`,
 				completionOutput(run),
 			].join("\n"));
 			const content = [
 				"[Background task lifecycle update — continue the original user work]",
-				`Durable wake id(s): ${wakeRunIds.join(", ")}`,
+				`Durable delivery: ${marker.deliveryId} · attempt ${marker.attempt}`,
+				`Durable wake id(s): ${marker.items.map((item) => item.runId).join(", ")}`,
 				...runSections,
 				"",
 				taskPlanText(plan, { includeResults: true }),
@@ -452,28 +690,60 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 				next
 					? `Next pending task from the latest revision: ${next.id} — ${next.title}`
 					: "No pending task remains in the latest revision.",
-				"This is completion context, not a new user request. A wake may be safely replayed after a runtime restart with the same durable id; reconcile each run idempotently. Reconcile any user prompts received while the command ran, analyze the result, then update the task plan with the current revision. Retain this terminal task only if its outcome still affects retry, verification, or the next decision; otherwise omit it from the current plan. Continue without polling the finished run.",
+				"This is completion context, not a new user request. Delivery can be replayed; identify it by run id, sequence and attempt, reconcile idempotently, then continue the latest plan without polling the finished run.",
 			].join("\n");
-			for (const runId of wakeRunIds) awaitingWakeMessageStart.add(runId);
+			const epoch = sessionEpoch;
+			const watchdog = setTimeout(() => {
+				if (shuttingDown || epoch !== sessionEpoch || activeWakeDelivery?.marker.deliveryId !== marker.deliveryId) return;
+				releaseActiveDelivery();
+			}, extensionOptions.wakeWatchdogMs);
+			watchdog.unref?.();
+			activeWakeDelivery = {
+				marker,
+				notices: deliverable,
+				sentAgentGeneration: agentGeneration,
+				messageStarted: false,
+				successfulStop: false,
+				failedResponse: false,
+				watchdog,
+			};
 			try {
 				pi.sendMessage<CompletionBatchDetails>(
 					{
 						customType: "background-task-completion",
 						content,
 						display: true,
-						details: { runs: deliverable.map((item) => item.run), plan, wakeRunIds },
+						details: {
+							runs: deliverable.map(({ run }) => ({
+								id: run.id,
+								taskId: run.taskId,
+								name: run.taskId,
+								status: run.status,
+								startedAt: run.startedAt,
+								finishedAt: run.finishedAt,
+								terminationReason: run.terminationReason,
+							})),
+							planRevision: plan.revision,
+							...(next ? { nextTaskId: next.id } : {}),
+							wake: {
+								sessionId: marker.sessionId,
+								deliveryId: marker.deliveryId,
+								attempt: marker.attempt,
+								items: marker.items,
+							},
+						},
 					},
 					{ triggerTurn: true, deliverAs: "followUp" },
 				);
-			} catch (error) {
-				for (const runId of wakeRunIds) awaitingWakeMessageStart.delete(runId);
-				throw error;
+			} catch {
+				clearTimeout(watchdog);
+				activeWakeDelivery = undefined;
+				throw new Error("wake send failed");
 			}
 		},
-		onError: (error) => {
-			try {
-				latestCtx?.ui.notify(`Could not wake main agent for background completion: ${error instanceof Error ? error.message : String(error)}. The durable wake remains pending for replay.`, "error");
-			} catch { /* best effort */ }
+		onError: () => {
+			notifyWakeDiagnostic("Background completion was not delivered; its durable attempt remains pending for bounded-backoff retry.");
+			scheduleWakeRetry();
 		},
 	});
 
@@ -495,20 +765,22 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		}
 	};
 
-	const finalizePlanForRun = (run: BackgroundRunSnapshot) => {
+	const finalizePlanForRun = (run: BackgroundRunSnapshot): boolean => {
 		const taskStatus = run.status === "completed"
 			? "completed"
 			: run.status === "stopped"
 				? run.stopReason === "shutdown" ? "blocked" : "cancelled"
 				: "failed";
 		try {
-			const nextPlan = finishTaskRun(plan, run.taskId, run.id, taskStatus, resultSummary(run));
-			if (nextPlan !== plan) {
-				plan = nextPlan;
-				persistPlan();
-			}
-		} catch (error) {
-			try { latestCtx?.ui.notify(`Could not update task ${run.taskId}: ${error instanceof Error ? error.message : String(error)}`, "error"); } catch { /* best effort */ }
+			const nextPlan = run.terminationReason === "recovery_blocked"
+				? blockTaskRecovery(plan, run.taskId, run.id)
+				: finishTaskRun(plan, run.taskId, run.id, taskStatus, resultSummary(run));
+			if (nextPlan === plan) return true;
+			plan = nextPlan;
+			return persistPlan();
+		} catch {
+			notifyWakeDiagnostic(`Background task ${run.taskId} could not update its durable plan; wake delivery remains blocked.`);
+			return false;
 		}
 	};
 
@@ -527,84 +799,142 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		dismissTimers.add(timer);
 	};
 
-	const handleCompletion = (run: BackgroundRunSnapshot) => {
+	const handleCompletion = (
+		run: BackgroundRunSnapshot,
+		options: { terminal?: TerminalRunManifest; replacePending?: boolean } = {},
+	) => {
 		controllers.delete(run.id);
 		lastProgressEventAt.delete(run.id);
 		runs.set(run.id, run);
-		finalizePlanForRun(run);
-		const shouldWake = runShouldWake(run);
-		if (shouldWake && !pendingWakeRuns.has(run.id)) recordPendingWake(run);
+		if (branchChanging) return;
+		const planPersisted = finalizePlanForRun(run);
+		if (runShouldWake(run)) {
+			const existing = pendingWakes.get(run.id);
+			if (existing && !options.replacePending) {
+				existing.run = { ...run };
+				existing.planPersisted = planPersisted;
+			} else {
+				recordPendingWake(run, {
+					terminal: options.terminal,
+					planPersisted,
+					replace: options.replacePending,
+				});
+			}
+		}
 		updateUi();
 		flushWebRuntime("active");
 		flushWebTasks();
 		emitLifecycle(run.status === "completed" ? "completed" : run.status === "failed" ? "failed" : "stopped", run);
-		if (!shuttingDown && pendingWakeRuns.has(run.id)) completionQueue.enqueue({ id: run.id, run });
+		if (!shuttingDown) preparePendingForDelivery();
 		if (!shuttingDown) scheduleDismiss(run.id);
-	};
-
-	const readDurableRunResult = async (sessionId: string, taskId: string, runId: string): Promise<BackgroundRunSnapshot | undefined> => {
-		const runDir = path.join(extensionOptions.runsDir, sessionId, runId);
-		const resultPath = path.join(runDir, "result.json");
-		try {
-			const stat = await fs.promises.stat(resultPath);
-			if (!stat.isFile() || stat.size > 2 * 1024 * 1024) return undefined;
-			const parsed = parseTerminalBackgroundRunSnapshot(JSON.parse(await fs.promises.readFile(resultPath, "utf8")));
-			if (!parsed || parsed.id !== runId || parsed.taskId !== taskId) return undefined;
-			if (path.resolve(parsed.resultPath) !== path.resolve(resultPath)) return undefined;
-			if (path.resolve(parsed.stdoutPath) !== path.resolve(runDir, "stdout.log")) return undefined;
-			if (path.resolve(parsed.stderrPath) !== path.resolve(runDir, "stderr.log")) return undefined;
-			return parsed;
-		} catch {
-			return undefined;
-		}
 	};
 
 	const lostMonitorRun = (ctx: ExtensionContext, task: TaskPlan["tasks"][number]): BackgroundRunSnapshot => {
 		const now = Date.now();
-		const runId = task.runId!;
-		const runDir = path.join(extensionOptions.runsDir, ctx.sessionManager.getSessionId(), runId);
 		return {
 			recordVersion: BACKGROUND_RUN_RECORD_VERSION,
-			id: runId,
+			id: task.runId!,
 			taskId: task.id,
 			name: task.id,
 			status: "failed",
 			cwd: ctx.cwd,
-			createdAt: task.updatedAt,
-			startedAt: task.updatedAt,
+			createdAt: now,
+			startedAt: now,
 			finishedAt: now,
 			timeoutAt: now,
 			terminationReason: "monitor_restarted",
 			stdoutTail: "",
 			stderrTail: "",
-			stdoutPath: path.join(runDir, "stdout.log"),
-			stderrPath: path.join(runDir, "stderr.log"),
-			resultPath: path.join(runDir, "result.json"),
 			logTruncated: false,
-			error: "The Pi runtime restarted before this managed command recorded a terminal result. Process ownership cannot be safely reattached; verify and clean up any orphaned external work before retrying.",
+			error: "The managed monitor restarted without a trusted terminal manifest; ownership cannot be safely reattached and external cleanup must be verified before retrying.",
+			manifestPersisted: false,
 		};
 	};
 
+	const recoveryBlockedRun = (
+		ctx: ExtensionContext,
+		task: TaskPlan["tasks"][number],
+		code: TerminalManifestFailureCode | "marker_mismatch",
+	): BackgroundRunSnapshot => {
+		const now = Date.now();
+		return {
+			recordVersion: BACKGROUND_RUN_RECORD_VERSION,
+			id: task.runId!,
+			taskId: task.id,
+			name: task.id,
+			status: "failed",
+			cwd: ctx.cwd,
+			createdAt: now,
+			startedAt: now,
+			finishedAt: now,
+			timeoutAt: now,
+			terminationReason: "recovery_blocked",
+			stdoutTail: "",
+			stderrTail: "",
+			logTruncated: false,
+			error: `Secure terminal recovery was blocked (${code}); no legacy or unbound result was trusted.`,
+			manifestPersisted: false,
+		};
+	};
+
+	const sameTerminalManifest = (left: TerminalRunManifest, right: TerminalRunManifest): boolean => {
+		const keys = [...new Set([...Object.keys(left), ...Object.keys(right)])].sort();
+		return keys.every((key) => (left as unknown as Record<string, unknown>)[key] === (right as unknown as Record<string, unknown>)[key]);
+	};
+
+	const manifestRequiredForWake = (terminal: TerminalRunManifest): boolean => ![
+		"monitor_restarted",
+		"recovery_blocked",
+		"persistence_failed",
+	].includes(terminal.terminationReason);
+
 	const recoverDurableRuns = async (ctx: ExtensionContext) => {
-		const sessionId = ctx.sessionManager.getSessionId();
 		for (const task of [...plan.tasks]) {
 			if (!task.runId) continue;
-			const pending = pendingWakeRuns.get(task.runId);
+			const pending = pendingWakes.get(task.runId);
 			if (pending) {
-				runs.set(pending.id, pending);
-				if (task.status === "in_progress") handleCompletion(pending);
+				if (manifestRequiredForWake(pending.terminal)) {
+					const verified = await readTerminalRunManifest(extensionOptions.runsDir, {
+						sessionId: boundSessionId,
+						runId: task.runId,
+						taskId: task.id,
+					});
+					if (!verified.ok || !sameTerminalManifest(verified.manifest, pending.terminal)) {
+						const blocked = recoveryBlockedRun(ctx, task, verified.ok ? "marker_mismatch" : verified.code);
+						handleCompletion(blocked, { replacePending: true });
+						continue;
+					}
+				}
+				runs.set(pending.run.id, pending.run);
+				if (task.status === "in_progress") handleCompletion(pending.run);
 				continue;
 			}
-			const result = await readDurableRunResult(sessionId, task.id, task.runId);
+
+			const result = await readTerminalRunManifest(extensionOptions.runsDir, {
+				sessionId: boundSessionId,
+				runId: task.runId,
+				taskId: task.id,
+			});
 			if (task.status === "in_progress") {
-				handleCompletion(result ?? lostMonitorRun(ctx, task));
+				if (result.ok) {
+					const recovered = snapshotFromTerminalManifest(result.manifest, ctx.cwd);
+					handleCompletion(recovered, { terminal: result.manifest });
+				} else {
+					handleCompletion(lostMonitorRun(ctx, task));
+				}
 				continue;
 			}
-			// For v2 runs, a terminal plan without any wake marker is the crash
-			// window between plan persistence and outbox persistence. Legacy v1
-			// completions are not replayed merely because the extension upgraded.
-			if (result?.recordVersion === BACKGROUND_RUN_RECORD_VERSION && runShouldWake(result) && !knownWakeRunIds.has(task.runId)) {
-				handleCompletion(result);
+			if (!result.ok) {
+				const acknowledgedTerminal = acknowledgedWakeTerminals.get(task.runId);
+				if ((task.status === "blocked" && knownWakeRunIds.has(task.runId))
+					|| (acknowledgedTerminal && !manifestRequiredForWake(acknowledgedTerminal))) continue;
+				handleCompletion(recoveryBlockedRun(ctx, task, result.code), { replacePending: true });
+				continue;
+			}
+			const recovered = snapshotFromTerminalManifest(result.manifest, ctx.cwd);
+			runs.set(recovered.id, recovered);
+			if (runShouldWake(recovered) && !knownWakeRunIds.has(task.runId)) {
+				handleCompletion(recovered, { terminal: result.manifest });
 			}
 		}
 	};
@@ -641,8 +971,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 				const icon = run.status === "completed" ? theme.fg("success", "✓") : run.status === "failed" ? theme.fg("error", "✗") : theme.fg("warning", "■");
 				return `${icon} ${theme.bold(run.name)} · ${run.status} · ${runDuration(run)}`;
 			});
-			const next = nextPendingTask(details.plan);
-			lines.push(theme.fg("dim", `plan revision ${details.plan.revision}${next ? ` · next ${next.id}` : " · no pending task"}`));
+			lines.push(theme.fg("dim", `plan revision ${details.planRevision}${details.nextTaskId ? ` · next ${details.nextTaskId}` : " · no pending task"}`));
 			return new Text(lines.join("\n"), 0, 0);
 		},
 	);
@@ -672,7 +1001,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 			} catch (error) {
 				throw new Error(`${error instanceof Error ? error.message : String(error)}\n\nLatest plan:\n${taskPlanText(plan, { includeResults: true })}`);
 			}
-			persistPlan();
+			if (!persistPlan()) throw new Error("Task plan changed in memory but secure session persistence failed; retry with the latest revision.");
 			return {
 				content: [{ type: "text", text: taskPlanText(plan, { includeResults: true }) }],
 				details: { plan } satisfies UpdatePlanDetails,
@@ -713,13 +1042,20 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 			if (command.length > MAX_COMMAND_CHARS) throw new Error(`command exceeds ${MAX_COMMAND_CHARS} characters`);
 			const taskId = params.taskId.trim().toLowerCase();
 			const name = safeRunName(params.name ?? taskId);
-			const id = `bg-${Date.now().toString(36)}-${(++sequence).toString(36)}`;
+			if (!SAFE_SESSION_ID.test(boundSessionId) || ctx.sessionManager.getSessionId() !== boundSessionId) {
+				throw new Error("secure session binding unavailable");
+			}
+			const id = `bg-${randomBytes(16).toString("hex")}`;
 			const cwd = params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd;
 			const timeoutMs = clampTimeout(params.timeoutMs);
 			const healthPolicy = normalizeHealthPolicy(params.healthPolicy);
+			const previousPlan = plan;
 			plan = attachRunToTask(plan, taskId, id, plan.tasks.find((task) => task.id === taskId)?.title ?? name);
-			persistPlan();
-			const runDir = path.join(extensionOptions.runsDir, ctx.sessionManager.getSessionId(), id);
+			if (!persistPlan()) {
+				plan = previousPlan;
+				updateUi();
+				throw new Error("background launch blocked because its plan binding could not be securely persisted");
+			}
 			let controller: BackgroundRunController;
 			try {
 				controller = await extensionOptions.startRun({
@@ -728,15 +1064,17 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 					name,
 					command,
 					cwd,
-					runDir,
+					runsDir: extensionOptions.runsDir,
+					sessionId: boundSessionId,
 					timeoutMs,
 					healthPolicy,
 					terminateGraceMs: TERMINATE_GRACE_MS,
-					maxLogBytes: MAX_LOG_BYTES,
+					killConfirmMs: extensionOptions.killConfirmMs,
 					maxTailBytes: MAX_TAIL_BYTES,
 					onUpdate: updateRun,
 				});
-			} catch (error) {
+			} catch {
+				const observedAt = Date.now();
 				const failed: BackgroundRunSnapshot = {
 					recordVersion: BACKGROUND_RUN_RECORD_VERSION,
 					id,
@@ -744,22 +1082,20 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 					name,
 					status: "failed",
 					cwd,
-					createdAt: Date.now(),
-					startedAt: Date.now(),
-					finishedAt: Date.now(),
-					timeoutAt: Date.now() + timeoutMs,
+					createdAt: observedAt,
+					startedAt: observedAt,
+					finishedAt: observedAt,
+					timeoutAt: observedAt + timeoutMs,
 					...(healthPolicy ? { healthPolicy, healthStatus: "awaiting" as const } : {}),
-					terminationReason: "spawn_error",
+					terminationReason: "persistence_failed",
 					stdoutTail: "",
 					stderrTail: "",
-					stdoutPath: path.join(runDir, "stdout.log"),
-					stderrPath: path.join(runDir, "stderr.log"),
-					resultPath: path.join(runDir, "result.json"),
 					logTruncated: false,
-					error: error instanceof Error ? error.message : String(error),
+					error: "Secure run setup failed before process ownership was established.",
+					manifestPersisted: false,
 				};
 				handleCompletion(failed);
-				throw error;
+				throw new Error("secure background run setup failed");
 			}
 			controllers.set(id, controller);
 			const initial = controller.snapshot();
@@ -771,7 +1107,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 			void controller.completion.then(handleCompletion);
 			onUpdate?.({
 				content: [{ type: "text", text: `Managed background task ${name} started (${id}). Monitoring exit, failure, signal, wall timeout${healthPolicy ? ", health availability and structured progress" : ""}.` }],
-				details: { run: initial, plan } satisfies RunDetails,
+				details: runDetails(initial, plan.revision),
 			});
 			return {
 				content: [{
@@ -785,11 +1121,11 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 							`Health policy: startup ${healthPolicy.startupGraceMs}ms · heartbeat ${healthPolicy.heartbeatTimeoutMs}ms · unavailable ${healthPolicy.unavailableTimeoutMs}ms${healthPolicy.staleProgressTimeoutMs ? ` · stale progress ${healthPolicy.staleProgressTimeoutMs}ms` : ""}`,
 							"Health protocol: write one JSON object per line to fd 3 (also exposed as PI_BACKGROUND_TASK_HEALTH_FD).",
 						] : []),
-						`Logs: ${initial.stdoutPath} · ${initial.stderrPath}`,
-						"Completion is durably recorded, updates the plan, and wakes the main agent automatically. Do not poll.",
+						"Console output is retained only as a bounded in-memory tail for the completion message.",
+						"Completion is durably classified, updates the plan, and wakes the main agent automatically. Do not poll.",
 					].join("\n"),
 				}],
-				details: { run: initial, plan } satisfies RunDetails,
+				details: runDetails(initial, plan.revision),
 			};
 		},
 		renderCall(args, theme) {
@@ -798,7 +1134,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		renderResult(result, _options, theme) {
 			const details = result.details as RunDetails | undefined;
 			if (!details) return new Text(theme.fg("dim", "Background launch unavailable"), 0, 0);
-			return new Text(`${theme.fg("warning", "●")} ${theme.fg("accent", details.run.name)} ${theme.fg("dim", `running · ${details.run.id} · plan revision ${details.plan.revision}`)}`, 0, 0);
+			return new Text(`${theme.fg("warning", "●")} ${theme.fg("accent", details.run.name)} ${theme.fg("dim", `running · ${details.run.id} · plan revision ${details.planRevision}`)}`, 0, 0);
 		},
 	});
 
@@ -841,8 +1177,8 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 				if (nextPlan === plan) ctx.ui.notify("No completed task history to clear", "info");
 				else {
 					plan = nextPlan;
-					persistPlan();
-					ctx.ui.notify(`Task history cleared · revision ${plan.revision}`, "info");
+					if (persistPlan()) ctx.ui.notify(`Task history cleared · revision ${plan.revision}`, "info");
+					else ctx.ui.notify("Task history changed in memory but secure persistence failed; retry the command.", "error");
 				}
 				return;
 			}
@@ -864,21 +1200,60 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 
 	const blockBranchChange = (ctx: ExtensionContext, action: string) => {
 		const active = activeRuns().length;
-		if (active === 0 && pendingWakeRuns.size === 0) return false;
+		if (active === 0 && pendingWakes.size === 0 && !activeWakeDelivery) return false;
 		const reason = active > 0
 			? "a managed background task is running. Stop it with /tasks stop first"
-			: "a durable background completion wake is awaiting acknowledgement";
+			: "a durable background completion wake is awaiting explicit acknowledgement";
 		try { ctx.ui.notify(`Cannot ${action} while ${reason}.`, "warning"); } catch { /* best effort */ }
 		return true;
+	};
+
+	const cancelWakeRuntime = () => {
+		clearWakeRetryTimer();
+		if (activeWakeDelivery) clearTimeout(activeWakeDelivery.watchdog);
+		activeWakeDelivery = undefined;
+		++sessionEpoch;
 	};
 
 	pi.on("session_before_switch", (_event, ctx) => blockBranchChange(ctx, "switch sessions") ? { cancel: true } : {});
 	pi.on("session_before_fork", (_event, ctx) => blockBranchChange(ctx, "fork the session") ? { cancel: true } : {});
 	pi.on("session_before_tree", (_event, ctx) => blockBranchChange(ctx, "navigate the session tree") ? { cancel: true } : {});
 
-	pi.on("session_tree", (_event, ctx) => {
-		if (activeRuns().length > 0) return;
-		plan = reconstructTaskPlan(ctx.sessionManager.getBranch() as any[]);
+	pi.on("session_tree", async (_event, ctx) => {
+		cancelWakeRuntime();
+		wakeRetryRound = 0;
+		completionQueue.clear();
+		if (activeRuns().length > 0) {
+			branchChanging = true;
+			const activeControllers = [...controllers.values()];
+			stopAll("shutdown");
+			await Promise.all(activeControllers.map((controller) => controller.completion));
+			branchChanging = false;
+		}
+		pendingWakes.clear();
+		acknowledgedWakeTerminals.clear();
+		knownWakeRunIds.clear();
+		runs.clear();
+		const branch = ctx.sessionManager.getBranch() as any[];
+		plan = reconstructTaskPlan(branch, Date.now(), boundSessionId);
+		if (SAFE_SESSION_ID.test(boundSessionId)) {
+			const wakeState = reconstructWakeOutbox(branch, boundSessionId);
+			nextWakeSequence = wakeState.nextSequence;
+			nextWakeAttempt = wakeState.maxAttempt + 1;
+			for (const runId of wakeState.knownRunIds) knownWakeRunIds.add(runId);
+			for (const [runId, terminal] of wakeState.acknowledged) acknowledgedWakeTerminals.set(runId, terminal);
+			for (const pending of wakeState.pending.values()) {
+				const run = snapshotFromTerminalManifest(pending.terminal, ctx.cwd);
+				recordPendingWake(run, {
+					terminal: pending.terminal,
+					restored: true,
+					sequence: pending.sequence,
+					planPersisted: true,
+				});
+			}
+			await recoverDurableRuns(ctx);
+			preparePendingForDelivery();
+		}
 		updateUi();
 		flushWebTasks();
 	});
@@ -886,61 +1261,137 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
 		shuttingDown = false;
+		branchChanging = false;
+		cancelWakeRuntime();
+		boundSessionId = ctx.sessionManager.getSessionId();
+		agentGeneration = 0;
+		wakeRetryRound = 0;
+		lastWakeDiagnosticAt = 0;
+		pendingWakes.clear();
+		acknowledgedWakeTerminals.clear();
+		knownWakeRunIds.clear();
+		runs.clear();
 		completionQueue.setParentActive(false);
 		const branch = ctx.sessionManager.getBranch() as any[];
-		plan = reconstructTaskPlan(branch);
-		const wakeState = reconstructWakeOutbox(branch);
-		pendingWakeRuns.clear();
-		knownWakeRunIds.clear();
-		awaitingWakeMessageStart.clear();
-		activeWakeRunIds.clear();
-		activeWakeResponded = false;
-		runs.clear();
-		for (const runId of wakeState.knownRunIds) knownWakeRunIds.add(runId);
-		for (const run of wakeState.pending.values()) {
-			recordPendingWake(run, false);
-			runs.set(run.id, run);
+		if (!SAFE_SESSION_ID.test(boundSessionId)) {
+			plan = reconstructTaskPlan(branch);
+			notifyWakeDiagnostic("Background recovery is disabled because Pi did not provide a safe, stable session identity.");
+			updateUi();
+			void startWebActivity(ctx);
+			return;
 		}
-		for (const runId of wakeState.implicitlyAcknowledged) appendWakeMarker(acknowledgedWakeMarker(runId));
+		plan = reconstructTaskPlan(branch, Date.now(), boundSessionId);
+		const wakeState = reconstructWakeOutbox(branch, boundSessionId);
+		nextWakeSequence = wakeState.nextSequence;
+		nextWakeAttempt = wakeState.maxAttempt + 1;
+		for (const runId of wakeState.knownRunIds) knownWakeRunIds.add(runId);
+		for (const [runId, terminal] of wakeState.acknowledged) acknowledgedWakeTerminals.set(runId, terminal);
+		for (const [runId, pending] of wakeState.pending) {
+			const run = snapshotFromTerminalManifest(pending.terminal, ctx.cwd);
+			recordPendingWake(run, {
+				terminal: pending.terminal,
+				restored: true,
+				sequence: pending.sequence,
+				planPersisted: true,
+			});
+			runs.set(runId, run);
+		}
+		if (wakeState.invalidMarkerCount > 0) {
+			notifyWakeDiagnostic("One or more invalid or mismatched background wake markers were rejected.");
+		}
 		await recoverDurableRuns(ctx);
-		for (const run of pendingWakeRuns.values()) completionQueue.enqueue({ id: run.id, run });
+		preparePendingForDelivery();
 		updateUi();
 		void startWebActivity(ctx);
 	});
 
 	pi.on("agent_start", () => {
+		agentGeneration += 1;
 		completionQueue.setParentActive(true);
+		const active = activeWakeDelivery;
+		if (!active) return;
+		if (active.boundAgentGeneration !== undefined) {
+			active.failedResponse = true;
+			active.successfulStop = false;
+			return;
+		}
+		if (active.messageStarted && agentGeneration > active.sentAgentGeneration) {
+			active.boundAgentGeneration = agentGeneration;
+			clearTimeout(active.watchdog);
+		}
 	});
 
 	pi.on("message_start", (event) => {
 		if (event.message.role !== "custom" || event.message.customType !== "background-task-completion") return;
 		const details = event.message.details as CompletionBatchDetails | undefined;
-		if (!details?.wakeRunIds) return;
-		if (activeWakeRunIds.size === 0) activeWakeResponded = false;
-		for (const runId of details.wakeRunIds) {
-			if (!pendingWakeRuns.has(runId)) continue;
-			awaitingWakeMessageStart.delete(runId);
-			activeWakeRunIds.add(runId);
+		const active = activeWakeDelivery;
+		if (!details?.wake || !active) return;
+		const expected = active.marker;
+		const actual = details.wake;
+		const matchingItems = actual.items.length === expected.items.length && expected.items.every((item, index) => (
+			item.runId === actual.items[index]?.runId && item.sequence === actual.items[index]?.sequence
+		));
+		if (actual.sessionId !== boundSessionId
+			|| actual.deliveryId !== expected.deliveryId
+			|| actual.attempt !== expected.attempt
+			|| !matchingItems) return;
+		if (expected.items.some((item) => pendingWakes.get(item.runId)?.sequence !== item.sequence)) return;
+		active.messageStarted = true;
+		if (agentGeneration > active.sentAgentGeneration) {
+			active.boundAgentGeneration = agentGeneration;
+			clearTimeout(active.watchdog);
 		}
 	});
 
 	pi.on("message_end", (event) => {
-		if (activeWakeRunIds.size === 0 || event.message.role !== "assistant") return;
-		if (event.message.stopReason !== "error" && event.message.stopReason !== "aborted") activeWakeResponded = true;
+		const active = activeWakeDelivery;
+		if (!active || event.message.role !== "assistant" || active.boundAgentGeneration !== agentGeneration) return;
+		if (event.message.stopReason === "stop") {
+			if (!active.failedResponse) active.successfulStop = true;
+			return;
+		}
+		if (event.message.stopReason === "length" || event.message.stopReason === "error" || event.message.stopReason === "aborted") {
+			active.failedResponse = true;
+			active.successfulStop = false;
+		}
+		// toolUse is an intermediate response and can never acknowledge delivery.
 	});
 
-	pi.on("agent_settled", () => {
-		if (activeWakeResponded && activeWakeRunIds.size > 0) {
-			acknowledgeWakeRuns(activeWakeRunIds);
-			activeWakeRunIds.clear();
-			activeWakeResponded = false;
+	pi.on("agent_settled", (_event, ctx) => {
+		if (!ctx.isIdle()) return;
+		const active = activeWakeDelivery;
+		if (active) {
+			const canAcknowledge = active.messageStarted
+				&& active.boundAgentGeneration !== undefined
+				&& active.successfulStop
+				&& !active.failedResponse
+				&& active.marker.items.every((item) => pendingWakes.get(item.runId)?.sequence === item.sequence);
+			if (canAcknowledge && appendWakeMarker(acknowledgedWakeMarker(active.marker))) {
+				clearTimeout(active.watchdog);
+				activeWakeDelivery = undefined;
+				for (const item of active.marker.items) {
+					const pending = pendingWakes.get(item.runId);
+					if (pending) acknowledgedWakeTerminals.set(item.runId, pending.terminal);
+					pendingWakes.delete(item.runId);
+					knownWakeRunIds.add(item.runId);
+				}
+				completionQueue.acknowledge(active.marker.items.map((item) => item.runId));
+				wakeRetryRound = 0;
+			} else {
+				releaseActiveDelivery();
+			}
 		}
-		completionQueue.setParentActive(false);
+		if (wakeRetryTimer === undefined) {
+			completionQueue.setParentActive(false);
+			preparePendingForDelivery();
+			completionQueue.rearm();
+		}
 	});
 
 	pi.on("session_shutdown", async () => {
 		if (shuttingDown) return;
 		shuttingDown = true;
+		cancelWakeRuntime();
 		++webEpoch;
 		for (const timer of dismissTimers) clearTimeout(timer);
 		dismissTimers.clear();
@@ -966,6 +1417,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 			} catch { /* UI already gone */ }
 		}
 		webRegistry = undefined;
+		boundSessionId = "";
 		latestCtx = undefined;
 	});
 }

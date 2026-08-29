@@ -1,5 +1,4 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import type { Readable } from "node:stream";
@@ -14,8 +13,14 @@ import {
 	type BackgroundHealthSnapshot,
 	type BackgroundHealthStatus,
 } from "./health-policy.ts";
+import {
+	BACKGROUND_RUN_RECORD_VERSION,
+	prepareSecureRunDirectory,
+	terminalManifestFromSnapshot,
+	writeTerminalRunManifest,
+} from "./run-persistence.ts";
 
-export const BACKGROUND_RUN_RECORD_VERSION = 2;
+export { BACKGROUND_RUN_RECORD_VERSION } from "./run-persistence.ts";
 export type BackgroundRunStatus = "running" | "completed" | "failed" | "stopped";
 export type BackgroundStopReason = "user" | "shutdown" | "timeout" | "health_policy";
 export type BackgroundTerminationReason =
@@ -26,6 +31,9 @@ export type BackgroundTerminationReason =
 	| "timed_out"
 	| "health_policy_failed"
 	| "monitor_restarted"
+	| "recovery_blocked"
+	| "persistence_failed"
+	| "termination_unconfirmed"
 	| "explicit_stop"
 	| "session_shutdown";
 
@@ -35,6 +43,7 @@ export interface BackgroundRunSnapshot {
 	taskId: string;
 	name: string;
 	status: BackgroundRunStatus;
+	/** Live-only execution context. Never written to a durable run/wake/web record. */
 	cwd: string;
 	createdAt: number;
 	startedAt: number;
@@ -53,15 +62,14 @@ export interface BackgroundRunSnapshot {
 	terminationReason?: BackgroundTerminationReason;
 	stopReason?: BackgroundStopReason;
 	terminationEscalated?: boolean;
-	/** @deprecated Prefer terminationEscalated; retained for persisted v1 results. */
 	timeoutEscalated?: boolean;
+	signalDeliveryFailed?: boolean;
 	stdoutTail: string;
 	stderrTail: string;
-	stdoutPath: string;
-	stderrPath: string;
-	resultPath: string;
 	logTruncated: boolean;
+	/** Live diagnostic only; terminal manifests intentionally omit it. */
 	error?: string;
+	manifestPersisted?: boolean;
 }
 
 export interface BackgroundRunController {
@@ -76,11 +84,14 @@ export interface BackgroundRunOptions {
 	name: string;
 	command: string;
 	cwd: string;
-	runDir: string;
+	runsDir: string;
+	sessionId: string;
 	timeoutMs: number;
 	healthPolicy?: BackgroundHealthPolicy;
 	terminateGraceMs: number;
-	maxLogBytes: number;
+	killConfirmMs?: number;
+	/** @deprecated Output is memory-only; retained as a source-compatibility no-op. */
+	maxLogBytes?: number;
 	maxTailBytes: number;
 	env?: NodeJS.ProcessEnv;
 	shell?: string;
@@ -88,57 +99,35 @@ export interface BackgroundRunOptions {
 	monotonicNow?: () => number;
 	onUpdate?: (snapshot: BackgroundRunSnapshot) => void;
 	spawnProcess?: typeof spawn;
-	signalProcess?: (child: ChildProcess, signal: "SIGTERM" | "SIGKILL") => void;
+	signalProcess?: (child: ChildProcess, signal: "SIGTERM" | "SIGKILL") => boolean | void;
 }
 
 const TERMINAL = new Set<BackgroundRunStatus>(["completed", "failed", "stopped"]);
 
-function boundedUtf8Tail(previous: string, chunk: string, maxBytes: number): string {
+function boundedUtf8Tail(previous: string, chunk: string, maxBytes: number): { value: string; truncated: boolean } {
 	let value = previous + chunk;
-	if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+	if (Buffer.byteLength(value, "utf8") <= maxBytes) return { value, truncated: false };
 	let start = Math.max(0, value.length - maxBytes);
 	value = value.slice(start);
 	while (Buffer.byteLength(value, "utf8") > maxBytes && value.length > 0) value = value.slice(1);
-	return value;
+	return { value, truncated: true };
 }
 
-async function writeJsonAtomically(filePath: string, value: unknown): Promise<void> {
-	await fs.promises.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
-	const temporaryPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`);
-	try {
-		await fs.promises.writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-		await fs.promises.rename(temporaryPath, filePath);
-	} catch (error) {
-		await fs.promises.rm(temporaryPath, { force: true }).catch(() => {});
-		throw error;
-	}
-}
-
-function signalOwnedProcessGroup(child: ChildProcess, signal: "SIGTERM" | "SIGKILL"): void {
+function signalOwnedProcessGroup(child: ChildProcess, signal: "SIGTERM" | "SIGKILL"): boolean {
 	if (process.platform !== "win32" && typeof child.pid === "number" && child.pid > 0) {
 		try {
-			// The child was spawned detached solely to give this runtime an exact
-			// process group. The pid is used only from the live ChildProcess handle;
-			// it is never persisted or accepted from a caller.
-			process.kill(-child.pid, signal);
-			return;
+			// The live ChildProcess pid is used only for signalling this owned group.
+			return process.kill(-child.pid, signal);
 		} catch {
-			// Fall through to the direct child signal if the group already exited.
+			// A group can disappear between close detection and the signal. Fall back
+			// to the direct child handle without exposing or persisting its pid.
 		}
 	}
-	try {
-		child.kill(signal);
-	} catch {
-		// The close/error path owns final classification.
-	}
+	return child.kill(signal);
 }
 
 function safeNotify(handler: BackgroundRunOptions["onUpdate"], snapshot: BackgroundRunSnapshot): void {
-	try {
-		handler?.({ ...snapshot });
-	} catch {
-		// Observability cannot break lifecycle finalization.
-	}
+	try { handler?.({ ...snapshot }); } catch { /* observational */ }
 }
 
 function compactDuration(ms: number): string {
@@ -164,50 +153,33 @@ function healthFailureMessage(failure: BackgroundHealthFailure, policy: Backgrou
 	}
 }
 
+function appendDiagnostic(current: string | undefined, next: string): string {
+	return current ? `${current.replace(/[.;]\s*$/, "")}; ${next}` : next;
+}
+
 export async function startManagedBackgroundRun(options: BackgroundRunOptions): Promise<BackgroundRunController> {
-	const now = options.now ?? Date.now;
+	const rawNow = options.now ?? Date.now;
+	const now = () => Math.max(0, Math.round(rawNow()));
 	const monotonicNow = options.monotonicNow ?? (() => performance.now());
 	const spawnProcess = options.spawnProcess ?? spawn;
 	const signalProcess = options.signalProcess ?? signalOwnedProcessGroup;
 	const shell = options.shell || (path.isAbsolute(process.env.SHELL ?? "") ? process.env.SHELL! : "/bin/sh");
 	const createdAt = now();
 	const healthPolicy = options.healthPolicy ? validateBackgroundHealthPolicy(options.healthPolicy) : undefined;
+	const maxTailBytes = Math.max(0, Math.floor(options.maxTailBytes));
+	const killConfirmMs = Math.max(1, Math.floor(options.killConfirmMs ?? Math.max(1_000, options.terminateGraceMs)));
+	const runDir = await prepareSecureRunDirectory(options.runsDir, options.sessionId, options.id, options.taskId);
 	let healthMonitor: ReturnType<typeof createBackgroundHealthMonitor> | undefined;
-	const stdoutPath = path.join(options.runDir, "stdout.log");
-	const stderrPath = path.join(options.runDir, "stderr.log");
-	const resultPath = path.join(options.runDir, "result.json");
-	const metadataPath = path.join(options.runDir, "metadata.json");
-	await fs.promises.mkdir(options.runDir, { recursive: true, mode: 0o700 });
-	try { await fs.promises.chmod(options.runDir, 0o700); } catch { /* best effort */ }
-	await writeJsonAtomically(metadataPath, {
-		version: BACKGROUND_RUN_RECORD_VERSION,
-		id: options.id,
-		taskId: options.taskId,
-		name: options.name,
-		command: options.command,
-		cwd: options.cwd,
-		createdAt,
-		timeoutMs: options.timeoutMs,
-		...(healthPolicy ? { healthPolicy, healthFd: 3 } : {}),
-	});
-
-	const stdoutStream = fs.createWriteStream(stdoutPath, { flags: "a", mode: 0o600 });
-	const stderrStream = fs.createWriteStream(stderrPath, { flags: "a", mode: 0o600 });
-	// A disk failure is reflected in the terminal result; it must never become
-	// an unhandled stream error that crashes the parent Pi runtime.
-	let logWriteError = "";
-	stdoutStream.on("error", (error) => { logWriteError ||= `stdout log failed: ${error.message}`; });
-	stderrStream.on("error", (error) => { logWriteError ||= `stderr log failed: ${error.message}`; });
-	let stdoutBytes = 0;
-	let stderrBytes = 0;
 	let outputNotifyTimer: ReturnType<typeof setTimeout> | undefined;
 	let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
 	let healthTimer: ReturnType<typeof setTimeout> | undefined;
 	let graceTimer: ReturnType<typeof setTimeout> | undefined;
+	let killConfirmationTimer: ReturnType<typeof setTimeout> | undefined;
 	let healthStream: Readable | undefined;
 	let healthBuffer = Buffer.alloc(0);
 	let child: ChildProcess | undefined;
 	let finalized = false;
+	let closeObserved = false;
 	let resolveCompletion!: (snapshot: BackgroundRunSnapshot) => void;
 	const completion = new Promise<BackgroundRunSnapshot>((resolve) => { resolveCompletion = resolve; });
 	const snapshot: BackgroundRunSnapshot = {
@@ -219,7 +191,7 @@ export async function startManagedBackgroundRun(options: BackgroundRunOptions): 
 		cwd: options.cwd,
 		createdAt,
 		startedAt: createdAt,
-		timeoutAt: createdAt + options.timeoutMs,
+		timeoutAt: createdAt + Math.max(0, Math.round(options.timeoutMs)),
 		...(healthPolicy ? {
 			healthPolicy,
 			healthStatus: "awaiting" as const,
@@ -227,9 +199,6 @@ export async function startManagedBackgroundRun(options: BackgroundRunOptions): 
 		} : {}),
 		stdoutTail: "",
 		stderrTail: "",
-		stdoutPath,
-		stderrPath,
-		resultPath,
 		logTruncated: false,
 	};
 
@@ -238,19 +207,12 @@ export async function startManagedBackgroundRun(options: BackgroundRunOptions): 
 		if (timeoutTimer) clearTimeout(timeoutTimer);
 		if (healthTimer) clearTimeout(healthTimer);
 		if (graceTimer) clearTimeout(graceTimer);
+		if (killConfirmationTimer) clearTimeout(killConfirmationTimer);
 		outputNotifyTimer = undefined;
 		timeoutTimer = undefined;
 		healthTimer = undefined;
 		graceTimer = undefined;
-	};
-
-	const flushStreams = async () => {
-		const close = (stream: fs.WriteStream) => new Promise<void>((resolve) => {
-			if (stream.closed) return resolve();
-			stream.once("close", () => resolve());
-			stream.end();
-		});
-		await Promise.all([close(stdoutStream), close(stderrStream)]);
+		killConfirmationTimer = undefined;
 	};
 
 	const finalize = async (fields: Partial<BackgroundRunSnapshot>) => {
@@ -260,15 +222,19 @@ export async function startManagedBackgroundRun(options: BackgroundRunOptions): 
 		healthStream?.destroy();
 		healthStream = undefined;
 		Object.assign(snapshot, fields, { finishedAt: fields.finishedAt ?? now() });
-		await flushStreams().catch(() => {});
-		if (logWriteError) {
-			snapshot.error = snapshot.error ? `${snapshot.error}; ${logWriteError}` : logWriteError;
+		try {
+			const manifest = terminalManifestFromSnapshot(snapshot, options.sessionId);
+			await writeTerminalRunManifest(runDir, manifest);
+			snapshot.manifestPersisted = true;
+		} catch {
+			// A terminal state without a securely published manifest is not reported
+			// as a durable success. The session outbox can still carry this bounded,
+			// privacy-safe failure classification during the current runtime.
+			snapshot.status = "failed";
+			snapshot.terminationReason = "persistence_failed";
+			snapshot.manifestPersisted = false;
+			snapshot.error = appendDiagnostic(snapshot.error, "Secure terminal recovery persistence failed.");
 		}
-		await writeJsonAtomically(resultPath, snapshot).catch((error) => {
-			snapshot.error = snapshot.error
-				? `${snapshot.error}; result persistence failed: ${error instanceof Error ? error.message : String(error)}`
-				: `Result persistence failed: ${error instanceof Error ? error.message : String(error)}`;
-		});
 		safeNotify(options.onUpdate, snapshot);
 		resolveCompletion({ ...snapshot });
 	};
@@ -284,29 +250,30 @@ export async function startManagedBackgroundRun(options: BackgroundRunOptions): 
 
 	const writeChunk = (kind: "stdout" | "stderr", chunk: Buffer | string) => {
 		if (finalized) return;
-		const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-		const text = buffer.toString("utf8");
+		const text = (Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)).toString("utf8");
 		snapshot.lastOutputAt = now();
-		if (kind === "stdout") {
-			snapshot.stdoutTail = boundedUtf8Tail(snapshot.stdoutTail, text, options.maxTailBytes);
-			const remaining = Math.max(0, options.maxLogBytes - stdoutBytes);
-			if (remaining > 0) {
-				const piece = buffer.subarray(0, remaining);
-				stdoutBytes += piece.byteLength;
-				stdoutStream.write(piece);
-			}
-			if (buffer.byteLength > remaining) snapshot.logTruncated = true;
-		} else {
-			snapshot.stderrTail = boundedUtf8Tail(snapshot.stderrTail, text, options.maxTailBytes);
-			const remaining = Math.max(0, options.maxLogBytes - stderrBytes);
-			if (remaining > 0) {
-				const piece = buffer.subarray(0, remaining);
-				stderrBytes += piece.byteLength;
-				stderrStream.write(piece);
-			}
-			if (buffer.byteLength > remaining) snapshot.logTruncated = true;
-		}
+		const bounded = boundedUtf8Tail(kind === "stdout" ? snapshot.stdoutTail : snapshot.stderrTail, text, maxTailBytes);
+		if (kind === "stdout") snapshot.stdoutTail = bounded.value;
+		else snapshot.stderrTail = bounded.value;
+		if (bounded.truncated) snapshot.logTruncated = true;
 		scheduleOutputNotify();
+	};
+
+	const attemptSignal = (signal: "SIGTERM" | "SIGKILL"): boolean => {
+		if (!child) return false;
+		try {
+			const result = signalProcess(child, signal);
+			if (result === false) {
+				snapshot.signalDeliveryFailed = true;
+				snapshot.error = appendDiagnostic(snapshot.error, `${signal} delivery was not confirmed.`);
+				return false;
+			}
+			return true;
+		} catch {
+			snapshot.signalDeliveryFailed = true;
+			snapshot.error = appendDiagnostic(snapshot.error, `${signal} delivery failed.`);
+			return false;
+		}
 	};
 
 	let activeHealthFailure: BackgroundHealthFailure | undefined;
@@ -339,20 +306,27 @@ export async function startManagedBackgroundRun(options: BackgroundRunOptions): 
 			void finalize({ status: failed ? "failed" : "stopped", terminationReason, error: baseError });
 			return true;
 		}
-		signalProcess(child, "SIGTERM");
+		attemptSignal("SIGTERM");
+		if (finalized || closeObserved) return true;
 		graceTimer = setTimeout(() => {
 			graceTimer = undefined;
-			if (finalized || !child) return;
+			if (finalized || closeObserved || !child) return;
 			snapshot.terminationEscalated = true;
 			if (reason === "timeout") snapshot.timeoutEscalated = true;
-			signalProcess(child, "SIGKILL");
-			const suffix = ` SIGKILL followed a ${compactDuration(options.terminateGraceMs)} grace period.`;
-			void finalize({
-				status: failed ? "failed" : "stopped",
-				terminationReason,
-				signal: "SIGKILL",
-				error: baseError ? `${baseError.replace(/\.$/, "")};${suffix}` : undefined,
-			});
+			const killDelivered = attemptSignal("SIGKILL");
+			if (finalized || closeObserved) return;
+			safeNotify(options.onUpdate, snapshot);
+			killConfirmationTimer = setTimeout(() => {
+				killConfirmationTimer = undefined;
+				if (finalized || closeObserved) return;
+				void finalize({
+					status: "failed",
+					terminationReason: "termination_unconfirmed",
+					...(killDelivered ? { signal: "SIGKILL" } : {}),
+					error: appendDiagnostic(baseError, "Process termination was not confirmed after bounded TERM/KILL cleanup."),
+				});
+			}, killConfirmMs);
+			killConfirmationTimer.unref?.();
 		}, Math.max(0, options.terminateGraceMs));
 		graceTimer.unref?.();
 		safeNotify(options.onUpdate, snapshot);
@@ -363,10 +337,7 @@ export async function startManagedBackgroundRun(options: BackgroundRunOptions): 
 		if (!healthMonitor) return;
 		const health = healthMonitor.snapshot();
 		snapshot.healthStatus = health.status;
-		// Public timestamps stay in epoch milliseconds for persistence/UI, while
-		// enforcement uses the monotonic clock and cannot be extended by a wall
-		// clock rollback.
-		snapshot.healthDeadlineAt = now() + Math.max(0, health.deadlineAt - monotonicNow());
+		snapshot.healthDeadlineAt = now() + Math.max(0, Math.round(health.deadlineAt - monotonicNow()));
 		if (health.failure) snapshot.healthFailure = health.failure.code;
 	};
 
@@ -398,7 +369,7 @@ export async function startManagedBackgroundRun(options: BackgroundRunOptions): 
 			health = healthMonitor.report(parseBackgroundHealthReport(text), monotonicNow());
 			validReport = true;
 		} catch (error) {
-			health = healthMonitor.failProtocol(error instanceof Error ? error.message : String(error), monotonicNow());
+			health = healthMonitor.failProtocol(error instanceof Error ? error.message : "invalid health record", monotonicNow());
 		}
 		if (validReport) snapshot.lastHeartbeatAt = observedAt;
 		if (validReport && health.lastProgressAt !== before.lastProgressAt) snapshot.lastProgressAt = observedAt;
@@ -458,15 +429,17 @@ export async function startManagedBackgroundRun(options: BackgroundRunOptions): 
 				requestStop("health_policy", health.failure);
 			}
 		}
-		child.once("error", (error) => {
+		child.once("error", () => {
+			if (snapshot.stopReason) return;
 			void finalize({
 				status: "failed",
 				terminationReason: "spawn_error",
 				exitCode: 1,
-				error: error.message,
+				error: "Managed process failed to start.",
 			});
 		});
 		child.once("close", (code, signal) => {
+			closeObserved = true;
 			if (finalized) return;
 			const stopReason = snapshot.stopReason;
 			if (stopReason === "timeout") {
@@ -475,7 +448,10 @@ export async function startManagedBackgroundRun(options: BackgroundRunOptions): 
 					terminationReason: "timed_out",
 					exitCode: code ?? undefined,
 					signal: signal ?? undefined,
-					error: `Background task timed out after ${compactDuration(options.timeoutMs)}${snapshot.terminationEscalated ? `; SIGKILL followed a ${compactDuration(options.terminateGraceMs)} grace period` : ""}.`,
+					error: appendDiagnostic(
+						`Background task timed out after ${compactDuration(options.timeoutMs)}.`,
+						snapshot.terminationEscalated ? `SIGKILL followed a ${compactDuration(options.terminateGraceMs)} grace period.` : "",
+					).replace(/;\s*$/, ""),
 				});
 				return;
 			}
@@ -518,12 +494,12 @@ export async function startManagedBackgroundRun(options: BackgroundRunOptions): 
 				error: `Background task exited with code ${code ?? "unknown"}.`,
 			});
 		});
-	} catch (error) {
+	} catch {
 		void finalize({
 			status: "failed",
 			terminationReason: "spawn_error",
 			exitCode: 1,
-			error: error instanceof Error ? error.message : String(error),
+			error: "Managed process failed to start.",
 		});
 	}
 

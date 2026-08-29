@@ -58,6 +58,34 @@ test("becoming busy cancels an idle timer without dropping completion", () => {
 	assert.equal(count, 1);
 });
 
+test("an unacknowledged delivered item can be released and retried after backoff", () => {
+	const scheduler = new FakeScheduler();
+	const flushes = [];
+	const item = { id: "one" };
+	const queue = createCompletionQueue({ scheduler, onFlush: (items) => flushes.push(items.map((entry) => entry.id)) });
+	queue.enqueue(item);
+	scheduler.runAll();
+	assert.deepEqual(flushes, [["one"]]);
+	queue.release([item]);
+	assert.equal(queue.pendingCount, 1);
+	assert.equal(queue.deliveredCount, 0);
+	queue.rearm();
+	scheduler.runAll();
+	assert.deepEqual(flushes, [["one"], ["one"]]);
+});
+
+test("clear drops old-branch dedupe state and allows the same id on a new branch", () => {
+	const scheduler = new FakeScheduler();
+	const flushes = [];
+	const queue = createCompletionQueue({ scheduler, onFlush: (items) => flushes.push(items.map((item) => item.id)) });
+	queue.enqueue({ id: "one" });
+	scheduler.runAll();
+	queue.clear();
+	assert.equal(queue.enqueue({ id: "one" }), true);
+	scheduler.runAll();
+	assert.deepEqual(flushes, [["one"], ["one"]]);
+});
+
 test("stop clears pending wakeups", () => {
 	const scheduler = new FakeScheduler();
 	let count = 0;

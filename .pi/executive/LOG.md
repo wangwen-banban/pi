@@ -13,3 +13,5 @@
 2026-08-16 | 文档与最终验收 | PASS：附件 warning 已补；diff/credential scan 与全部目标测试通过，准备分拆本地提交。
 2026-08-29 | Plan Mode 本地/Claude Code 对照审计 | 成功：确认核心 CLI 非开源；本地高频来自宽泛重复提示和固定双确认。
 2026-08-29 | Claude 风格 Plan Mode 实施与独立 QA | PASS：24/24 workflow、79/79 分类、91/91 对抗；0 blocker/major，1 minor 覆盖缺口。
+2026-08-29 | Background Tasks PR #1 双重审计 | 原 PR FAIL：隐私持久化、wake 误 ack/未持久化发送、TERM→KILL 假终态；转为兼容补丁。
+2026-08-29 | Background Tasks PR #1 最终 gate | PASS：75/75 background、313/313 Activity、24/24 Plan；0 blocker/major。

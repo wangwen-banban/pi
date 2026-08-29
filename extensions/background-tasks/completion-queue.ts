@@ -80,10 +80,31 @@ export function createCompletionQueue<T extends { id: string }>(options: {
 			clearTimer();
 			flush();
 		},
+		/** Release an unacknowledged delivery without immediately defeating backoff. */
+		release(items: T[]): void {
+			if (stopped) return;
+			for (const item of items) {
+				delivered.delete(item.id);
+				pending.set(item.id, item);
+			}
+		},
+		rearm(): void {
+			schedule();
+		},
+		acknowledge(ids: Iterable<string>): void {
+			for (const id of ids) delivered.delete(id);
+		},
+		clear(): void {
+			clearTimer();
+			pending.clear();
+			delivered.clear();
+			parentActive = false;
+		},
 		stop(): void {
 			stopped = true;
 			clearTimer();
 			pending.clear();
+			delivered.clear();
 		},
 		get pendingCount(): number {
 			return pending.size;

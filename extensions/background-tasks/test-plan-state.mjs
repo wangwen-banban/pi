@@ -4,6 +4,7 @@ import {
 	COMPLETED_TASK_HOLD_MS,
 	TASK_PLAN_MARKER_TYPE,
 	attachRunToTask,
+	durableTaskPlanMarker,
 	emptyTaskPlan,
 	finishTaskRun,
 	nextPendingTask,
@@ -130,16 +131,25 @@ test("dynamic reconciliation never exceeds the persisted 50-task contract", () =
 	);
 });
 
-test("branch reconstruction takes the newest valid marker", () => {
-	const first = reconcileTaskPlan(emptyTaskPlan(1), 0, [task("old", "Old")], "old", 2);
-	const second = reconcileTaskPlan(first, first.revision, [task("new", "New")], "new", 3);
+test("branch reconstruction takes the newest session-bound privacy-minimal marker", () => {
+	const first = reconcileTaskPlan(emptyTaskPlan(1), 0, [task("old", "Private old title")], "private reason", 2);
+	const second = reconcileTaskPlan(first, first.revision, [task("new", "Private new title")], "private reason two", 3);
+	const firstMarker = durableTaskPlanMarker(first, "session-test");
+	const secondMarker = durableTaskPlanMarker(second, "session-test");
+	const serialized = JSON.stringify(secondMarker);
+	assert.equal(serialized.includes("Private new title"), false);
+	assert.equal(serialized.includes("private reason"), false);
 	const reconstructed = reconstructTaskPlan([
-		{ type: "custom", customType: TASK_PLAN_MARKER_TYPE, data: first },
+		{ type: "custom", customType: TASK_PLAN_MARKER_TYPE, data: firstMarker },
 		{ type: "message", message: { role: "user" } },
-		{ type: "custom", customType: TASK_PLAN_MARKER_TYPE, data: second },
-	]);
+		{ type: "custom", customType: TASK_PLAN_MARKER_TYPE, data: secondMarker },
+	], Date.now(), "session-test");
 	assert.equal(reconstructed.revision, 2);
 	assert.equal(reconstructed.tasks[0].id, "new");
+	assert.equal(reconstructed.tasks[0].title, "new");
+	assert.equal(reconstructTaskPlan([
+		{ type: "custom", customType: TASK_PLAN_MARKER_TYPE, data: secondMarker },
+	], Date.now(), "other-session").revision, 0);
 });
 
 test("compact display keeps completed tasks briefly, then reveals later pending work", () => {

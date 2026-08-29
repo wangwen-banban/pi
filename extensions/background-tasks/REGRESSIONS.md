@@ -41,14 +41,21 @@ crash windows in (1).
 - Health-policy expiry terminates the owned process group through the existing
   TERM→KILL path and records `health_policy_failed`, creating an ordinary
   terminal lifecycle event.
-- Every wakeable terminal result is followed by an append-only pending-wake
-  marker before delivery. A successful settled assistant turn appends an
-  acknowledgement. Pending ids are deduplicated in one runtime and safely
-  replayed after restart.
-- Restart reconstruction finalizes an `in_progress` task from a valid durable
-  result. If process ownership was lost without a terminal result, it fails
-  closed as `monitor_restarted`; Pi does not guess or reattach to an arbitrary
-  process id.
+- Every wakeable terminal result requires durable plan and pending markers
+  before delivery. Each send has an explicit delivery id, attempt, run ids and
+  sequences. Only the matching agent run's final `stop` response at an idle
+  settle can append an acknowledgement; no later assistant message is an
+  implicit ack. Missing starts and failed responses release dedupe for bounded-
+  backoff retry.
+- Restart reconstruction finalizes an `in_progress` task only from a strict,
+  session-bound v3 terminal manifest. Lost ownership without a terminal result
+  fails closed as `monitor_restarted`; invalid terminal evidence is surfaced as
+  `recovery_blocked`. Pi never guesses or reattaches to a process id.
+- TERM→KILL finalization waits for child `close`. Signal failure or a missing
+  close becomes `termination_unconfirmed`, never a fabricated stopped/timeout
+  result.
+- Durable run/session/web records contain no commands, paths, titles, output,
+  credentials, parent context, PID, or start token. No stdout/stderr logs exist.
 - Task-plan revisions remain optimistic: completion/recovery increments the
   current revision, stale model updates are rejected, and wake delivery reads
   the latest revision.
@@ -61,9 +68,9 @@ operation or replayed idempotently after restart until acknowledged.
 ### Compatibility
 
 Existing calls without `healthPolicy` retain process-exit/signal/wall-timeout
-semantics. Text such as `unavailable` remains ordinary output. The new run
-record version is read alongside legacy results; old terminal history is not
-replayed merely because the extension was upgraded.
+semantics. Text such as `unavailable` remains ordinary output. Legacy/full run
+records are intentionally rejected rather than trusted for recovery; their
+terminal plans produce an explicit blocked recovery notice.
 
 ### Regression coverage
 
@@ -73,6 +80,10 @@ replayed merely because the extension was upgraded.
 - transient unavailable→healthy recovery and sustained unavailable/stale
   progress;
 - malformed/missing heartbeat policy records;
-- result recovery, lost ownership, pending replay, persisted-response crash
-  window, acknowledgement/deduplication, and latest-plan revision races;
-- privacy-safe PI WEB health/progress projection.
+- strict manifest recovery, lost ownership, blocked invalid recovery, pending
+  replay, explicit acknowledgement/deduplication, watchdogs, and latest-plan
+  revision races;
+- append failure sends zero, tool/error responses never ack, nested busy settles
+  never flush, and shutdown/branch changes cancel retry;
+- recursive durable-data privacy scans, symlink/traversal/mode/session/schema/
+  stale/coherence rejection, and privacy-safe PI WEB health projection.

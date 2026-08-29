@@ -108,7 +108,10 @@ All windows are explicit, from 1 second through 7 days. Omitting
 ### `stop_background_task`
 
 Stops an exact run id or task id. The owned process group receives `SIGTERM`,
-then `SIGKILL` after a five-second grace period if needed.
+then `SIGKILL` after a five-second grace period if needed. A KILL request is not
+a terminal result: the runner still waits for child `close`. If close never
+arrives within the bounded confirmation window, the honest terminal class is
+`termination_unconfirmed`, not `stopped` or `timed_out`.
 
 ## Completion behavior
 
@@ -117,28 +120,34 @@ Any terminal result updates the plan and wakes the main model:
 - exit 0 → `completed`
 - non-zero exit, signal, spawn failure, wall timeout or health-policy expiry → `failed`
 - restart with lost process ownership → `failed` (`monitor_restarted`)
+- unsafe/missing terminal recovery evidence → `blocked` (`recovery_blocked`)
+- TERM/KILL without observed close → `failed` (`termination_unconfirmed`)
 - explicit stop → `cancelled`
 - graceful session shutdown/reload → `blocked`
 
-Before delivery, the terminal result, terminal task-plan revision, and a
-per-run pending-wake marker are appended durably. The wake uses
-`triggerTurn: true` and `deliverAs: "followUp"`. If the main model is responding
-to another user prompt, completion waits for `agent_settled` (after retries,
-auto-compaction, and queued continuations), not merely a low-level `agent_end`.
-Completions arriving together are coalesced. The injected message uses the
-latest task-plan revision, so a user reprioritization made while the command ran
-determines the next pending task.
+Before delivery, the terminal task-plan revision and a per-run pending marker
+must both append successfully. Every send then appends a delivery marker binding
+the exact session, random delivery id, attempt, run ids, and run sequences. The
+wake uses `triggerTurn: true` and `deliverAs: "followUp"`. Persistence failure
+sends nothing and leaves bounded-backoff in-memory retry state. Missing
+`agent_start`/message delivery is detected by a watchdog and releases queue
+deduplication for another explicit attempt.
 
-A successful assistant response acknowledges each durable run id. Normal
-runtime delivery is deduplicated; if Pi exits after terminal persistence but
-before acknowledgement, session reconstruction safely replays the same id. A
-persisted assistant response also acts as an implicit acknowledgement for the
-small crash window before the explicit acknowledgement marker. On restart, an
-`in_progress` plan with a valid terminal `result.json` is finalized from that
-result. If no terminal result exists, ownership cannot safely be reattached, so
-the run fails closed with `monitor_restarted` and wakes recovery instead of
-remaining `in_progress` forever. Graceful reload/shutdown still stops owned
-processes and marks their tasks `blocked` without a completion wake.
+If the main model is responding to another prompt, completion waits for an
+`agent_settled` event whose `ctx.isIdle()` is actually true. Completions arriving
+together are coalesced, and the injected message uses the latest plan revision.
+Only the matching delivery's final assistant response with `stopReason=stop`
+can append an explicit acknowledgement at an idle settle. `toolUse`, `length`,
+`error`, and `aborted` never acknowledge; later unrelated successful turns do
+not repair a failed attempt. Branch changes and shutdown cancel old-session
+watchdogs and retries. There is deliberately no implicit assistant-message ack.
+
+On restart, an `in_progress` plan with a valid, session-bound v3 terminal
+`result.json` is finalized from that manifest. A missing unowned result becomes
+`monitor_restarted`. A terminal plan whose manifest is missing, malformed,
+stale, mismatched, symlinked, or incorrectly permissioned becomes an explicit
+`recovery_blocked` result and durable wake rather than being silently skipped.
+Graceful reload/shutdown stops owned processes without waking the old session.
 
 ## Commands and UI
 
@@ -156,26 +165,35 @@ omitted non-active tasks disappear from the latest marker, system prompt,
 `/tasks`, and PI WEB projection. An active managed run can never be omitted.
 Terminal tasks kept because they remain relevant stay in the compact TUI/PI WEB
 display briefly (completed rows age out visually after 60 seconds). The
-append-only transcript, completion message, and private result logs retain the
+append-only transcript and bounded completion message retain the model-facing
 audit trail. The PI WEB Activity panel reads a privacy-trimmed record and shows
 task ids/statuses plus managed-run timing.
 
 ## Storage and privacy
 
-Full private run data is stored under:
+A privacy-minimal terminal manifest is stored under:
 
 ```text
-~/.pi/agent/background-task-runs/<session-id>/<run-id>/
+~/.pi/agent/background-task-runs/<session-id>/<random-run-id>/result.json
 ```
 
-Directories are `0700`; metadata, result and log files are `0600`. Console logs
-are capped. Pending/acknowledged wake markers are branch-aware session custom
-entries and do not enter model context. The workspace Activity registry
-contains no command, full task title, output, progress token, credentials,
-parent context or PID—only short ids/names, lifecycle/health status, revision
-and timestamps.
+Directories are strict `0700` and the manifest is strict `0600`. Run ids are
+cryptographically random; atomic temporary names use cryptographic nonces and
+never PIDs. Storage creation is exclusive, rejects symlinks/non-regular files,
+checks realpath containment and ownership/modes, and fails closed on any
+permission or atomic-publication error. No metadata sidecar, `stdout.log`, or
+`stderr.log` is created. Command, cwd/path, title, credentials, output/tails,
+parent context, PID, and process start tokens are never written to run storage,
+session markers, or PI WEB records. Console output exists only as a bounded
+in-memory tail and in the one current completion message when needed.
 
-The task plan and wake outbox are session custom entries and follow `/tree`,
+The v3 terminal manifest contains only session/run/task bindings, terminal
+status/classification, bounded timestamps, exit/signal flags, and health timing
+metadata. Legacy/full snapshots, stale or incoherent records, and identity
+mismatches are rejected. Privacy-minimal v2 plan/wake markers are branch-aware
+session custom entries and do not enter model context.
+
+The task plan and wake outbox follow `/tree`,
 `/rewind`, `/sync`, and reload reconstruction. Active runs and unacknowledged
 completion wakes block branch/session switches. Browser disconnects do not stop
 a PI WEB session runtime. `/reload`, session close/archive, or TUI exit safely
