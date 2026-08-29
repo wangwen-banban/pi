@@ -52,6 +52,9 @@ npm install -g @earendil-works/pi-coding-agent
 # Clone this configuration
 git clone git@github.com:wangwen-banban/pi.git ~/.pi/agent
 
+# Clone the portable personal skills repository (kept separate from Pi config)
+git clone git@github.com:wangwen-banban/Ban-Skills.git ~/Ban-Skills
+
 # Ensure helper scripts are executable
 chmod +x ~/.pi/agent/scripts/*.sh
 
@@ -68,6 +71,24 @@ chmod +x ~/.pi/agent/scripts/*.sh
 # Start pi
 pi
 ```
+
+### Install Ban-Skills
+
+[`Ban-Skills`](https://github.com/wangwen-banban/Ban-Skills) is maintained as a separate repository so this Pi configuration can keep its local `skills/` directory untracked. After cloning it as shown above, merge this top-level setting into `~/.pi/agent/settings.json` (append to an existing `skills` array rather than replacing other entries):
+
+```json
+{
+  "skills": ["~/Ban-Skills"]
+}
+```
+
+Pi recursively discovers each directory containing `SKILL.md`; individual copies or symlinks are unnecessary. Pi `0.84.1` uses the setting name `skills` (not `skillDirectories`). After installation or updates, run `/reload`, then verify with a command such as `/skill:executive-delegation`. Update all skills later with:
+
+```bash
+git -C ~/Ban-Skills pull --ff-only
+```
+
+Review third-party skill instructions before loading them because skills can direct the agent to run tools and scripts.
 
 `auth.json` is intentionally excluded from Git and will not be present after cloning.
 
