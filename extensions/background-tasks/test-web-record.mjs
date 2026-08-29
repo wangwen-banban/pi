@@ -31,6 +31,10 @@ test("background web records expose lifecycle metadata but no task text, command
 		startedAt: 110,
 		timeoutAt: 1000,
 		lastOutputAt: 150,
+		lastProgressAt: 175,
+		lastHeartbeatAt: 190,
+		healthStatus: "healthy",
+		healthDeadlineAt: 1_500,
 		stdoutTail: liveOutput,
 		stderrTail: "",
 		stdoutPath: "/private/stdout.log",
@@ -40,6 +44,7 @@ test("background web records expose lifecycle metadata but no task text, command
 		command: secretCommand,
 		pid: 12345,
 		apiKey: "top-secret",
+		healthProgressToken: "private-progress-token",
 	};
 	const record = buildBackgroundTasksRecord(plan, [run], identity, 300);
 	const serialized = JSON.stringify(record);
@@ -47,6 +52,7 @@ test("background web records expose lifecycle metadata but no task text, command
 	assert.equal(serialized.includes(secretCommand), false);
 	assert.equal(serialized.includes(liveOutput), false);
 	assert.equal(serialized.includes("top-secret"), false);
+	assert.equal(serialized.includes("private-progress-token"), false);
 	assert.equal(serialized.includes("12345"), false);
 	assert.equal(serialized.includes("/private/"), false);
 	assert.equal(record.revision, 7);
@@ -59,6 +65,10 @@ test("background web records expose lifecycle metadata but no task text, command
 		runId: "bg-run-1",
 	});
 	assert.equal(record.runs[0].name, "benchmark_run");
+	assert.equal(record.runs[0].lastProgressAt, 175);
+	assert.equal(record.runs[0].lastHeartbeatAt, 190);
+	assert.equal(record.runs[0].healthStatus, "healthy");
+	assert.equal(record.runs[0].healthDeadlineAt, 1_500);
 });
 
 test("runtime heartbeat identifies background source and shutdown omits heartbeat", () => {

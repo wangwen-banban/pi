@@ -270,6 +270,10 @@ describe('backend contract — background task records', () => {
     createdAt: 7000,
     startedAt: 7100,
     lastOutputAt: 7900,
+    lastProgressAt: 7950,
+    lastHeartbeatAt: 7990,
+    healthStatus: 'healthy',
+    healthDeadlineAt: 9000,
     timeoutAt: 20_000,
     stdoutTail: 'secret output',
     stderrTail: '',
@@ -299,6 +303,10 @@ describe('backend contract — background task records', () => {
       ['analyze', 'pending'],
     ]);
     assert.equal(parsedTasks.runs[0].status, 'running');
+    assert.equal(parsedTasks.runs[0].lastProgressAt, 7950);
+    assert.equal(parsedTasks.runs[0].lastHeartbeatAt, 7990);
+    assert.equal(parsedTasks.runs[0].healthStatus, 'healthy');
+    assert.equal(parsedTasks.runs[0].healthDeadlineAt, 9000);
 
     const projected = projectSession({
       runtimes: [parsedRuntime.public],
