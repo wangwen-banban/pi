@@ -275,10 +275,13 @@ Keep the home Mac awake, let PI WEB and Tailscale start after reboot, and retain
 ## Plan Mode
 
 - `enter_plan_mode` blocks write tools and writes a branch-aware durable marker.
-- `ask_user` displays interactive choices where supported.
-- `exit_plan_mode` presents the complete plan for explicit approval.
+- Model-initiated entry is limited to an explicit request to plan first, whole-plan approval for an irreversible/high-risk operation, or a material goal/architecture fork that genuinely requires the user's direction.
+- File count, ordinary complexity or multi-step work, implementation-detail choices, test/build failures, and follow-ups within an approved goal do not trigger another planning pass.
+- `ask_user` is only for a real unresolved ambiguity or consequential tradeoff. A clear plan can go directly to `exit_plan_mode`, so the normal flow has one final approval prompt.
+- Approval covers implementation, tests, fixes, and validation for the same top-level goal. Re-enter only when that goal materially changes or the approved approach is invalid and the user must choose a new direction.
+- `exit_plan_mode` presents the complete plan for explicit approval; calling it while inactive is a no-op and never opens approval UI.
 - TUI uses its custom approval view; PI WEB/RPC uses browser confirm and optional feedback dialogs.
-- Reject, cancel, feedback, JSON/print mode, or unavailable UI all fail closed and keep write access blocked.
+- Reject, cancel, feedback, JSON/print mode, or unavailable UI all fail closed and keep write access blocked. Rejection or feedback stays in the current Plan Mode and the revised plan is submitted with `exit_plan_mode` again.
 - `/reload`, `/tree`, and `/rewind` reconstruct Plan Mode from the current branch; shutdown never silently turns it off.
 - The PI WEB Activity panel displays a persistent PLAN chip, reason, and runtime liveness.
 

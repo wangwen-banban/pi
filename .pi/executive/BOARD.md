@@ -1,4 +1,4 @@
-# 任务看板（更新时间：2026-08-16）
+# 任务看板（更新时间：2026-08-29）
 
 ## 进行中
 - （无）
@@ -16,6 +16,7 @@
 - [x] History patch 独立 QA — PASS：独立 7/7 + 官方 9/9；installer/hash/tamper/patch共存通过。
 - [x] 文档收口 — 根 README、附件重新附加警告与 patch bootstrap 已更新。
 - [x] 最终验收 — diff/credential scan、rewind 6/6、smart 23/23、history 9/9、两个 package patch check 全过。
+- [x] Claude 风格 Plan Mode — 收窄自动触发、取消固定双确认、enter sequential、inactive exit 无 UI；独立 QA PASS，0 blocker/major。
 
 ## 失败/搁置
 - [ ] `codex_rewind_semantics` — runtime 中断，仅留 context.md。

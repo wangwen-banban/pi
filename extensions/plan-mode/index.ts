@@ -2,12 +2,13 @@
  * Plan Mode Extension
  *
  * Implements Claude Code–style plan mode for Pi:
- * - Model calls `enter_plan_mode` → write tools are blocked
- * - Model uses `ask_user` → interactive options + Other free-form
+ * - Model or user enters plan mode → write tools are blocked
+ * - Model uses `ask_user` only for genuine unresolved choices
  * - Model calls `exit_plan_mode` with a plan summary → user approves/edits/rejects
- * - On approve → write tools unblocked, model proceeds to implement
+ * - On approve → write tools stay unblocked for the same top-level goal
  *
- * The model is guided via promptGuidelines to use these tools proactively.
+ * The model is guided via promptGuidelines to treat planning as an approval
+ * boundary rather than a task-complexity checklist.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -284,8 +285,10 @@ export default function planMode(pi: ExtensionAPI) {
 				"git commit/add/push/checkout, package installs, inline eval (`node -e`, `python -c`), sudo, " +
 				"and process/system control.\n" +
 				"Sub-agents you dispatch are forced to read-only while plan mode is active.\n" +
-				"Your job: explore, present options (ask_user), then present the final plan (exit_plan_mode).\n" +
-				`Plan reason: ${planModeReason || "proactive planning"}\n`,
+				"Your job: explore and prepare a plan. Use `ask_user` only for a genuine unresolved ambiguity or " +
+				"consequential tradeoff; if the plan is clear, call `exit_plan_mode` directly. Rejection or feedback " +
+				"keeps this same Plan Mode active — revise and call `exit_plan_mode` again without another `enter_plan_mode`.\n" +
+				`Plan reason: ${planModeReason || "planning approval"}\n`,
 		};
 	});
 
@@ -372,20 +375,23 @@ export default function planMode(pi: ExtensionAPI) {
 		name: "enter_plan_mode",
 		label: "Enter Plan Mode",
 		description:
-			"Enter plan mode to explore the codebase and design an approach before coding. " +
-			"Use this proactively for non-trivial tasks, architectural decisions, multi-file changes, " +
-			"or when multiple valid approaches exist. In plan mode, write tools (bash, edit, write) are " +
-			"blocked — you can only read, search, and ask the user questions.",
-		promptSnippet: "Enter read-only planning phase for non-trivial tasks",
+			"Enter read-only Plan Mode only when the user explicitly requests planning, an irreversible or " +
+			"high-risk operation needs whole-plan approval, or an unresolved material objective/architecture " +
+			"fork requires the user to choose. Do not enter for ordinary complexity, multi-file work, " +
+			"implementation-detail choices, failures, or follow-ups within an approved goal.",
+		promptSnippet: "Enter read-only approval planning for an explicit request, high risk, or a strategic fork",
 		promptGuidelines: [
-			"Call enter_plan_mode BEFORE starting non-trivial implementation tasks.",
-			"In plan mode: explore code with read/grep/find, then present options via ask_user.",
-			"When your plan is ready, call exit_plan_mode with a summary for user approval.",
-			"Do NOT skip planning for tasks touching >2 files or with multiple valid approaches.",
+			"Call enter_plan_mode only when the user explicitly asks to plan first, an irreversible/high-risk operation needs whole-plan approval, or an unresolved material goal/architecture fork requires the user's direction.",
+			"Multiple files, ordinary complex or multi-step work, several pure implementation-detail choices, and test/build failures are NOT reasons to enter Plan Mode.",
+			"Approval covers implementation, tests, fixes, and validation for the same top-level goal. Do not re-enter for follow-ups within that goal; re-enter only if the goal materially changes or the approved approach is invalid and the user must choose a new direction.",
+			"In Plan Mode, explore with read/grep/find and read-only bash. Use ask_user only for a genuine unresolved ambiguity or consequential tradeoff.",
+			"If the plan is clear, call exit_plan_mode directly; ask_user is optional, so normally there is only one final approval prompt.",
+			"After rejection or feedback, remain in the current Plan Mode, revise, and call exit_plan_mode again without another enter_plan_mode.",
 		],
 		parameters: Type.Object({
 			reason: Type.Optional(Type.String({ description: "Brief reason for entering plan mode (optional)" })),
 		}),
+		executionMode: "sequential",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			currentCtx = ctx;
 			settings = loadSettings();
@@ -412,8 +418,8 @@ export default function planMode(pi: ExtensionAPI) {
 							"",
 							"Available actions:",
 							"• Read/grep/find — explore the codebase",
-							"• ask_user — present options or clarify requirements",
-							"• exit_plan_mode — present final plan for user approval",
+							"• ask_user — only when a genuine ambiguity or tradeoff requires input",
+							"• exit_plan_mode — present a clear final plan directly for approval",
 							"",
 							"Blocked: mutating bash, edit, write, run_background_task (until plan is approved)",
 						].filter(Boolean).join("\n"),
@@ -435,10 +441,10 @@ export default function planMode(pi: ExtensionAPI) {
 		name: "ask_user",
 		label: "Ask User",
 		description:
-			"Ask the user a question with numbered options. Always include meaningful choices. " +
-			"An 'Other' free-form input option is automatically appended. " +
-			"Use this to clarify requirements, present architectural choices, or gather preferences.",
-		promptSnippet: "Ask user a multiple-choice question (Other option auto-added)",
+			"Ask the user only when a genuine unresolved ambiguity, consequential tradeoff, or user preference " +
+			"blocks a responsible choice. Include meaningful numbered options; an 'Other' free-form input is " +
+			"automatically appended. Do not use this as routine confirmation before exit_plan_mode.",
+		promptSnippet: "Ask about a genuine unresolved choice (Other option auto-added)",
 		parameters: Type.Object({
 			question: Type.String({ description: "The question to ask" }),
 			options: Type.Array(
@@ -614,6 +620,17 @@ export default function planMode(pi: ExtensionAPI) {
 		}),
 		executionMode: "sequential",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			if (!inPlanMode) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Plan mode is not active. No approval UI was opened and no state changed.",
+						},
+					],
+				};
+			}
+
 			currentCtx = ctx;
 			const planText = String(params.plan ?? "").slice(0, 12_000);
 			const channel = planExitChannel(ctx.mode);
@@ -831,6 +848,7 @@ export default function planMode(pi: ExtensionAPI) {
 			if (msg.includes("APPROVED")) return new Text(theme.fg("success", "✅ Plan approved — implementing"), 0, 0);
 			if (msg.includes("REJECTED")) return new Text(theme.fg("error", "❌ Plan rejected — revising"), 0, 0);
 			if (msg.includes("feedback")) return new Text(theme.fg("warning", "✏️  Feedback received — revising"), 0, 0);
+			if (msg.includes("not active")) return new Text(theme.fg("dim", "— Plan mode already inactive; no approval requested"), 0, 0);
 			return new Text(theme.fg("dim", "— cancelled"), 0, 0);
 		},
 	});

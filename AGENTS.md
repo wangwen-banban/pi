@@ -2,35 +2,38 @@
 
 ## Plan Mode (Tool-Enforced Workflow)
 
-You have access to three plan-mode tools that control write permissions:
+You have access to three plan-mode tools that control write permissions. Plan Mode is an approval boundary, not a complexity checklist.
 
 ### When to Enter Plan Mode
 
-Call `enter_plan_mode` BEFORE starting implementation when:
-- Task is non-trivial (touching >2 files or with architectural decisions)
-- Multiple valid approaches exist and you're unsure which the user prefers
-- The request is ambiguous and needs clarification
-- After errors or unexpected results — do NOT blindly retry
+Call `enter_plan_mode` before implementation only when:
+- The user explicitly asks to plan or review the approach before making changes
+- An irreversible or high-risk operation needs approval of the complete approach
+- Exploration reveals a material strategic fork that would change the top-level objective or architecture, and the requirements do not let you responsibly choose a direction
 
 ### Workflow in Plan Mode
 
-1. Call `enter_plan_mode` → write tools (bash, edit, write) become blocked
-2. Explore with read/grep/find to understand the codebase
-3. Use `ask_user` to clarify requirements or present options:
-   - Always provide 2–5 concrete options with tradeoffs
+1. Call `enter_plan_mode` → mutating bash, edit, write, and managed background work become blocked
+2. Explore with read/grep/find and read-only bash to understand the codebase
+3. Use `ask_user` only when a genuine unresolved ambiguity, consequential tradeoff, or user preference blocks a responsible choice:
+   - Provide 2–5 concrete options with tradeoffs
    - The "Other" free-form input is automatically appended
-   - Wait for user selection
-4. When plan is ready, call `exit_plan_mode` with a markdown plan
-5. User approves → write tools unblocked → implement
-   User rejects → revise plan
-   User gives feedback → incorporate and re-present
+   - Do not ask merely because several implementation details are possible; choose those yourself
+4. If the plan is clear, call `exit_plan_mode` directly with the markdown plan. `ask_user` is optional, so a normal clear planning pass has one final approval prompt
+5. User approves → write tools unblock and the approval covers implementation, tests, fixes, and validation for the same top-level goal
+   User rejects or gives feedback → remain in the current Plan Mode, revise, and call `exit_plan_mode` again without another `enter_plan_mode`
 
 ### When NOT to Enter Plan Mode
 
-- Simple, unambiguous single-file edits
-- Follow-up execution after the user already approved a plan
-- User explicitly said "just do it" / "直接做"
-- Trivial commands with no ambiguity
+The following do not by themselves justify Plan Mode:
+- Multiple files or a large diff
+- Ordinary complex or multi-step work
+- Several valid choices that are purely implementation details
+- Test, build, tool, or other routine failures; diagnose and continue within the current goal
+- Follow-up implementation, debugging, or validation inside an already approved scope
+- A clear request to "just do it" / "直接做", unless the operation is irreversible or high-risk
+
+After approval, do not re-enter for the same top-level goal. Re-enter only if the goal materially changes, or the approved approach becomes invalid and a new direction genuinely requires the user's choice. Do not call `enter_plan_mode` while already active; after rejection or feedback, revise and call `exit_plan_mode` again.
 
 ### /plan Command
 
