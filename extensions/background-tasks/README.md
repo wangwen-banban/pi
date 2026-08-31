@@ -168,7 +168,10 @@ display briefly (completed rows age out visually after 60 seconds). In the TUI,
 Tasks shares one editor-above activity stack with Smart Sub Agents: Tasks is
 always first and Sub Agents follows immediately, regardless of which extension
 refreshes most recently. Each section retains its independent 10-line widget
-limit and truncation notice. The append-only transcript and bounded completion
+limit and truncation notice. While a Plan Mode question or approval replaces the
+editor, Pi 0.84.1 keeps the current stack snapshot static; task state/timers keep
+running, and the latest Tasks-then-Sub-Agents snapshot is rendered once when the
+dialog closes. The append-only transcript and bounded completion
 message retain the model-facing audit trail. The PI WEB Activity panel reads a
 privacy-trimmed record and shows task ids/statuses plus managed-run timing.
 

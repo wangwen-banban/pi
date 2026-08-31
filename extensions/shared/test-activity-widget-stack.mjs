@@ -123,6 +123,101 @@ test("100 alternating refreshes keep Tasks above Sub Agents without re-registeri
 	assert.equal(ui.placements.get(helperA.ACTIVITY_WIDGET_KEY), "aboveEditor");
 });
 
+test("presentation lease freezes 100 alternating updates and flushes the latest ordered snapshot once", () => {
+	const ui = new FakeUi();
+	const tasks = helperA.createActivityWidgetOwner("tasks");
+	const agents = helperA.createActivityWidgetOwner("subagents");
+	helperA.setActivityWidgetSection(ui, agents, ["Sub Agents", "└─ agent-0"]);
+	helperA.setActivityWidgetSection(ui, tasks, ["Tasks · revision 0", "○ task-0"]);
+
+	const frozen = trimmed(ui);
+	const callsBeforeLease = ui.calls.length;
+	const rendersBeforeLease = ui.renderRequests;
+	const lease = helperA.acquireActivityWidgetPresentationLease(ui);
+	for (let index = 1; index <= 100; index += 1) {
+		if (index % 2 === 0) {
+			helperA.setActivityWidgetSection(ui, tasks, [`Tasks · revision ${index}`, `○ task-${index}`]);
+		} else {
+			helperA.setActivityWidgetSection(ui, agents, ["Sub Agents", `└─ agent-${index}`]);
+		}
+		ui.tui.requestRender(); // Simulate unrelated full-TUI/spinner redraw pressure.
+		ui.widgets.get(helperA.ACTIVITY_WIDGET_KEY).invalidate();
+		assert.deepEqual(trimmed(ui), frozen, "invalidations must keep the leased snapshot static");
+	}
+
+	assert.equal(ui.calls.length, callsBeforeLease, "leased updates must not call setWidget");
+	assert.equal(
+		ui.renderRequests,
+		rendersBeforeLease + 100,
+		"only the 100 simulated external redraws may request presentation",
+	);
+	lease.release();
+	assert.equal(ui.calls.length, callsBeforeLease, "mounted stack refreshes without re-registering");
+	assert.equal(ui.renderRequests, rendersBeforeLease + 101, "outer release renders at most once");
+	assert.deepEqual(trimmed(ui), ["Tasks · revision 100", "○ task-100", "Sub Agents", "└─ agent-99"]);
+	lease.release();
+	assert.equal(ui.renderRequests, rendersBeforeLease + 101, "lease release is idempotent");
+});
+
+test("nested leases preserve clear and owner replacement semantics until the outer release", () => {
+	const ui = new FakeUi();
+	const oldTasks = helperA.createActivityWidgetOwner("tasks");
+	const oldAgents = helperA.createActivityWidgetOwner("subagents");
+	helperA.setActivityWidgetSection(ui, oldTasks, ["Tasks old"]);
+	helperA.setActivityWidgetSection(ui, oldAgents, ["Sub Agents old"]);
+	const frozen = trimmed(ui);
+
+	const outer = helperA.acquireActivityWidgetPresentationLease(ui);
+	const inner = helperB.acquireActivityWidgetPresentationLease(ui);
+	const newTasks = helperB.createActivityWidgetOwner("tasks");
+	const newAgents = helperB.createActivityWidgetOwner("subagents");
+	helperB.setActivityWidgetSection(ui, newTasks, ["Tasks new"]);
+	helperB.setActivityWidgetSection(ui, newAgents, ["Sub Agents new"]);
+	helperB.setActivityWidgetSection(ui, newAgents); // Current owner clears only its own section.
+	const callsWhileFrozen = ui.calls.length;
+	const rendersWhileFrozen = ui.renderRequests;
+
+	// Owners retired by replacement can neither clear nor republish over the new owner.
+	helperA.setActivityWidgetSection(ui, oldTasks);
+	helperA.setActivityWidgetSection(ui, oldTasks, ["Tasks stale"]);
+	helperA.releaseActivityWidgetSection(ui, oldAgents);
+	assert.equal(ui.calls.length, callsWhileFrozen);
+	assert.equal(ui.renderRequests, rendersWhileFrozen);
+	assert.deepEqual(trimmed(ui), frozen);
+
+	outer.release();
+	outer.release();
+	assert.equal(ui.renderRequests, rendersWhileFrozen, "inner lease still owns the freeze");
+	inner.release();
+	assert.equal(ui.renderRequests, rendersWhileFrozen + 1);
+	assert.deepEqual(trimmed(ui), ["Tasks new"]);
+
+	const shutdownLease = helperA.acquireActivityWidgetPresentationLease(ui);
+	helperB.releaseActivityWidgetSection(ui, newTasks);
+	assert.deepEqual(trimmed(ui), ["Tasks new"], "shutdown clear stays static during a lease");
+	shutdownLease.release();
+	assert.equal(ui.widgets.has(helperA.ACTIVITY_WIDGET_KEY), false, "final empty snapshot removes the widget");
+});
+
+test("presentation leases are isolated between UI objects", () => {
+	const first = new FakeUi();
+	const second = new FakeUi();
+	const firstOwner = helperA.createActivityWidgetOwner("tasks");
+	const secondOwner = helperA.createActivityWidgetOwner("tasks");
+	helperA.setActivityWidgetSection(first, firstOwner, ["Tasks first · old"]);
+	helperA.setActivityWidgetSection(second, secondOwner, ["Tasks second · old"]);
+	const firstLease = helperA.acquireActivityWidgetPresentationLease(first);
+	const secondLease = helperA.acquireActivityWidgetPresentationLease(second);
+	helperA.setActivityWidgetSection(first, firstOwner, ["Tasks first · new"]);
+	helperA.setActivityWidgetSection(second, secondOwner, ["Tasks second · new"]);
+
+	firstLease.release();
+	assert.deepEqual(trimmed(first), ["Tasks first · new"]);
+	assert.deepEqual(trimmed(second), ["Tasks second · old"]);
+	secondLease.release();
+	assert.deepEqual(trimmed(second), ["Tasks second · new"]);
+});
+
 test("either section can render alone", () => {
 	const tasksUi = new FakeUi();
 	const agentsUi = new FakeUi();

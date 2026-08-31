@@ -11,6 +11,11 @@ export interface ActivityWidgetOwner {
 	readonly section: ActivityWidgetSection;
 }
 
+export interface ActivityWidgetPresentationLease {
+	/** Release this lease once. Repeated calls are harmless. */
+	release(): void;
+}
+
 const SECTION_ORDER: readonly ActivityWidgetSection[] = ["tasks", "subagents"];
 const STATE_SYMBOL = Symbol.for("pi.extensions.activity-widget-stack.state.v1");
 
@@ -20,8 +25,14 @@ type ActivityTui = { requestRender(): void };
 
 interface ActivityWidgetState {
 	owners: Partial<Record<ActivityWidgetSection, ActivityWidgetOwner>>;
+	/** Latest logical state, including updates received while presentation is leased. */
 	sections: Partial<Record<ActivityWidgetSection, readonly string[]>>;
+	/** Immutable-for-the-lease snapshot consumed by the mounted component. */
+	presentedSections: Partial<Record<ActivityWidgetSection, readonly string[]>>;
 	legacyCleanedOwners: WeakSet<ActivityWidgetOwner>;
+	retiredOwners: WeakSet<ActivityWidgetOwner>;
+	presentationLeases: Set<object>;
+	presentationDirty: boolean;
 	component?: ActivityWidgetStackComponent;
 }
 
@@ -39,6 +50,17 @@ function globalStates(): WeakMap<object, ActivityWidgetState> {
 	return states;
 }
 
+function copySections(
+	sections: Partial<Record<ActivityWidgetSection, readonly string[]>>,
+): Partial<Record<ActivityWidgetSection, readonly string[]>> {
+	const copy: Partial<Record<ActivityWidgetSection, readonly string[]>> = {};
+	for (const section of SECTION_ORDER) {
+		const lines = sections[section];
+		if (lines?.length) copy[section] = [...lines];
+	}
+	return copy;
+}
+
 function stateFor(ui: ActivityWidgetUi): ActivityWidgetState {
 	const states = globalStates();
 	const key = ui as object;
@@ -47,15 +69,28 @@ function stateFor(ui: ActivityWidgetUi): ActivityWidgetState {
 		state = {
 			owners: {},
 			sections: {},
+			presentedSections: {},
 			legacyCleanedOwners: new WeakSet<ActivityWidgetOwner>(),
+			retiredOwners: new WeakSet<ActivityWidgetOwner>(),
+			presentationLeases: new Set<object>(),
+			presentationDirty: false,
 		};
 		states.set(key, state);
+	} else {
+		// STATE_SYMBOL intentionally remains v1 so independently loaded extension
+		// copies share ownership. Fill fields added after the original v1 shape.
+		state.presentedSections ??= copySections(state.sections);
+		state.retiredOwners ??= new WeakSet<ActivityWidgetOwner>();
+		state.presentationLeases ??= new Set<object>();
+		state.presentationDirty ??= false;
 	}
 	return state;
 }
 
-function hasVisibleSections(state: ActivityWidgetState): boolean {
-	return SECTION_ORDER.some((section) => (state.sections[section]?.length ?? 0) > 0);
+function hasVisibleSections(
+	sections: Partial<Record<ActivityWidgetSection, readonly string[]>>,
+): boolean {
+	return SECTION_ORDER.some((section) => (sections[section]?.length ?? 0) > 0);
 }
 
 class ActivityWidgetStackComponent extends Container {
@@ -89,7 +124,7 @@ class ActivityWidgetStackComponent extends Container {
 	private rebuild(): void {
 		this.clear();
 		for (const section of SECTION_ORDER) {
-			const lines = this.state.sections[section];
+			const lines = this.state.presentedSections[section];
 			if (!lines?.length) continue;
 			for (const line of lines.slice(0, MAX_ACTIVITY_SECTION_LINES)) {
 				this.addChild(new Text(line, 1, 0));
@@ -108,7 +143,8 @@ function clearLegacyWidgets(ui: ActivityWidgetUi, state: ActivityWidgetState, ow
 }
 
 function syncWidget(ui: ActivityWidgetUi, state: ActivityWidgetState): void {
-	if (!hasVisibleSections(state)) {
+	state.presentedSections = copySections(state.sections);
+	if (!hasVisibleSections(state.presentedSections)) {
 		ui.setWidget(ACTIVITY_WIDGET_KEY, undefined);
 		state.component = undefined;
 		return;
@@ -130,8 +166,47 @@ function syncWidget(ui: ActivityWidgetUi, state: ActivityWidgetState): void {
 	);
 }
 
+function requestWidgetSync(ui: ActivityWidgetUi, state: ActivityWidgetState): void {
+	if (state.presentationLeases.size > 0) {
+		state.presentationDirty = true;
+		return;
+	}
+	state.presentationDirty = false;
+	syncWidget(ui, state);
+}
+
 export function createActivityWidgetOwner(section: ActivityWidgetSection): ActivityWidgetOwner {
 	return Object.freeze({ section });
+}
+
+/**
+ * Freeze this UI's shared widget at its current snapshot while logical section
+ * updates continue. Leases are UI-local, nest across independently loaded module
+ * copies, and release idempotently. The final release performs at most one shared
+ * widget presentation update with the latest Tasks-then-Sub-Agents state.
+ */
+export function acquireActivityWidgetPresentationLease(
+	ui: ActivityWidgetUi,
+): ActivityWidgetPresentationLease {
+	const state = stateFor(ui);
+	const token = Object.freeze({});
+	state.presentationLeases.add(token);
+	let active = true;
+
+	return Object.freeze({
+		release(): void {
+			if (!active) return;
+			active = false;
+			if (!state.presentationLeases.delete(token)) return;
+			if (state.presentationLeases.size > 0 || !state.presentationDirty) return;
+
+			// Legacy-key cleanup is deliberately not attempted here: each setWidget
+			// can render in Pi 0.84.1, while the outer release promises one flush.
+			// An owner first seen during the lease performs that one-time migration
+			// on its next ordinary update; the shared snapshot is current now.
+			requestWidgetSync(ui, state);
+		},
+	});
 }
 
 /**
@@ -144,18 +219,22 @@ export function setActivityWidgetSection(
 	lines?: readonly string[],
 ): void {
 	const state = stateFor(ui);
-	clearLegacyWidgets(ui, state, owner);
+	if (state.retiredOwners.has(owner)) return;
+	if (state.presentationLeases.size === 0) clearLegacyWidgets(ui, state, owner);
+	const previousOwner = state.owners[owner.section];
+	if (previousOwner && previousOwner !== owner) state.retiredOwners.add(previousOwner);
 	state.owners[owner.section] = owner;
 	if (lines?.length) state.sections[owner.section] = [...lines];
 	else delete state.sections[owner.section];
-	syncWidget(ui, state);
+	requestWidgetSync(ui, state);
 }
 
 /** Release only the section still owned by this extension/session instance. */
 export function releaseActivityWidgetSection(ui: ActivityWidgetUi, owner: ActivityWidgetOwner): void {
 	const state = stateFor(ui);
 	if (state.owners[owner.section] !== owner) return;
+	state.retiredOwners.add(owner);
 	delete state.owners[owner.section];
 	delete state.sections[owner.section];
-	syncWidget(ui, state);
+	requestWidgetSync(ui, state);
 }

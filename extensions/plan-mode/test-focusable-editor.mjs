@@ -24,9 +24,13 @@ test("outer component focus is propagated to the embedded Editor", () => {
 	assert.equal(invalidations, 1, "component methods remain intact");
 });
 
-test("both embedded Plan Mode editors use focus propagation and invalidate their child", () => {
+test("both embedded Plan Mode editors propagate focus and invalidate width-sensitive caches", () => {
 	const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
 	assert.equal((source.match(/withEditorFocus\(\{/g) ?? []).length, 2);
 	assert.equal((source.match(/editor\.invalidate\(\)/g) ?? []).length, 2);
+	assert.equal((source.match(/let cachedWidth: number \| undefined;/g) ?? []).length, 2);
+	assert.equal((source.match(/cachedLines && cachedWidth === width/g) ?? []).length, 2);
+	assert.equal((source.match(/cachedWidth = undefined;/g) ?? []).length, 4, "refresh and invalidate both clear width");
+	assert.doesNotMatch(source, /params\.plan\.split\(/, "approval renders only bounded planText");
 	assert.doesNotMatch(source, /return \{ render, invalidate: \(\) => \{ cachedLines = undefined; \}, handleInput \};/);
 });

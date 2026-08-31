@@ -18,7 +18,6 @@ import {
 	Key,
 	matchesKey,
 	Text,
-	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -28,6 +27,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { classifyCommand } from "./readonly-check.ts";
 import { withEditorFocus } from "./focusable-editor.ts";
+import { acquireActivityWidgetPresentationLease } from "../shared/activity-widget-stack.ts";
 import {
 	WebActivityRegistry,
 	WEB_ACTIVITY_SCHEMA_VERSION,
@@ -73,6 +73,46 @@ function loadSettings(): PlanModeSettings {
 		judgeModel: typeof raw.judgeModel === "string" ? raw.judgeModel : "",
 		extraReadOnlyCommands: Array.isArray(raw.extraReadOnlyCommands) ? raw.extraReadOnlyCommands : [],
 	};
+}
+
+/**
+ * Pi 0.84.1 custom UI replaces only the editor. Freeze the editor-adjacent
+ * activity presentation and hide the 80ms working row while an approval owns
+ * that slot. This Pi version exposes no working-visibility getter; because Plan
+ * Mode is this repository's only setter, restore `true` only after `false`
+ * returned successfully. Display suppression never pauses background workers or
+ * their state timers.
+ */
+async function withStableApprovalPresentation<T>(
+	ctx: ExtensionContext,
+	openDialog: () => Promise<T>,
+): Promise<T> {
+	const lease = acquireActivityWidgetPresentationLease(ctx.ui);
+	let workingHidden = false;
+	try {
+		try {
+			ctx.ui.setWorkingVisible(false);
+			workingHidden = true;
+		} catch {
+			// Do not assume the row changed when this write failed.
+		}
+		return await openDialog();
+	} finally {
+		// Presentation restoration is cosmetic and must never replace the dialog's
+		// result or original exception. Lease release is independently guaranteed.
+		try {
+			lease.release();
+		} catch {
+			// UI teardown can make the final render unavailable.
+		}
+		if (workingHidden) {
+			try {
+				ctx.ui.setWorkingVisible(true);
+			} catch {
+				// Pi 0.84.1 has no prior-state getter or stronger restore primitive.
+			}
+		}
+	}
 }
 
 export default function planMode(pi: ExtensionAPI) {
@@ -474,10 +514,13 @@ export default function planMode(pi: ExtensionAPI) {
 				{ label: "Other — 请描述你的想法", isOther: true },
 			];
 
-			const result = await ctx.ui.custom<{ answer: string; wasCustom: boolean; index?: number } | null>(
+			const result = await withStableApprovalPresentation(ctx, () => ctx.ui.custom<
+				{ answer: string; wasCustom: boolean; index?: number } | null
+			>(
 				(tui, theme, _kb, done) => {
 					let optionIndex = 0;
 					let editMode = false;
+					let cachedWidth: number | undefined;
 					let cachedLines: string[] | undefined;
 
 					const editorTheme: EditorTheme = {
@@ -503,6 +546,7 @@ export default function planMode(pi: ExtensionAPI) {
 					};
 
 					function refresh() {
+						cachedWidth = undefined;
 						cachedLines = undefined;
 						tui.requestRender();
 					}
@@ -539,7 +583,7 @@ export default function planMode(pi: ExtensionAPI) {
 					}
 
 					function render(width: number): string[] {
-						if (cachedLines) return cachedLines;
+						if (cachedLines && cachedWidth === width) return cachedLines;
 						const lines: string[] = [];
 						const w = Math.max(1, width);
 						lines.push(theme.fg("accent", "─".repeat(w)));
@@ -568,6 +612,7 @@ export default function planMode(pi: ExtensionAPI) {
 								: ` ${theme.fg("dim", "↑↓ 选择 • Enter 确认 • Esc 取消")}`,
 						);
 						lines.push(theme.fg("accent", "─".repeat(w)));
+						cachedWidth = width;
 						cachedLines = lines;
 						return lines;
 					}
@@ -575,13 +620,14 @@ export default function planMode(pi: ExtensionAPI) {
 					return withEditorFocus({
 						render,
 						invalidate: () => {
+							cachedWidth = undefined;
 							cachedLines = undefined;
 							editor.invalidate();
 						},
 						handleInput,
 					}, editor);
 				},
-			);
+			));
 
 			if (!result) {
 				return { content: [{ type: "text", text: "用户取消了选择" }] };
@@ -677,10 +723,13 @@ export default function planMode(pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: decision.text }] };
 			}
 
-			const result = await ctx.ui.custom<"approve" | "reject" | { feedback: string } | null>(
+			const result = await withStableApprovalPresentation(ctx, () => ctx.ui.custom<
+				"approve" | "reject" | { feedback: string } | null
+			>(
 				(tui, theme, _kb, done) => {
 					let optionIndex = 0;
 					let feedbackMode = false;
+					let cachedWidth: number | undefined;
 					let cachedLines: string[] | undefined;
 
 					const editorTheme: EditorTheme = {
@@ -712,6 +761,7 @@ export default function planMode(pi: ExtensionAPI) {
 					];
 
 					function refresh() {
+						cachedWidth = undefined;
 						cachedLines = undefined;
 						tui.requestRender();
 					}
@@ -748,13 +798,13 @@ export default function planMode(pi: ExtensionAPI) {
 					}
 
 					function render(width: number): string[] {
-						if (cachedLines) return cachedLines;
+						if (cachedLines && cachedWidth === width) return cachedLines;
 						const lines: string[] = [];
 						const w = Math.max(1, width);
 						lines.push(theme.fg("accent", "═".repeat(w)));
 						lines.push(theme.fg("accent", " 📋 实现计划"));
 						lines.push(theme.fg("accent", "─".repeat(w)));
-						for (const line of params.plan.split("\n")) {
+						for (const line of planText.split("\n")) {
 							lines.push(...wrapTextWithAnsi(` ${theme.fg("text", line)}`, w));
 						}
 						lines.push(theme.fg("accent", "─".repeat(w)));
@@ -777,6 +827,7 @@ export default function planMode(pi: ExtensionAPI) {
 								: ` ${theme.fg("dim", "↑↓ 选择 • Enter 确认 • Esc 取消")}`,
 						);
 						lines.push(theme.fg("accent", "═".repeat(w)));
+						cachedWidth = width;
 						cachedLines = lines;
 						return lines;
 					}
@@ -784,13 +835,14 @@ export default function planMode(pi: ExtensionAPI) {
 					return withEditorFocus({
 						render,
 						invalidate: () => {
+							cachedWidth = undefined;
 							cachedLines = undefined;
 							editor.invalidate();
 						},
 						handleInput,
 					}, editor);
 				},
-			);
+			));
 
 			if (result === "approve") {
 				deactivatePlanMode(ctx, "approve", "plan approved in TUI");
