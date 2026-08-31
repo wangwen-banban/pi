@@ -28,3 +28,5 @@
 - 2026-08-29：PR #1 的 health/recovery 方向已兼容集成；durable run 使用严格 session-bound 最小 manifest，不持久化 command/task/cwd/output/path/PID，wake 采用显式 pending→delivery→ack 顺序与至少一次重试。
 - 2026-08-29：Background stop/timeout 只有 child `close` 后才确认终态；KILL 后未确认退出必须报告 `termination_unconfirmed`，不能伪装 stopped/timed_out。
 - 2026-08-29：Pi 0.84.1 `setWidget` 更新会 delete→set 并改变 Map 顺序；Tasks/Sub Agents 改用共享 aboveEditor stack，固定 Tasks 在上、Sub Agents 在下。
+- 2026-08-30：PI WEB 1.202608.1 在 iPhone Safari/Tailscale 打开含大型内嵌图片的 fork session 时，100条首屏可达5.5MB并触发 `TypeError: Load failed`；版本/hash门禁补丁将 client message page size降为20，用户端验证可正常打开。
+- 2026-08-30：Plan TUI custom dialog 只替换 editor，working spinner与Activity widget仍会重绘regular TUI；审批期间隐藏working并持有Activity presentation lease，退出后一次恢复，同时render cache必须绑定width。

@@ -63,7 +63,8 @@ chmod +x ~/.pi/agent/scripts/*.sh
 ~/.pi/agent/scripts/apply-history-navigation-patch.sh
 ~/.pi/agent/scripts/apply-history-navigation-patch.sh --check
 
-# Install and start the loopback-only PI WEB user services
+# Install and start the loopback-only PI WEB user services.
+# This also applies the version-gated 20-message mobile paging patch.
 ~/.pi/agent/scripts/setup-pi-web.sh
 
 # Start pi
@@ -239,6 +240,26 @@ Verify without changing anything:
 ~/.pi/agent/scripts/setup-pi-web.sh --check
 ```
 
+Setup keeps PI WEB pinned to `1.202608.1` and applies the versioned client paging patch under:
+
+```text
+patches/pi-web-mobile-paging/1.202608.1/client-message-page-size.patch.json
+```
+
+The patch changes only the compiled client's shared `MESSAGE_PAGE_SIZE` from 100 to 20, covering initial selection, **Load earlier messages**, and reload. It does not modify the server or session JSONL, so older history remains available by scrolling upward. The installer resolves the main asset from `dist/client/index.html` and accepts only the exact stock/patched hashes. Package-root input is lexically normalized before resolution, including repeated slashes and trailing `/` or `/.`; package-root symlinks (including those aliases), symlinked `index.html`, intermediate asset-directory symlinks, unknown versions, tampering, multiple scripts, and path traversal are rejected.
+
+Apply, verify, or roll back the known patch without an npm upgrade:
+
+```bash
+~/.pi/agent/scripts/apply-pi-web-mobile-paging-patch.sh
+~/.pi/agent/scripts/apply-pi-web-mobile-paging-patch.sh --check
+~/.pi/agent/scripts/apply-pi-web-mobile-paging-patch.sh --restore
+```
+
+Apply and restore are serialized by an empty, mode-`0700`, atomic `mkdir` lock beside the resolved asset; a contender fails fast instead of racing the current operation. `--check` remains read-only and lockless. If a command reports a potentially stale lock, first verify that no apply/restore process is active, then remove only the exact lock directory reported by the command.
+
+An npm install/update can replace the compiled asset; rerun the apply command afterward. Applying or restoring needs no PI WEB restart—hard-refresh open browsers so they discard the old JavaScript bundle. `setup-pi-web.sh --check` intentionally fails after `--restore` until the patch is reapplied.
+
 Open locally at <http://127.0.0.1:8504>. Use **Actions → Add Project**, enter one project directory, select its workspace, then start or resume a session.
 
 ### Activity panel for phone/background work
@@ -357,6 +378,19 @@ An npm update replaced the patched package file. Re-run:
 ```
 
 If the script reports an unsupported version or unknown hash, it has intentionally left the installation untouched; update the versioned patch before applying anything.
+
+### Mobile Safari shows `TypeError: Load failed` / `Failed to fetch` when opening a fork
+
+A fork whose latest 100-message page contains large base64 PNG turns can produce a multi-megabyte compressed response. In the observed case it was about 3.7 MB gzip / 5.5 MB decoded, and iPhone/iPad Safari failed while fetching it through Tailscale even in a private window; the same valid payload worked with curl and DOM tests.
+
+Verify or reapply the PI WEB `1.202608.1` client paging patch, then hard-refresh Safari:
+
+```bash
+~/.pi/agent/scripts/apply-pi-web-mobile-paging-patch.sh --check || \
+  ~/.pi/agent/scripts/apply-pi-web-mobile-paging-patch.sh
+```
+
+The latest 20-message page for that session was about 382 KB and avoids fetching the large historical image turns on first open. This is a transport-size mitigation, not a claim that every historical image will load: an older page can still contain one very large turn. If upward scrolling fails on such a page, the follow-up fix needs lazy image loading or a server-side message projection rather than a smaller global page alone. Use `--restore` for exact stock rollback; no service restart is needed for either direction.
 
 ### Existing clone after security history rewrite
 

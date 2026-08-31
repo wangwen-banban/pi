@@ -3,6 +3,8 @@ set -euo pipefail
 
 PI_WEB_VERSION="1.202608.1"
 PI_WEB_SPEC="@jmfederico/pi-web@$PI_WEB_VERSION"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+MOBILE_PAGING_PATCH_SCRIPT="$SCRIPT_DIR/apply-pi-web-mobile-paging-patch.sh"
 PI_WEB_HOST="127.0.0.1"
 PI_WEB_PORT="8504"
 CONFIG_FILE="${PI_WEB_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/pi-web/config.json}"
@@ -99,6 +101,15 @@ INSTALLED_VERSION="$(node -p "require('$GLOBAL_PACKAGE/package.json').version" 2
   echo "PI WEB ${INSTALLED_VERSION:-missing}; expected $PI_WEB_VERSION" >&2
   exit 1
 }
+[[ -x "$MOBILE_PAGING_PATCH_SCRIPT" ]] || {
+  echo "Missing executable paging patch script: $MOBILE_PAGING_PATCH_SCRIPT" >&2
+  exit 1
+}
+if [[ "$MODE" == "check" ]]; then
+  PI_WEB_PACKAGE_ROOT="$GLOBAL_PACKAGE" "$MOBILE_PAGING_PATCH_SCRIPT" --check
+else
+  PI_WEB_PACKAGE_ROOT="$GLOBAL_PACKAGE" "$MOBILE_PAGING_PATCH_SCRIPT"
+fi
 
 node - "$CONFIG_FILE" <<'NODE'
 const fs = require("node:fs");

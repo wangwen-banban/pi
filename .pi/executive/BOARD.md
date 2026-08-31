@@ -19,6 +19,8 @@
 - [x] Claude 风格 Plan Mode — 收窄自动触发、取消固定双确认、enter sequential、inactive exit 无 UI；独立 QA PASS，0 blocker/major。
 - [x] Background Tasks PR #1 — 保留 health/recovery，修复 durable 隐私、wake ack/retry、symlink 与 TERM→KILL 真实性；最终 gate 0 blocker/major。
 - [x] Activity widget 稳定顺序 — 共享 stack 固定 Tasks→Sub Agents；独立 QA 156/156，0 blocker/major/minor。
+- [x] PI WEB fork 移动端访问 — 1.202608.1 client分页100→20的版本化补丁；installer最终gate 65/65，iPhone Safari实测恢复。
+- [x] Exit Plan Mode TUI 抖动 — 审批期间暂停working/Activity展示重绘并修width cache；独立QA 168/168，0 blocker/major。
 
 ## 失败/搁置
 - [ ] `codex_rewind_semantics` — runtime 中断，仅留 context.md。

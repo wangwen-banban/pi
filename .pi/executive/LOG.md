@@ -16,3 +16,5 @@
 2026-08-29 | Background Tasks PR #1 双重审计 | 原 PR FAIL：隐私持久化、wake 误 ack/未持久化发送、TERM→KILL 假终态；转为兼容补丁。
 2026-08-29 | Background Tasks PR #1 最终 gate | PASS：75/75 background、313/313 Activity、24/24 Plan；0 blocker/major。
 2026-08-29 | Tasks/Sub Agents widget 顺序修复 | PASS：共享 aboveEditor stack 固定顺序；独立 QA 156/156，无 blocker/major/minor。
+2026-08-30 | PI WEB fork session移动Safari诊断与修复 | PASS：确认5.5MB首屏触发Load failed；分页20补丁gate 65/65，用户实测恢复。
+2026-08-30 | Exit Plan Mode审批抖动修复 | PASS：working/Activity presentation freeze与width cache修复；独立QA 168/168。

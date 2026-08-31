@@ -1,0 +1,25 @@
+{
+  "format": "pi-web-exact-client-replacement-v1",
+  "package": "@jmfederico/pi-web",
+  "version": "1.202608.1",
+  "upstream": {
+    "tag": "v1.202608.1",
+    "commit": "e3cd03aa18c9b677c45dc8f1992b3fe76816bafc",
+    "sourcePath": "src/client/src/controllers/sessionController.ts",
+    "sourceConstant": "MESSAGE_PAGE_SIZE",
+    "stockValue": 100,
+    "patchedValue": 20
+  },
+  "bundle": {
+    "stockSha256": "a7686fe5e58b9091fcda0cce4f3f249bfa33fd7a2d070882b1f49aa5697c1210",
+    "patchedSha256": "db3de7fd910e2a55e8e725fd034527816987a99ebab75b090fb8915f19077f7d",
+    "find": "var $u=100,ed=class",
+    "replace": "var $u=20,ed=class",
+    "expectedReplacementCount": 1,
+    "messageLimitUseContexts": [
+      "this.api.messages(e,{limit:$u},L(this.getState()))",
+      "this.api.messages(t,{before:e.messagePageStart,limit:$u},L(this.getState()))",
+      "this.api.messages(e.session,{limit:$u},e.machineId)"
+    ]
+  }
+}
