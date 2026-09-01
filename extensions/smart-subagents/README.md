@@ -138,6 +138,34 @@ no stale UI, completion message, or lifecycle hook is required to save it.
 Running children receive `SIGTERM` and then `SIGKILL` after the configured grace
 if needed.
 
+At the next `session_start`, the extension scans only
+`sessionManager.getBranch()` (the active branch, in branch order) for each job's
+latest durable state. A latest `stopped` / `session_shutdown` state without a
+valid completion message on that branch receives one recovered `stopped`
+completion; no worker is restored or restarted. Existing completion messages
+are hydrated as delivered, so a repeated start or `/reload` does not replay the
+same branch again. Forks are isolated by their own active-branch history.
+
+Recovery is intentionally **shutdown-only**. It does not synthesize completion
+for `/agents stop` (`explicit_stop`), `completed`, or `failed` states, so it does
+not widen normal completion crash windows. Parsing is fail-closed and bounded:
+identifiers, names, routing metadata/enums, strings, paths, arrays, nesting,
+entry/total bytes, and tracked jobs are validated, and at most 64 latest states
+are replayed. Recovered details contain only validated id/name, status,
+timestamps, shutdown reason, and optional routing metadata. They never copy the
+historical task, expected output, context or scope paths, cwd, output/error,
+progress, changed files, or run-log path; the displayed stopped reason is fixed
+extension text.
+
+Delivery uses an in-memory pending claim. A synchronous `sendMessage` throw
+releases the claim for a later start, and a completion deferred while the parent
+agent is active is marked delivered only after the `agent_end` send returns.
+Shutdown abandons unsent deferred claims. Pi's extension API exposes
+`sendMessage` as synchronous `void`, however, so a later failure inside its
+fire-and-forget async implementation cannot be observed here; this mechanism
+must not be treated as durable exactly-once delivery for that async failure
+window.
+
 ## Worker provider bootstrap
 
 Workers keep `--no-extensions`, so they do not inherit the parent's extension

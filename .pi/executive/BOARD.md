@@ -1,4 +1,4 @@
-# 任务看板（更新时间：2026-08-29）
+# 任务看板（更新时间：2026-08-31）
 
 ## 进行中
 - （无）
@@ -21,6 +21,7 @@
 - [x] Activity widget 稳定顺序 — 共享 stack 固定 Tasks→Sub Agents；独立 QA 156/156，0 blocker/major/minor。
 - [x] PI WEB fork 移动端访问 — 1.202608.1 client分页100→20的版本化补丁；installer最终gate 65/65，iPhone Safari实测恢复。
 - [x] Exit Plan Mode TUI 抖动 — 审批期间暂停working/Activity展示重绘并修width cache；独立QA 168/168，0 blocker/major。
+- [x] Smart Subagent shutdown replay（PR #2）— active-branch、隐私最小、恰好一次正常恢复；独立QA 0 blocker/major/minor。
 
 ## 失败/搁置
 - [ ] `codex_rewind_semantics` — runtime 中断，仅留 context.md。

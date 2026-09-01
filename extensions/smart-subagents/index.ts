@@ -52,6 +52,12 @@ import {
 	type TerminationReason,
 } from "./lifecycle.ts";
 import {
+	SHUTDOWN_REPLAY_REASON,
+	scanShutdownCompletionReplay,
+	type ShutdownReplayJobSnapshot,
+	type ShutdownReplayRoute,
+} from "./shutdown-replay.ts";
+import {
 	DEFAULT_CONFIG,
 	THINKING_LEVELS,
 	buildModelListText,
@@ -88,6 +94,7 @@ const FINAL_STATUSES = new Set(["completed", "failed", "stopped"]);
 
 type JobStatus = "routing" | "queued" | "running" | "completed" | "failed" | "stopped";
 type LifecycleEvent = "started" | "progress" | "completed" | "failed" | "stopped";
+type CompletionEvent = "completed" | "failed" | "stopped";
 
 interface UsageStats {
 	input: number;
@@ -172,8 +179,16 @@ interface DispatchDetails {
 }
 
 interface CompletionDetails {
-	event: LifecycleEvent;
-	job: JobSnapshot;
+	event: CompletionEvent;
+	job: JobSnapshot | ShutdownReplayJobSnapshot;
+}
+
+interface PendingCompletion {
+	jobId: string;
+	jobName: string;
+	logPath?: string;
+	content: string;
+	details: CompletionDetails;
 }
 
 interface ModelListDetails {
@@ -494,7 +509,7 @@ function snapshot(job: Job): JobSnapshot {
 	};
 }
 
-function formatDuration(job: JobSnapshot): string {
+function formatDuration(job: Pick<JobSnapshot, "createdAt" | "startedAt" | "finishedAt">): string {
 	const start = job.startedAt ?? job.createdAt;
 	const end = job.finishedAt ?? Date.now();
 	const seconds = Math.max(0, Math.round((end - start) / 1000));
@@ -502,7 +517,7 @@ function formatDuration(job: JobSnapshot): string {
 	return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
-function displayModel(route: RouteDecision): string {
+function displayModel(route: Pick<RouteDecision | ShutdownReplayRoute, "providerName" | "modelId">): string {
 	return `${route.providerName} / ${route.modelId}`;
 }
 
@@ -667,7 +682,11 @@ export default function smartSubagents(pi: ExtensionAPI) {
 	let agentBrowserOpen = false;
 	let agentBrowserRequestRender: (() => void) | undefined;
 	const deliveredCompletionIds = new Set<string>();
-	const deferredCompletionMessages: Array<{ content: string; details: CompletionDetails }> = [];
+	const pendingCompletionIds = new Set<string>();
+	const deferredCompletionMessages: PendingCompletion[] = [];
+	const deliveryObjectIds = new WeakMap<object, number>();
+	let nextDeliveryObjectId = 0;
+	let activeDeliveryBranchKey = "";
 	let parentAgentActive = false;
 	let updateUi: () => void = () => {};
 	// PI WEB activity registry state. Timers and dispatchers are only started
@@ -911,45 +930,119 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		return job.resultWritePromise;
 	};
 
-	const deliverCompletion = (event: "completed" | "failed", job: Job) => {
-		if (shuttingDown || deliveredCompletionIds.has(job.id)) return;
-		const route = job.route!;
+	const buildCompletion = (
+		event: CompletionEvent,
+		job: Job | ShutdownReplayJobSnapshot,
+	): PendingCompletion => {
+		if (event === "stopped") {
+			const recovered = job as ShutdownReplayJobSnapshot;
+			const content = [
+				"[Sub-agent lifecycle update — continue the original task]",
+				"Sub-agent stopped event (recovered)",
+				`Agent: ${recovered.name} (${recovered.id})`,
+				"",
+				SHUTDOWN_REPLAY_REASON,
+				"No worker was restored or restarted.",
+				"",
+				"This is lifecycle context for the existing task, not a new user task. Integrate the terminal state and continue the original task unless the user explicitly cancels or replaces that task.",
+			].join("\n");
+			return {
+				jobId: recovered.id,
+				jobName: recovered.name,
+				content,
+				details: { event, job: recovered },
+			};
+		}
+
+		const completed = job as Job;
+		const route = completed.route!;
 		const primaryResult = event === "failed"
-			? job.error || job.stderr || job.output
-			: job.output || job.error || job.stderr;
+			? completed.error || completed.stderr || completed.output
+			: completed.output || completed.error || completed.stderr;
 		const output = truncateUtf8(primaryResult || "(no output)", RESULT_OUTPUT_LIMIT);
-		const changed = job.changedFiles.length > 0 ? job.changedFiles.map((file) => `- ${file}`).join("\n") : "- None detected";
+		const changed = completed.changedFiles.length > 0
+			? completed.changedFiles.map((file) => `- ${file}`).join("\n")
+			: "- None detected";
 		const content = [
 			`[Sub-agent lifecycle update — continue the original task]`,
 			`Sub-agent ${event} event`,
-			`Agent: ${job.name} (${job.id})`,
+			`Agent: ${completed.name} (${completed.id})`,
 			`Model: ${route.provider}/${route.modelId}`,
 			`Thinking: ${route.effort}`,
 			`Context: ${route.contextMode}`,
 			`Permission: ${route.permission}`,
 			`Changed files:\n${changed}`,
-			`Run log: ${job.logPath ?? "not saved"}`,
+			`Run log: ${completed.logPath ?? "not saved"}`,
 			"",
 			"Result:",
 			output,
 			"",
 			"This is lifecycle context for the existing task, not a new user task. Integrate it and continue the original task unless the user explicitly cancels or replaces that task.",
 		].join("\n");
-		const details: CompletionDetails = { event, job: snapshot(job) };
-		try {
-			if (parentAgentActive) {
-				deferredCompletionMessages.push({ content, details });
-			} else {
-				pi.sendMessage<CompletionDetails>(
-					{ customType: "smart-subagent-completion", content, display: true, details },
-					{ triggerTurn: true, deliverAs: "followUp" },
-				);
-			}
-			deliveredCompletionIds.add(job.id);
-		} catch (error) {
-			const reason = error instanceof Error ? error.message : String(error);
-			latestCtx?.ui.notify(`Could not queue result from ${job.name}: ${reason}. Run log: ${job.logPath ?? "not saved"}`, "error");
+		return {
+			jobId: completed.id,
+			jobName: completed.name,
+			logPath: completed.logPath,
+			content,
+			details: { event, job: snapshot(completed) },
+		};
+	};
+
+	const releaseCompletionClaim = (jobId: string) => {
+		pendingCompletionIds.delete(jobId);
+	};
+
+	const sendClaimedCompletion = (completion: PendingCompletion): boolean => {
+		if (shuttingDown || deliveredCompletionIds.has(completion.jobId)) {
+			releaseCompletionClaim(completion.jobId);
+			return false;
 		}
+		try {
+			pi.sendMessage<CompletionDetails>(
+				{
+					customType: "smart-subagent-completion",
+					content: completion.content,
+					display: true,
+					details: completion.details,
+				},
+				{ triggerTurn: true, deliverAs: "followUp" },
+			);
+			// ExtensionAPI.sendMessage is a synchronous void boundary. We can
+			// account for a synchronous throw, but not a later rejection inside
+			// pi's fire-and-forget sendCustomMessage implementation.
+			releaseCompletionClaim(completion.jobId);
+			deliveredCompletionIds.add(completion.jobId);
+			return true;
+		} catch (error) {
+			releaseCompletionClaim(completion.jobId);
+			const reason = error instanceof Error ? error.message : String(error);
+			latestCtx?.ui.notify(
+				`Could not queue result from ${completion.jobName}: ${reason}. Run log: ${completion.logPath ?? "not saved"}`,
+				"error",
+			);
+			return false;
+		}
+	};
+
+	const queueCompletion = (completion: PendingCompletion): boolean => {
+		if (shuttingDown || deliveredCompletionIds.has(completion.jobId) || pendingCompletionIds.has(completion.jobId)) {
+			return false;
+		}
+		pendingCompletionIds.add(completion.jobId);
+		if (parentAgentActive) {
+			deferredCompletionMessages.push(completion);
+			return true;
+		}
+		return sendClaimedCompletion(completion);
+	};
+
+	const deliverCompletion = (event: "completed" | "failed", job: Job) => {
+		if (!job.route) return;
+		queueCompletion(buildCompletion(event, job));
+	};
+
+	const replayShutdownCompletion = (job: ShutdownReplayJobSnapshot) => {
+		queueCompletion(buildCompletion("stopped", job));
 	};
 
 	let pumpQueue: () => void;
@@ -1440,19 +1533,26 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			if (!details || !route) return new Text(fallbackContent, outputPad, 0);
 			const job = details.job;
 			const success = details.event === "completed";
-			const icon = success ? theme.fg("success", "✓") : theme.fg("error", "✗");
+			const stopped = details.event === "stopped";
+			const color = success ? "success" : stopped ? "warning" : "error";
+			const icon = success ? theme.fg("success", "✓") : stopped ? theme.fg("warning", "■") : theme.fg("error", "✗");
 			const box = new Box(outputPad, 1, (text) => theme.bg("customMessageBg", text));
-			box.addChild(new Text(`${icon} ${theme.bold(job.name)} ${theme.fg(success ? "success" : "error", details.event)}`, 0, 0));
+			box.addChild(new Text(`${icon} ${theme.bold(job.name)} ${theme.fg(color, details.event)}`, 0, 0));
 			box.addChild(new Text(theme.fg("muted", `model: ${displayModel(route)} · thinking: ${route.effort} · ${formatDuration(job)}`), 0, 0));
 			box.addChild(new Text(theme.fg("muted", `context: ${route.contextMode} · permission: ${route.permission}`), 0, 0));
-			if (job.changedFiles.length > 0) box.addChild(new Text(theme.fg("muted", `changed: ${job.changedFiles.join(", ")}`), 0, 0));
+			const changedFiles = "changedFiles" in job ? job.changedFiles : [];
+			if (changedFiles.length > 0) box.addChild(new Text(theme.fg("muted", `changed: ${changedFiles.join(", ")}`), 0, 0));
 			box.addChild(new Spacer(1));
-			const output = details.event === "failed" ? job.error || job.output || "(no output)" : job.output || job.error || "(no output)";
+			const storedOutput = "output" in job ? job.output : undefined;
+			const output = details.event === "failed"
+				? job.error || storedOutput || "(no output)"
+				: storedOutput || job.error || "(no output)";
 			if (expanded) {
 				box.addChild(new Markdown(output, 0, 0, getMarkdownTheme()));
-				if (job.logPath) {
+				const logPath = "logPath" in job ? job.logPath : undefined;
+				if (logPath) {
 					box.addChild(new Spacer(1));
-					box.addChild(new Text(theme.fg("dim", `run log: ${job.logPath}`), 0, 0));
+					box.addChild(new Text(theme.fg("dim", `run log: ${logPath}`), 0, 0));
 				}
 			} else {
 				const preview = output.split("\n").slice(0, 6).join("\n");
@@ -1809,12 +1909,76 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		},
 	});
 
+	const deliveryObjectId = (value: object): number => {
+		let id = deliveryObjectIds.get(value);
+		if (id === undefined) {
+			id = ++nextDeliveryObjectId;
+			deliveryObjectIds.set(value, id);
+		}
+		return id;
+	};
+
+	const deliveryBranchKey = (ctx: ExtensionContext, branch: readonly unknown[]): string => {
+		const manager = ctx.sessionManager as object;
+		let sessionId = "unknown";
+		try {
+			sessionId = String(ctx.sessionManager.getSessionId());
+		} catch {
+			// The manager object and leaf still isolate this transient branch.
+		}
+		const leaf = branch[branch.length - 1];
+		let leafKey = "empty";
+		if (leaf && typeof leaf === "object") {
+			try {
+				const descriptor = Object.getOwnPropertyDescriptor(leaf, "id");
+				leafKey = descriptor && "value" in descriptor && typeof descriptor.value === "string"
+					? `id:${descriptor.value}`
+					: `object:${deliveryObjectId(leaf)}`;
+			} catch {
+				leafKey = `object:${deliveryObjectId(leaf)}`;
+			}
+		}
+		return `${deliveryObjectId(manager)}:${sessionId}:${branch.length}:${leafKey}`;
+	};
+
+	const switchDeliveryBranch = (key: string) => {
+		if (key === activeDeliveryBranchKey) return;
+		activeDeliveryBranchKey = key;
+		deferredCompletionMessages.splice(0);
+		pendingCompletionIds.clear();
+		deliveredCompletionIds.clear();
+	};
+
+	const hydrateDeliveredCompletions = (ids: readonly string[]) => {
+		if (ids.length === 0) return;
+		const hydrated = new Set(ids);
+		for (const id of hydrated) {
+			deliveredCompletionIds.add(id);
+			pendingCompletionIds.delete(id);
+		}
+		for (let index = deferredCompletionMessages.length - 1; index >= 0; index--) {
+			if (hydrated.has(deferredCompletionMessages[index]!.jobId)) {
+				deferredCompletionMessages.splice(index, 1);
+			}
+		}
+	};
+
 	pi.on("session_start", (_event, ctx) => {
 		latestCtx = ctx;
 		shuttingDown = false;
+		let branch: readonly unknown[] = [];
+		try {
+			branch = ctx.sessionManager.getBranch();
+		} catch {
+			// Recovery is best-effort and must never block session startup.
+		}
+		switchDeliveryBranch(deliveryBranchKey(ctx, branch));
+		const recovery = scanShutdownCompletionReplay(branch);
+		hydrateDeliveredCompletions(recovery.deliveredIds);
+		for (const candidate of recovery.candidates) replayShutdownCompletion(candidate);
 		updateUi();
-		// Registry, control watcher, and heartbeat timers only start here and
-		// only stop in session_shutdown.
+		// Registry, control watcher, and heartbeat timers only start after the
+		// synchronous branch replay pass and only stop in session_shutdown.
 		void startWebActivity(ctx);
 	});
 
@@ -1826,10 +1990,8 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		parentAgentActive = false;
 		const completions = deferredCompletionMessages.splice(0);
 		for (const completion of completions) {
-			pi.sendMessage<CompletionDetails>(
-				{ customType: "smart-subagent-completion", content: completion.content, display: true, details: completion.details },
-				{ triggerTurn: true, deliverAs: "followUp" },
-			);
+			if (!pendingCompletionIds.has(completion.jobId)) continue;
+			sendClaimedCompletion(completion);
 		}
 	});
 
@@ -1847,7 +2009,8 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			agentBrowserRenderTimer = undefined;
 		}
 		agentBrowserRequestRender = undefined;
-		deferredCompletionMessages.splice(0);
+		const abandonedCompletions = deferredCompletionMessages.splice(0);
+		for (const completion of abandonedCompletions) releaseCompletionClaim(completion.jobId);
 		parentAgentActive = false;
 		queue.splice(0, queue.length);
 		if (latestCtx?.hasUI) {
