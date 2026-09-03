@@ -233,9 +233,7 @@ test("preflightWorkerProvider gates extension-dependent providers and lets built
 	assert.equal(preflightWorkerProvider("anthropic", []), null);
 	assert.equal(preflightWorkerProvider("openai-codex", both), null);
 	assert.equal(preflightWorkerProvider("openai-codex-second", both), null);
-	assert.equal(preflightWorkerProvider("claude-relay", ["provider-routing"]), null);
-	assert.equal(preflightWorkerProvider("claude-relay-alibaba", ["provider-routing"]), null);
-	assert.equal(preflightWorkerProvider("big-data-claude", ["provider-routing"]), null);
+	assert.equal(preflightWorkerProvider("claude-custom", ["provider-routing"]), null);
 
 	const primaryMissing = preflightWorkerProvider("openai-codex", ["codex-multi-account"]);
 	assert.match(primaryMissing, /provider-routing/);
@@ -245,7 +243,7 @@ test("preflightWorkerProvider gates extension-dependent providers and lets built
 	const secondaryMissing = preflightWorkerProvider("openai-codex-second", ["provider-routing"]);
 	assert.match(secondaryMissing, /codex-multi-account/);
 
-	const none = preflightWorkerProvider("big-data-claude", []);
+	const none = preflightWorkerProvider("claude-custom", []);
 	assert.match(none, /provider-routing/);
 });
 

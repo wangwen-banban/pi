@@ -39,7 +39,7 @@ export const WORKER_EXTENSIONS = {
 		key: "provider-routing",
 		rel: "provider-routing/index.ts",
 		order: 1,
-		providers: ["openai-codex", "openai-codex-second", "claude-relay", "claude-relay-alibaba", "big-data-claude"],
+		providers: ["openai-codex", "openai-codex-second", "claude-custom"],
 	},
 	"codex-web-search": {
 		key: "codex-web-search",
@@ -63,9 +63,7 @@ export const WORKER_PROVIDER_DEPENDENCIES: Record<string, WorkerExtensionKey[]> 
 	"openai-codex": ["provider-routing"],
 	// Needs codex-multi-account for oauth/models AND provider-routing for transport.
 	"openai-codex-second": ["codex-multi-account", "provider-routing"],
-	"claude-relay": ["provider-routing"],
-	"claude-relay-alibaba": ["provider-routing"],
-	"big-data-claude": ["provider-routing"],
+	"claude-custom": ["provider-routing"],
 };
 
 export function isWorkerExtensionKey(value: string): value is WorkerExtensionKey {

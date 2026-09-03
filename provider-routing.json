@@ -1,26 +1,10 @@
 {
   "providers": {
-    "claude-relay": {
-      "mode": "direct",
-      "baseUrl": "https://idealab.alibaba-inc.com/api/anthropic",
-      "modelId": "claude-opus-4-6[1m]",
-      "requestModelId": "claude-opus-4-6",
-      "contextWindow": 1000000,
-      "maxTokens": 64000
-    },
     "openai-codex": {
       "mode": "proxy",
       "proxyUrl": "http://127.0.0.1:10808"
     },
-    "claude-relay-alibaba": {
-      "mode": "direct",
-      "baseUrl": "https://idealab.alibaba-inc.com/api/anthropic",
-      "modelId": "claude-opus-5",
-      "requestModelId": "claude-opus-5",
-      "contextWindow": 1000000,
-      "maxTokens": 64000
-    },
-    "big-data-claude": {
+    "claude-custom": {
       "mode": "direct",
       "baseUrl": "https://llm-chat-api-pre.alibaba-inc.com/anthropic",
       "modelId": "claude-opus-5",

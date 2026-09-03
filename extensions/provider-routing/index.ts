@@ -95,11 +95,11 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Extract error message from alibaba's non-standard SSE error formats:
+ * Extract error message from relay's non-standard SSE error formats:
  *   Format 1: data: {"error":{"message":"..."},"type":"error"}
  *   Format 2: data: {"type":"error","error":{"type":"api_error","message":"..."}}
  */
-function extractAlibabaSSEError(text: string): string | null {
+function extractRelaySSEError(text: string): string | null {
   // Try both formats
   const m1 = text.match(/data:\s*\{"error":\{"message":"((?:[^"\\]|\\.)*)"/);
   const m2 = text.match(/data:\s*\{"type":\s*"error",\s*"error":\s*\{[^}]*"message":\s*"((?:[^"\\]|\\.)*)"/);
@@ -115,7 +115,7 @@ function retryDelay(attempt: number): number {
 }
 
 /**
- * Wraps alibaba relay stream calls with:
+ * Wraps relay stream calls with:
  * 1. Retry logic (up to maxRetries) for transient errors (IAM, rate-limit, etc.)
  * 2. Stream healing for "ended without stop reason" errors
  *
@@ -265,7 +265,7 @@ function streamWithRetry(
     wrapper.push({
       type: "error",
       reason: "error",
-      error: errorMessage(`[alibaba-relay] ${exhaustMsg}`),
+      error: errorMessage(`[claude-custom] ${exhaustMsg}`),
     });
   })();
   return wrapper;
@@ -316,189 +316,29 @@ export function registerProviderRouting(
     return publishFastMode(ctx);
   };
 
-  const relay = routeFor("claude-relay");
+  // --- claude-custom provider (唯一自定义 Claude 通道) ---
+  const claudeRoute = routeFor("claude-custom");
   for (const key of ["baseUrl", "modelId", "requestModelId"] as const) {
-    if (!relay[key]) throw new Error(`Missing claude-relay.${key} in ${ROUTING_PATH}`);
+    if (!claudeRoute[key]) throw new Error(`Missing claude-custom.${key} in ${ROUTING_PATH}`);
   }
+  const claudeSessionId = crypto.randomUUID();
 
-  // --- claude-relay-alibaba provider ---
-  const alibaba = routeFor("claude-relay-alibaba");
-  for (const key of ["baseUrl", "modelId", "requestModelId"] as const) {
-    if (!alibaba[key]) throw new Error(`Missing claude-relay-alibaba.${key} in ${ROUTING_PATH}`);
-  }
-
-  // Alibaba relay requires Claude Code identity headers
-  const alibabaSessionId = crypto.randomUUID();
-
-  pi.registerProvider("claude-relay-alibaba", {
+  pi.registerProvider("claude-custom", {
     api: "anthropic-messages",
-    baseUrl: alibaba.baseUrl,
+    baseUrl: claudeRoute.baseUrl,
     headers: {
-      "x-claude-code-session-id": alibabaSessionId,
+      "x-claude-code-session-id": claudeSessionId,
       "user-agent": "claude-code/1.0",
     },
     models: [
       {
         id: "claude-opus-5",
-        name: "Claude Opus 5 (Alibaba Relay)",
+        name: "Claude Opus 5 (Custom)",
         api: "anthropic-messages",
         reasoning: true,
         input: ["text", "image"],
-        contextWindow: alibaba.contextWindow ?? 1_000_000,
-        maxTokens: alibaba.maxTokens ?? 64_000,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        thinkingLevelMap: {
-          minimal: "low",
-          low: "low",
-          medium: "medium",
-          high: "high",
-          xhigh: "xhigh",
-          max: "max",
-        },
-        compat: {
-          supportsPromptCaching: false,
-          sendSessionAffinityHeaders: false,
-          forceAdaptiveThinking: true,
-        },
-      },
-    ],
-    streamSimple: async (
-      model: Model<any>,
-      context: Context,
-      options?: SimpleStreamOptions,
-    ): Promise<AssistantMessageEventStream> => {
-      const provider = getApiProvider("anthropic-messages");
-      const env = withRouteEnv(options?.env, alibaba);
-      // Filter out web_search tool — alibaba idealab rejects it (confuses with Anthropic built-in server tool)
-      const filteredContext: Context = {
-        ...context,
-        tools: context.tools?.filter((t: any) => t.name !== "web_search"),
-      };
-      // Inject identity headers + skip TLS verification for internal endpoint.
-      // Also detect alibaba's non-standard SSE error format (HTTP 200 + error JSON)
-      // and convert it to a proper thrown error so it surfaces to the user.
-      const directFetch: typeof fetch = async (input, init) => {
-        const headers = new Headers((init as any)?.headers);
-        headers.set("x-claude-code-session-id", alibabaSessionId);
-        headers.set("user-agent", "claude-code/1.0");
-
-        // Fix thinking format: alibaba only supports adaptive, not "enabled".
-        // This is a defensive fix in case pi-ai sends the old format.
-        if ((init as any)?.body && typeof (init as any).body === "string") {
-          try {
-            const reqBody = JSON.parse((init as any).body);
-            if (reqBody.thinking?.type === "enabled") {
-              const budget = reqBody.thinking.budget_tokens ?? reqBody.max_tokens ?? 8000;
-              const effort = budget >= 32000 ? "max" : budget >= 16000 ? "xhigh" : budget >= 8000 ? "high" : budget >= 4000 ? "medium" : "low";
-              reqBody.thinking = { type: "adaptive" };
-              reqBody.output_config = { effort };
-              (init as any) = { ...(init as any), body: JSON.stringify(reqBody) };
-            }
-          } catch { /* non-JSON body, pass through */ }
-        }
-
-        // 90s timeout: if alibaba hangs without responding, abort.
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 90_000);
-        let resp: any;
-        try {
-          resp = await transport.fetch(input as any, {
-            ...(init as any),
-            headers,
-            signal: controller.signal,
-          }, { rejectUnauthorized: false });
-        } catch (e: any) {
-          clearTimeout(timeout);
-          if (e?.name === "AbortError") throw new Error("[alibaba] 请求超时 (90s)");
-          throw e;
-        }
-        clearTimeout(timeout);
-        // Alibaba sometimes returns HTTP 200 with SSE body containing only:
-        //   data: {"error":{"message":"...","type":"..."},"type":"error"}
-        //   data: [DONE]
-        // The Anthropic SDK can't parse this → "stream ended without a stop
-        // reason" → user sees nothing. Peek the first chunk to detect this.
-        //
-        // NOTE: We intentionally avoid body.tee() which is unreliable with
-        // undici's ReadableStream on large streaming responses. Instead we
-        // read the first chunk, check it, and manually reconstruct the stream.
-        if (resp.body) {
-          const reader = resp.body.getReader();
-          const { value: firstChunk, done } = await reader.read();
-          if (done || !firstChunk) {
-            reader.releaseLock();
-            return resp as any;
-          }
-          const peek = new TextDecoder().decode(firstChunk).slice(0, 512);
-          const firstErr = extractAlibabaSSEError(peek);
-          if (firstErr) {
-            reader.releaseLock();
-            throw new Error(`[alibaba] ${firstErr}`);
-          }
-          // Reassemble: put the peeked chunk back in front of the rest.
-          // Also monitor ALL subsequent chunks for alibaba's mid-stream error
-          // format (error can appear after initial message_start + thinking blocks).
-          const reconstructed = new ReadableStream({
-            start(controller) {
-              controller.enqueue(firstChunk);
-            },
-            async pull(controller) {
-              const { value, done: d } = await reader.read();
-              if (d) { controller.close(); return; }
-              // Check every chunk for alibaba inline errors
-              const text = new TextDecoder().decode(value);
-              const midErr = extractAlibabaSSEError(text);
-              if (midErr) {
-                // Signal error on the stream. The downstream Anthropic SDK / pi-ai
-                // SSE parser will catch this as an iteration error and surface it.
-                controller.error(new Error(`[alibaba] ${midErr}`));
-                reader.releaseLock();
-                return;
-              }
-              controller.enqueue(value);
-            },
-            cancel() { reader.releaseLock(); },
-          });
-          return new Response(reconstructed, {
-            status: resp.status,
-            statusText: resp.statusText,
-            headers: resp.headers,
-          }) as any;
-        }
-        return resp as any;
-      };
-      return streamWithRetry(
-        () => provider.streamSimple(model, filteredContext, { ...options, env, fetch: directFetch }),
-        createAssistantMessageEventStream,
-        model,
-        5, // max 5 retries
-      );
-    },
-  });
-
-  // --- big-data-claude provider ---
-  const bigData = routeFor("big-data-claude");
-  for (const key of ["baseUrl", "modelId", "requestModelId"] as const) {
-    if (!bigData[key]) throw new Error(`Missing big-data-claude.${key} in ${ROUTING_PATH}`);
-  }
-  const bigDataSessionId = crypto.randomUUID();
-
-  pi.registerProvider("big-data-claude", {
-    api: "anthropic-messages",
-    baseUrl: bigData.baseUrl,
-    headers: {
-      "x-claude-code-session-id": bigDataSessionId,
-      "user-agent": "claude-code/1.0",
-    },
-    models: [
-      {
-        id: "claude-opus-5",
-        name: "Claude Opus 5 (Big Data)",
-        api: "anthropic-messages",
-        reasoning: true,
-        input: ["text", "image"],
-        contextWindow: bigData.contextWindow ?? 1_000_000,
-        maxTokens: bigData.maxTokens ?? 64_000,
+        contextWindow: claudeRoute.contextWindow ?? 1_000_000,
+        maxTokens: claudeRoute.maxTokens ?? 64_000,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         thinkingLevelMap: {
           minimal: "low",
@@ -516,12 +356,12 @@ export function registerProviderRouting(
       },
       {
         id: "claude-opus-4-8",
-        name: "Claude Opus 4.8 (Big Data)",
+        name: "Claude Opus 4.8 (Custom)",
         api: "anthropic-messages",
         reasoning: true,
         input: ["text", "image"],
-        contextWindow: bigData.contextWindow ?? 1_000_000,
-        maxTokens: bigData.maxTokens ?? 64_000,
+        contextWindow: claudeRoute.contextWindow ?? 1_000_000,
+        maxTokens: claudeRoute.maxTokens ?? 64_000,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         thinkingLevelMap: {
           minimal: "low",
@@ -544,14 +384,14 @@ export function registerProviderRouting(
       options?: SimpleStreamOptions,
     ): Promise<AssistantMessageEventStream> => {
       const provider = getApiProvider("anthropic-messages");
-      const env = withRouteEnv(options?.env, bigData);
+      const env = withRouteEnv(options?.env, claudeRoute);
       const filteredContext: Context = {
         ...context,
         tools: context.tools?.filter((t: any) => t.name !== "web_search"),
       };
       const directFetch: typeof fetch = async (input, init) => {
         const headers = new Headers((init as any)?.headers);
-        headers.set("x-claude-code-session-id", bigDataSessionId);
+        headers.set("x-claude-code-session-id", claudeSessionId);
         headers.set("user-agent", "claude-code/1.0");
 
         // Fix thinking format
@@ -579,7 +419,7 @@ export function registerProviderRouting(
           }, { rejectUnauthorized: false });
         } catch (e: any) {
           clearTimeout(timeout);
-          if (e?.name === "AbortError") throw new Error("[big-data-claude] 请求超时 (90s)");
+          if (e?.name === "AbortError") throw new Error("[claude-custom] 请求超时 (90s)");
           throw e;
         }
         clearTimeout(timeout);
@@ -589,16 +429,16 @@ export function registerProviderRouting(
           const { value: firstChunk, done } = await reader.read();
           if (done || !firstChunk) { reader.releaseLock(); return resp as any; }
           const peek = new TextDecoder().decode(firstChunk).slice(0, 512);
-          const firstErr = extractAlibabaSSEError(peek);
-          if (firstErr) { reader.releaseLock(); throw new Error(`[big-data-claude] ${firstErr}`); }
+          const firstErr = extractRelaySSEError(peek);
+          if (firstErr) { reader.releaseLock(); throw new Error(`[claude-custom] ${firstErr}`); }
           const reconstructed = new ReadableStream({
             start(c) { c.enqueue(firstChunk); },
             async pull(c) {
               const { value, done: d } = await reader.read();
               if (d) { c.close(); return; }
               const t = new TextDecoder().decode(value);
-              const midErr = extractAlibabaSSEError(t);
-              if (midErr) { c.error(new Error(`[big-data-claude] ${midErr}`)); reader.releaseLock(); return; }
+              const midErr = extractRelaySSEError(t);
+              if (midErr) { c.error(new Error(`[claude-custom] ${midErr}`)); reader.releaseLock(); return; }
               c.enqueue(value);
             },
             cancel() { reader.releaseLock(); },
@@ -613,41 +453,6 @@ export function registerProviderRouting(
         model,
         5,
       );
-    },
-  });
-
-  // --- claude-relay provider ---
-  pi.registerProvider("claude-relay", {
-    api: "anthropic-messages",
-    baseUrl: relay.baseUrl,
-    models: [
-      {
-        id: relay.modelId!,
-        name: "Claude Opus 4.6 (Relay)",
-        api: "anthropic-messages",
-        reasoning: true,
-        input: ["text", "image"],
-        contextWindow: relay.contextWindow ?? 1_000_000,
-        maxTokens: relay.maxTokens ?? 64_000,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        compat: {
-          supportsPromptCaching: false,
-          sendSessionAffinityHeaders: false,
-          forceAdaptiveThinking: true,
-        },
-      },
-    ],
-    streamSimple: async (
-      model: Model<any>,
-      context: Context,
-      options?: SimpleStreamOptions,
-    ): Promise<AssistantMessageEventStream> => {
-      const provider = getApiProvider("anthropic-messages");
-      const env = withRouteEnv(options?.env, relay);
-      const requestModel = { ...model, id: relay.requestModelId! };
-      const directFetch: typeof fetch = (input, init) =>
-        transport.fetch(input as any, init as any) as any;
-      return provider.streamSimple(requestModel, context, { ...options, env, fetch: directFetch });
     },
   });
 
@@ -786,20 +591,20 @@ export function registerProviderRouting(
     },
   });
 
-  pi.registerCommand("check-alibaba", {
-    description: "测试 alibaba relay 连通性",
+  pi.registerCommand("check-claude", {
+    description: "测试 claude-custom 连通性",
     handler: async (_args, ctx) => {
-      ctx.ui.notify("⟳ 正在测试 alibaba relay...", "info");
+      ctx.ui.notify("⟳ 正在测试 claude-custom...", "info");
       try {
-        const apiKey = await ctx.modelRegistry.getApiKeyForProvider("claude-relay-alibaba");
+        const apiKey = await ctx.modelRegistry.getApiKeyForProvider("claude-custom");
         const headers = new Headers();
         headers.set("Content-Type", "application/json");
         headers.set("anthropic-version", "2023-06-01");
         headers.set("x-api-key", apiKey ?? "");
-        headers.set("x-claude-code-session-id", alibabaSessionId);
+        headers.set("x-claude-code-session-id", claudeSessionId);
         headers.set("user-agent", "claude-code/1.0");
         const body = JSON.stringify({
-          model: alibaba.requestModelId,
+          model: claudeRoute.requestModelId,
           max_tokens: 32,
           stream: true,
           messages: [{ role: "user", content: "hi" }],
@@ -808,7 +613,7 @@ export function registerProviderRouting(
         const timer = setTimeout(() => controller.abort(), 15_000);
         let resp: Response;
         try {
-          resp = await transport.fetch(alibaba.baseUrl + "/v1/messages", {
+          resp = await transport.fetch(claudeRoute.baseUrl + "/v1/messages", {
             method: "POST",
             headers,
             body,
@@ -820,13 +625,13 @@ export function registerProviderRouting(
         const status = resp.status;
         const text = await (resp as any).text();
         if (status === 200 && text.includes("message_start")) {
-          ctx.ui.notify(`✅ alibaba relay 正常 (HTTP ${status}, 流式响应圴序)`, "info");
+          ctx.ui.notify(`✅ claude-custom 正常 (HTTP ${status}, 流式响应有序)`, "info");
         } else {
           const msg = text.match(/"message":"([^"]{1,120})"/)?.[1] ?? text.slice(0, 200);
-          ctx.ui.notify(`❌ alibaba relay 异常: HTTP ${status} — ${msg}`, "error");
+          ctx.ui.notify(`❌ claude-custom 异常: HTTP ${status} — ${msg}`, "error");
         }
       } catch (e: any) {
-        ctx.ui.notify(`❌ alibaba relay 连接失败: ${String(e?.message ?? e).slice(0, 200)}`, "error");
+        ctx.ui.notify(`❌ claude-custom 连接失败: ${String(e?.message ?? e).slice(0, 200)}`, "error");
       }
     },
   });

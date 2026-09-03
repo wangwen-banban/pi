@@ -33,9 +33,7 @@ try {
 	console.log("✓ both Codex accounts share label 'CODEX WEEK' and read their own cache");
 
 	// Third-party API / pay-per-use providers render no quota bar at all.
-	assert.equal(readSubscriptionQuota(agentDir, "claude-relay"), undefined);
-	assert.equal(readSubscriptionQuota(agentDir, "claude-relay-alibaba"), undefined);
-	assert.equal(readSubscriptionQuota(agentDir, "big-data-claude"), undefined);
+	assert.equal(readSubscriptionQuota(agentDir, "claude-custom"), undefined);
 	assert.equal(
 		SUBSCRIPTION_PROVIDERS["opencode-go"],
 		undefined,

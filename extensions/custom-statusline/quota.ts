@@ -2,7 +2,7 @@
  * Subscription-provider quota registry for the custom status line.
  *
  * Only providers listed here render a quota bar. Third-party API / pay-per-use
- * providers (e.g. claude-relay, big-data-claude) are intentionally absent and
+ * providers (e.g. claude-custom) are intentionally absent and
  * never show quota.
  *
  * OpenCode Go (`opencode-go`) is also absent: opencode does not expose an

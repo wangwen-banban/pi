@@ -164,7 +164,7 @@ Claude relays) are re-registered through a small, fixed, audited bootstrap:
   dispatch, so a missing/moved/compromised trusted file fails with a
   `routing_error` before any worker spawns.
 - Providers supplied/routed by the bootstrap (`openai-codex`,
-  `openai-codex-second`, and the `claude-relay*` family) are preflighted
+  `openai-codex-second`, and `claude-custom`) are preflighted
   against the configured keys without any network call; unrelated builtin
   providers continue to work.
 - The unsupported-model fallback is the only automatic retry. It never runs

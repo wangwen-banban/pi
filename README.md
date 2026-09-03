@@ -6,9 +6,7 @@ Personal [pi](https://github.com/badlogic/pi-mono) configuration with multi-prov
 
 | Provider | Mode | Description |
 |----------|------|-------------|
-| `claude-relay` | Direct | Claude relay |
-| `claude-relay-alibaba` | Direct | Alibaba ideaLAB relay, including Opus 5 |
-| `big-data-claude` | Direct | Big Data Claude relay |
+| `claude-custom` | Direct | Custom Claude-compatible relay — set `baseUrl` in `provider-routing.json` and the key in `auth.json` |
 | `openai-codex` | Configurable | Primary Codex OAuth account |
 | `openai-codex-second` | Follows primary | Secondary Codex OAuth account; shares the primary route |
 

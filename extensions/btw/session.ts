@@ -3,7 +3,7 @@
  *
  * Creates an in-memory (never-persisted) AgentSession that inherits:
  *   - the parent process's ModelRuntime (so extension-registered custom
- *     providers like `claude-relay-alibaba` resolve correctly), and
+ *     providers like `claude-custom` resolve correctly), and
  *   - a snapshot of the parent conversation as hidden reference context.
  *
  * The side session has read-only tools only, so it can inspect files/run
