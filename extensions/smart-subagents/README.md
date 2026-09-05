@@ -169,8 +169,9 @@ window.
 ## Worker provider bootstrap
 
 Workers keep `--no-extensions`, so they do not inherit the parent's extension
-set. Dynamic providers (the secondary Codex OAuth account and the routed Codex /
-Claude relays) are re-registered through a small, fixed, audited bootstrap:
+set. Dynamic providers (the secondary Codex OAuth account, `claude-custom`, and
+the two Cambricon NewAPI aliases) are re-registered through a small, fixed,
+audited bootstrap:
 
 ```json
 {
@@ -196,17 +197,18 @@ Claude relays) are re-registered through a small, fixed, audited bootstrap:
   dispatch, so a missing/moved/compromised trusted file fails with a
   `routing_error` before any worker spawns.
 - Providers supplied/routed by the bootstrap (`openai-codex`,
-  `openai-codex-second`, and `claude-custom`) are preflighted
-  against the configured keys without any network call; unrelated builtin
-  providers continue to work.
+  `openai-codex-second`, `claude-custom`, `claude-cambricon`, and
+  `cambricon-codex`) are preflighted against the configured keys without any
+  network call; unrelated builtin providers continue to work.
 - The unsupported-model fallback is the only automatic retry. It never runs
   after tool activity or file edits, and a generic `fetch failed` never
   silently falls back — it surfaces a bounded diagnostic instead.
-- Global `models.json` overrides give GPT-5.6 Sol/Terra/Luna a 1M Codex
-  context window for both OAuth accounts. Workers inherit those overrides even
-  under `--no-extensions`; the trusted bootstrap only restores provider and
-  transport registration. Routing uses Luna for simple work, Terra for normal
-  work, and Sol for complex/critical work.
+- Global `models.json` overrides give GPT-5.6 Sol/Terra/Luna and GPT-6 Astra a
+  1M context window for both OAuth accounts. Workers inherit those overrides
+  even under `--no-extensions`; the trusted bootstrap only restores provider
+  and transport registration. Routing uses Luna for simple work, Terra for
+  normal work, and Sol for complex/critical work unless the caller explicitly
+  selects another catalog model.
 
 ## Commands
 

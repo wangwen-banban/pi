@@ -7,6 +7,11 @@ import type {
   Model,
 } from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
+import {
+  mergeCodexModels,
+  readStoredCodexModels,
+  refreshSecondaryCodexModels,
+} from "./catalog.ts";
 
 const PRIMARY_PROVIDER = "openai-codex";
 const SECONDARY_PROVIDER = "openai-codex-second";
@@ -135,10 +140,15 @@ export default async function codexMultiAccount(pi: ExtensionAPI): Promise<void>
   if (!("oauth" in primary.auth)) throw new Error("Built-in openai-codex OAuth provider is unavailable");
   const primaryOAuth = primary.auth.oauth;
   const primaryModels = await primary.getModels();
-  const models = primaryModels.map((model: any) => {
+  const staticModels = primaryModels.map((model: any) => {
     const { provider: _provider, baseUrl: _baseUrl, ...definition } = model;
     return definition;
   });
+  // The primary provider receives a dynamic pi.dev catalog overlay after
+  // extensions load. Mirror its persisted overlay immediately, then give the
+  // secondary provider its own refresh hook so /model stays current without a
+  // /reload or a second hand-maintained model list.
+  const models = mergeCodexModels(staticModels, readStoredCodexModels());
 
   pi.registerProvider(SECONDARY_PROVIDER, {
     api: "openai-codex-responses",
@@ -152,5 +162,6 @@ export default async function codexMultiAccount(pi: ExtensionAPI): Promise<void>
       getApiKey: (credentials: any) => credentials.access,
     },
     models,
+    refreshModels: (context) => refreshSecondaryCodexModels(context, primary.baseUrl, models),
   });
 }

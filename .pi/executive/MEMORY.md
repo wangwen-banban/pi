@@ -31,3 +31,6 @@
 - 2026-08-30：PI WEB 1.202608.1 在 iPhone Safari/Tailscale 打开含大型内嵌图片的 fork session 时，100条首屏可达5.5MB并触发 `TypeError: Load failed`；版本/hash门禁补丁将 client message page size降为20，用户端验证可正常打开。
 - 2026-08-30：Plan TUI custom dialog 只替换 editor，working spinner与Activity widget仍会重绘regular TUI；审批期间隐藏working并持有Activity presentation lease，退出后一次恢复，同时render cache必须绑定width。
 - 2026-08-31：Smart Subagent 在 session shutdown 时只持久化 stopped state、不发送 completion；恢复时仅扫描 active branch，对最新 `stopped/session_shutdown` 且无对应 custom_message 的可信最小状态补发一次，不恢复 worker，也不扩展到 explicit stop/completed/failed。
+- 2026-09-05：远端 `9cab926` 将旧 Claude relays 收敛为 `claude-custom`；本地 `claude-cambricon` 与 `cambricon-codex` 作为独立 NewAPI aliases 兼容保留，旧 relay 不恢复。
+- 2026-09-05：`openai-codex-second` 必须镜像 primary 的 pi.dev 动态 catalog；启动与 `/model` refresh 均不能只依赖 `builtinProviders()` 静态7模型。GPT-6 Astra 对 primary/second 均覆盖1M，默认保持 `openai-codex-second/gpt-6-astra`。
+- 2026-09-05：NewAPI 当前实测 Claude ID 为 `k3`；Codex Responses IDs 为 Spark、GPT-5.6 Luna/Terra/Sol、GPT-6 Astra。两个 aliases 同Host同Key，共享 `/api/usage/token/` 状态和一个私有数值缓存。

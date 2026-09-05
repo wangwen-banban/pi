@@ -17,10 +17,10 @@ const result = spawnSync(
     "--provider",
     "openai-codex-second",
     "--model",
-    "gpt-5.6-sol",
+    "gpt-6-astra",
     "--no-session",
     "-p",
-    "Reply exactly SECOND-PROVIDER-LOAD-OK",
+    "Reply exactly SECOND-ASTRA-LOAD-OK",
   ],
   { encoding: "utf8", timeout: 120_000 },
 );
@@ -31,7 +31,7 @@ assert.doesNotMatch(output, /Failed to load extension/);
 assert.doesNotMatch(output, /Cannot find module/);
 assert.doesNotMatch(output, /Unknown model|Model .* not found/i);
 assert.ok(
-  output.includes("SECOND-PROVIDER-LOAD-OK") ||
+  output.includes("SECOND-ASTRA-LOAD-OK") ||
     output.includes("No API key found for openai-codex-second"),
   `secondary provider did not register correctly:\n${output.slice(0, 500)}`,
 );

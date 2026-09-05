@@ -11,6 +11,20 @@
       "requestModelId": "claude-opus-5",
       "contextWindow": 1000000,
       "maxTokens": 64000
+    },
+    "claude-cambricon": {
+      "mode": "direct",
+      "baseUrl": "http://43.143.241.66:18319",
+      "modelId": "k3",
+      "requestModelId": "k3",
+      "contextWindow": 1000000,
+      "maxTokens": 64000
+    },
+    "cambricon-codex": {
+      "mode": "direct",
+      "baseUrl": "http://43.143.241.66:18319/v1",
+      "contextWindow": 1000000,
+      "maxTokens": 128000
     }
   }
 }

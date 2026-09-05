@@ -7,8 +7,10 @@ Personal [pi](https://github.com/badlogic/pi-mono) configuration with multi-prov
 | Provider | Mode | Description |
 |----------|------|-------------|
 | `claude-custom` | Direct | Custom Claude-compatible relay — set `baseUrl` in `provider-routing.json` and the key in `auth.json` |
+| `claude-cambricon` | Direct | Lab NewAPI Claude route; uses the live `k3` model |
+| `cambricon-codex` | Direct | Lab NewAPI Responses route for the gateway's advertised Codex models |
 | `openai-codex` | Configurable | Primary Codex OAuth account |
-| `openai-codex-second` | Follows primary | Secondary Codex OAuth account; shares the primary route |
+| `openai-codex-second` | Follows primary | Secondary Codex OAuth account; shares the primary route and mirrors its refreshed model catalog |
 
 Edit `provider-routing.json` to change the primary Codex route:
 
@@ -23,7 +25,7 @@ Edit `provider-routing.json` to change the primary Codex route:
 }
 ```
 
-`openai-codex-second` automatically follows this direct/proxy setting. Its OAuth credentials and quota cache remain independent from the primary account.
+`openai-codex-second` automatically follows this direct/proxy setting. Its OAuth credentials and quota cache remain independent from the primary account. Its model catalog mirrors the official primary Codex catalog at startup and whenever `/model` refreshes, so newly published entries such as `gpt-6-astra` do not require a hand-maintained second list. `models.json` opts GPT-5.6 and GPT-6 Astra into the 1M context window for both OAuth accounts.
 
 ## Main Extensions
 
@@ -38,6 +40,7 @@ Edit `provider-routing.json` to change the primary Codex route:
 | `custom-statusline` | Provider, thinking, token, context, and Codex quota status |
 | `codex-web-search` | Live web search |
 | `weekly-usage-status` | Per-account Codex weekly quota tracking |
+| `newapi-usage-status` | One shared NewAPI quota/status for `cambricon-codex` and `claude-cambricon` |
 
 The provider transport uses pi's official virtual modules. It does not depend on a fixed nvm/npm installation path. If `undici` is unavailable, it falls back to a Node-core HTTP(S) transport supporting direct requests, HTTP(S) proxies, CONNECT tunnels, streaming, aborts, and relay TLS compatibility.
 
@@ -109,6 +112,12 @@ chmod 600 ~/.pi/agent/auth.json
 6. Run `/model` and select a model under `openai-codex-second`.
 
 After both accounts are authorized, switch accounts through `/model`; repeated logout/login is not required. The footer and `/weekly` use the quota belonging to the currently selected provider.
+
+## Shared Lab NewAPI Status
+
+`cambricon-codex` and `claude-cambricon` are two protocol aliases for one NewAPI account. When either is active, the footer and standalone status show one shared `NEW API` remaining-capacity value from `/api/usage/token/`; switching aliases reuses the same single-flight request and private numeric cache. `/newapi` forces a refresh and reports the remaining/granted amounts and expiry. Keys are read from Pi auth memory and are never written to the cache.
+
+The gateway model names are taken from its live `/v1/models` catalog. The Claude route currently uses `k3`; the Codex route uses base model IDs and Pi's thinking level rather than inventing `-high`/`-max` suffixes. If the gateway advertises a model but has no live channel, requests may still return `503 model_not_found`; treat the successful protocol probe as authoritative.
 
 ## Codex Fast Mode
 

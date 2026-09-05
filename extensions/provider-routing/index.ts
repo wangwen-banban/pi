@@ -456,6 +456,165 @@ export function registerProviderRouting(
     },
   });
 
+  // --- claude-cambricon provider (lab New API gateway) ---
+  const cambricon = routeFor("claude-cambricon");
+  for (const key of ["baseUrl", "modelId", "requestModelId"] as const) {
+    if (!cambricon[key]) throw new Error(`Missing claude-cambricon.${key} in ${ROUTING_PATH}`);
+  }
+  const cambriconSessionId = crypto.randomUUID();
+
+  pi.registerProvider("claude-cambricon", {
+    api: "anthropic-messages",
+    baseUrl: cambricon.baseUrl,
+    headers: {
+      "x-claude-code-session-id": cambriconSessionId,
+      "user-agent": "claude-code/1.0",
+    },
+    models: [
+      {
+        id: cambricon.modelId!,
+        name: "K3 (Cambricon New API)",
+        api: "anthropic-messages",
+        reasoning: true,
+        input: ["text", "image"],
+        contextWindow: cambricon.contextWindow ?? 1_000_000,
+        maxTokens: cambricon.maxTokens ?? 64_000,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        thinkingLevelMap: {
+          minimal: "low",
+          low: "low",
+          medium: "medium",
+          high: "high",
+          xhigh: "xhigh",
+          max: "max",
+        },
+        compat: {
+          supportsPromptCaching: false,
+          sendSessionAffinityHeaders: false,
+          forceAdaptiveThinking: true,
+        },
+      },
+    ],
+    streamSimple: async (
+      model: Model<any>,
+      context: Context,
+      options?: SimpleStreamOptions,
+    ): Promise<AssistantMessageEventStream> => {
+      const provider = getApiProvider("anthropic-messages");
+      const env = withRouteEnv(options?.env, cambricon);
+      const requestModel = { ...model, id: cambricon.requestModelId! };
+      const filteredContext: Context = {
+        ...context,
+        tools: context.tools?.filter((t: any) => t.name !== "web_search"),
+      };
+      const directFetch: typeof fetch = async (input, init) => {
+        const headers = new Headers((init as any)?.headers);
+        headers.set("x-claude-code-session-id", cambriconSessionId);
+        headers.set("user-agent", "claude-code/1.0");
+
+        // Fix thinking format: adaptive instead of "enabled"
+        if ((init as any)?.body && typeof (init as any).body === "string") {
+          try {
+            const reqBody = JSON.parse((init as any).body);
+            if (reqBody.thinking?.type === "enabled") {
+              const budget = reqBody.thinking.budget_tokens ?? reqBody.max_tokens ?? 8000;
+              const effort = budget >= 32000 ? "max" : budget >= 16000 ? "xhigh" : budget >= 8000 ? "high" : budget >= 4000 ? "medium" : "low";
+              reqBody.thinking = { type: "adaptive" };
+              reqBody.output_config = { effort };
+              (init as any) = { ...(init as any), body: JSON.stringify(reqBody) };
+            }
+          } catch { /* pass through */ }
+        }
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 90_000);
+        try {
+          return await transport.fetch(input as any, {
+            ...(init as any),
+            headers,
+            signal: controller.signal,
+          }) as any;
+        } catch (e: any) {
+          if (e?.name === "AbortError") throw new Error("[claude-cambricon] 请求超时 (90s)");
+          throw e;
+        } finally {
+          clearTimeout(timeout);
+        }
+      };
+      return streamWithRetry(
+        () => provider.streamSimple(requestModel, filteredContext, { ...options, env, fetch: directFetch }),
+        createAssistantMessageEventStream,
+        requestModel,
+        5,
+      );
+    },
+  });
+
+  // --- cambricon-codex provider (lab New API gateway, OpenAI Responses) ---
+  const codexRoute = routeFor("cambricon-codex");
+  if (!codexRoute.baseUrl) throw new Error(`Missing cambricon-codex.baseUrl in ${ROUTING_PATH}`);
+
+  const cambriconCodexModel = (id: string, label: string, contextWindow: number) => ({
+    id,
+    name: label,
+    api: "openai-responses" as const,
+    reasoning: true,
+    input: ["text", "image"] as ("text" | "image")[],
+    contextWindow,
+    maxTokens: codexRoute.maxTokens ?? 128_000,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    thinkingLevelMap: {
+      minimal: "low",
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "xhigh",
+      max: "max",
+    },
+    compat: {
+      supportsPromptCaching: false,
+      sendSessionAffinityHeaders: false,
+    },
+  });
+  const cambriconContext = codexRoute.contextWindow ?? 1_000_000;
+
+  pi.registerProvider("cambricon-codex", {
+    api: "openai-responses",
+    baseUrl: codexRoute.baseUrl,
+    models: [
+      cambriconCodexModel("gpt-5.3-codex-spark", "GPT 5.3 Codex Spark (Cambricon)", 128_000),
+      cambriconCodexModel("gpt-5.6-luna", "GPT 5.6 Luna (Cambricon)", cambriconContext),
+      cambriconCodexModel("gpt-5.6-terra", "GPT 5.6 Terra (Cambricon)", cambriconContext),
+      cambriconCodexModel("gpt-5.6-sol", "GPT 5.6 Sol (Cambricon)", cambriconContext),
+      cambriconCodexModel("gpt-6-astra", "GPT 6 Astra (Cambricon)", 1_000_000),
+    ],
+    streamSimple: async (
+      model: Model<any>,
+      context: Context,
+      options?: SimpleStreamOptions,
+    ): Promise<AssistantMessageEventStream> => {
+      const provider = getApiProvider("openai-responses");
+      const env = withRouteEnv(options?.env, codexRoute);
+      const requestModel = { ...model, baseUrl: codexRoute.baseUrl };
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 120_000);
+      const directFetch: typeof fetch = async (input, init) => {
+        try {
+          return await transport.fetch(input as any, {
+            ...(init as any),
+            signal: controller.signal,
+          }) as any;
+        } catch (e: any) {
+          if (e?.name === "AbortError") throw new Error("[cambricon-codex] 请求超时 (120s)");
+          throw e;
+        } finally {
+          clearTimeout(timeout);
+        }
+      };
+      return provider.streamSimple(requestModel, context, { ...options, env, fetch: directFetch });
+    },
+  });
+
   const streamCodexWithPrimaryRoute = async (
     model: Model<any>,
     context: Context,

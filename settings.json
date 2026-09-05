@@ -1,9 +1,9 @@
 {
   "lastChangelogVersion": "0.84.1",
   "theme": "dark",
-  "defaultProvider": "claude-custom",
-  "defaultModel": "claude-opus-5",
-  "defaultThinkingLevel": "max",
+  "defaultProvider": "openai-codex-second",
+  "defaultModel": "gpt-6-astra",
+  "defaultThinkingLevel": "xhigh",
   "skills": [
     "~/.code-helper/skills"
   ],

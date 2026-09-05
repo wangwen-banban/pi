@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getCodexCachePath } from "../weekly-usage-status/codex-provider.ts";
+import { getNewApiCachePath } from "../newapi-usage-status/cache.ts";
 import { formatResetCountdown, readSubscriptionQuota, SUBSCRIPTION_PROVIDERS } from "./quota.ts";
 
 const agentDir = mkdtempSync(join(tmpdir(), "pi-quota-"));
@@ -32,6 +33,39 @@ try {
 	assert.equal(second.resetsAt, 1_700_000_200);
 	console.log("✓ both Codex accounts share label 'CODEX WEEK' and read their own cache");
 
+	writeFileSync(
+		getNewApiCachePath(agentDir),
+		JSON.stringify({
+			version: 1,
+			account: "newapi-cambricon",
+			remainingPercent: 49.3,
+			totalGranted: 100,
+			totalUsed: 50.7,
+			totalAvailable: 49.3,
+			unlimited: false,
+			expiresAt: 1_800_000_000,
+			updatedAt: 1_700_000_000_000,
+			source: "api",
+		}),
+	);
+	assert.equal(SUBSCRIPTION_PROVIDERS["cambricon-codex"].label, "NEW API");
+	assert.equal(SUBSCRIPTION_PROVIDERS["claude-cambricon"].label, "NEW API");
+	assert.equal(SUBSCRIPTION_PROVIDERS["cambricon-codex"].cacheFile(agentDir), SUBSCRIPTION_PROVIDERS["claude-cambricon"].cacheFile(agentDir));
+	for (const provider of ["cambricon-codex", "claude-cambricon"]) {
+		const shared = readSubscriptionQuota(agentDir, provider);
+		assert.equal(shared.remaining, 49.3);
+		assert.equal(shared.resetsAt, 1_800_000_000);
+		assert.equal(shared.deadlineLabel, "EXPIRES");
+		assert.equal(shared.unlimited, false);
+	}
+	writeFileSync(getNewApiCachePath(agentDir), JSON.stringify({
+		version: 1, account: "newapi-cambricon", remainingPercent: null,
+		totalGranted: null, totalUsed: null, totalAvailable: null,
+		unlimited: true, updatedAt: Date.now(), source: "api",
+	}));
+	assert.equal(readSubscriptionQuota(agentDir, "cambricon-codex").unlimited, true);
+	console.log("✓ both Cambricon aliases share one NEW API cache with expiry and unlimited semantics");
+
 	// Third-party API / pay-per-use providers render no quota bar at all.
 	assert.equal(readSubscriptionQuota(agentDir, "claude-custom"), undefined);
 	assert.equal(
@@ -60,6 +94,8 @@ const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
 assert.match(source, /SUBSCRIPTION_PROVIDERS\[providerId\]/);
 assert.match(source, /readSubscriptionQuota\(AGENT_DIR, providerId\)/);
 assert.match(source, /secondSegments\.join\("   "\)/);
+assert.match(source, /quota\.deadlineLabel \?\? "RESET"/);
+assert.match(source, /unlimited \? "∞"/);
 assert.doesNotMatch(source, /function readCodexQuota/);
 assert.doesNotMatch(source, /function formatResetCountdown/);
 console.log("✓ statusline renders quota only for registered subscription providers");

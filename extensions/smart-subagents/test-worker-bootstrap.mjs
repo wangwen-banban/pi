@@ -34,6 +34,9 @@ test("default config carries the trusted worker extensions in fixed order", () =
 	assert.deepEqual(WORKER_EXTENSION_KEYS, ["codex-multi-account", "provider-routing", "codex-web-search"]);
 	assert.equal(WORKER_EXTENSIONS["codex-multi-account"].order, 0);
 	assert.equal(WORKER_EXTENSIONS["provider-routing"].order, 1);
+	assert.deepEqual(WORKER_EXTENSIONS["provider-routing"].providers, [
+		"openai-codex", "openai-codex-second", "claude-custom", "claude-cambricon", "cambricon-codex",
+	]);
 	assert.equal(WORKER_EXTENSIONS["codex-web-search"].order, 2);
 	assert.deepEqual(WORKER_EXTENSIONS["codex-web-search"].providers, []);
 });
@@ -234,6 +237,8 @@ test("preflightWorkerProvider gates extension-dependent providers and lets built
 	assert.equal(preflightWorkerProvider("openai-codex", both), null);
 	assert.equal(preflightWorkerProvider("openai-codex-second", both), null);
 	assert.equal(preflightWorkerProvider("claude-custom", ["provider-routing"]), null);
+	assert.equal(preflightWorkerProvider("claude-cambricon", ["provider-routing"]), null);
+	assert.equal(preflightWorkerProvider("cambricon-codex", ["provider-routing"]), null);
 
 	const primaryMissing = preflightWorkerProvider("openai-codex", ["codex-multi-account"]);
 	assert.match(primaryMissing, /provider-routing/);
@@ -243,8 +248,10 @@ test("preflightWorkerProvider gates extension-dependent providers and lets built
 	const secondaryMissing = preflightWorkerProvider("openai-codex-second", ["provider-routing"]);
 	assert.match(secondaryMissing, /codex-multi-account/);
 
-	const none = preflightWorkerProvider("claude-custom", []);
-	assert.match(none, /provider-routing/);
+	for (const provider of ["claude-custom", "claude-cambricon", "cambricon-codex"]) {
+		const none = preflightWorkerProvider(provider, []);
+		assert.match(none, /provider-routing/);
+	}
 });
 
 // ---------------------------------------------------------------------------

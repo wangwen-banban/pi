@@ -95,30 +95,35 @@ export default function (pi: ExtensionAPI) {
 					const contextRemainingTokens = contextUsage?.tokens == null || contextTotal == null
 						? null
 						: Math.max(0, contextTotal - contextUsage.tokens);
-					// --- Subscription quota bar (only for subscription providers) ---
-					// Third-party API / pay-per-use providers are not in the registry and
-					// render no quota bar at all; the balance follows the active provider.
+					// --- Provider capacity bar (only providers with an official usage API) ---
+					// Codex OAuth accounts use independent weekly caches; the two NewAPI
+					// protocol aliases deliberately share one account/cache.
 					const subscriptionProvider = SUBSCRIPTION_PROVIDERS[providerId];
 					const barWidth = Math.min(10, Math.max(4, Math.floor(width * 0.055)));
-					const capacity = (label: string, remaining: number | null) => {
-						const valueColor = remaining == null
-							? "dim"
-							: remaining <= 10
-								? "error"
-								: remaining <= 25
-									? "warning"
-									: "accent";
-						const filled = remaining == null ? 0 : Math.round((remaining / 100) * barWidth);
+					const capacity = (label: string, remaining: number | null, unlimited = false) => {
+						const valueColor = unlimited
+							? "accent"
+							: remaining == null
+								? "dim"
+								: remaining <= 10
+									? "error"
+									: remaining <= 25
+										? "warning"
+										: "accent";
+						const filled = unlimited ? barWidth : remaining == null ? 0 : Math.round((remaining / 100) * barWidth);
 						const cells = theme.fg(valueColor, "━".repeat(filled)) + theme.fg("dim", "─".repeat(barWidth - filled));
-						const value = remaining == null ? "N/A" : `${Math.round(remaining)}%`;
+						const value = unlimited ? "∞" : remaining == null ? "N/A" : `${Math.round(remaining)}%`;
 						return `${theme.fg("muted", label)} ${theme.fg(valueColor, value)} ${cells}`;
 					};
 					let quotaBar = "";
 					if (subscriptionProvider) {
 						const quota = readSubscriptionQuota(AGENT_DIR, providerId);
 						if (quota) {
-							quotaBar = capacity(subscriptionProvider.label, quota.remaining) +
-								(quota.resetsAt ? ` ${theme.fg("dim", `RESET ${formatResetCountdown(quota.resetsAt)}`)}` : "");
+							const deadline = quota.resetsAt ? formatResetCountdown(quota.resetsAt) : null;
+							const stale = quota.updatedAt !== undefined && Date.now() - quota.updatedAt > 30 * 60_000;
+							quotaBar = capacity(subscriptionProvider.label, quota.remaining, quota.unlimited) +
+								(deadline ? ` ${theme.fg("dim", `${quota.deadlineLabel ?? "RESET"} ${deadline}`)}` : "") +
+								(stale ? ` ${theme.fg("dim", "CACHED")}` : "");
 						}
 					}
 					const contextBar = capacity("CTX", contextRemaining);

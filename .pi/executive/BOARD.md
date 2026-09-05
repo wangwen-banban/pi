@@ -1,4 +1,4 @@
-# 任务看板（更新时间：2026-08-31）
+# 任务看板（更新时间：2026-09-05）
 
 ## 进行中
 - （无）
@@ -22,6 +22,8 @@
 - [x] PI WEB fork 移动端访问 — 1.202608.1 client分页100→20的版本化补丁；installer最终gate 65/65，iPhone Safari实测恢复。
 - [x] Exit Plan Mode TUI 抖动 — 审批期间暂停working/Activity展示重绘并修width cache；独立QA 168/168，0 blocker/major。
 - [x] Smart Subagent shutdown replay（PR #2）— active-branch、隐私最小、恰好一次正常恢复；独立QA 0 blocker/major/minor。
+- [x] Provider远端同步 — rebase到9cab926，保留claude-custom及两个本地Cambricon aliases；auth未变。
+- [x] Codex/NewAPI模型与状态 — second动态catalog、Astra 1M、k3及共享NEW API状态；真实三条模型调用与相关回归通过。
 
 ## 失败/搁置
 - [ ] `codex_rewind_semantics` — runtime 中断，仅留 context.md。

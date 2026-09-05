@@ -10,8 +10,8 @@ import * as path from "node:path";
  * from the agent directory, in a fixed order:
  *
  *   1. codex-multi-account — OAuth + models for `openai-codex-second`
- *   2. provider-routing    — proxy transport for `openai-codex`,
- *                            `openai-codex-second`, and the Claude relays
+ *   2. provider-routing    — proxy/direct transport for both Codex OAuth
+ *                            accounts, claude-custom, and the two NewAPI aliases
  *
  * `provider-routing` alone leaves `openai-codex-second` without oauth/models,
  * which aborts worker startup in the provider composer. The order is enforced
@@ -39,7 +39,7 @@ export const WORKER_EXTENSIONS = {
 		key: "provider-routing",
 		rel: "provider-routing/index.ts",
 		order: 1,
-		providers: ["openai-codex", "openai-codex-second", "claude-custom"],
+		providers: ["openai-codex", "openai-codex-second", "claude-custom", "claude-cambricon", "cambricon-codex"],
 	},
 	"codex-web-search": {
 		key: "codex-web-search",
@@ -64,6 +64,8 @@ export const WORKER_PROVIDER_DEPENDENCIES: Record<string, WorkerExtensionKey[]> 
 	// Needs codex-multi-account for oauth/models AND provider-routing for transport.
 	"openai-codex-second": ["codex-multi-account", "provider-routing"],
 	"claude-custom": ["provider-routing"],
+	"claude-cambricon": ["provider-routing"],
+	"cambricon-codex": ["provider-routing"],
 };
 
 export function isWorkerExtensionKey(value: string): value is WorkerExtensionKey {

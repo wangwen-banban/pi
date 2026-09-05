@@ -1,9 +1,9 @@
 /**
- * Subscription-provider quota registry for the custom status line.
+ * Provider capacity registry for the custom status line.
  *
- * Only providers listed here render a quota bar. Third-party API / pay-per-use
- * providers (e.g. claude-custom) are intentionally absent and
- * never show quota.
+ * Only providers with an official quota/usage endpoint are listed. The two
+ * Cambricon routes share one NewAPI account and therefore intentionally read
+ * the same cache instead of showing two independent balances.
  *
  * OpenCode Go (`opencode-go`) is also absent: opencode does not expose an
  * official usage/balance API (anomalyco/opencode#31084 was closed without an
@@ -15,15 +15,20 @@
 
 import { readFileSync } from "node:fs";
 import { getCodexCachePath } from "../weekly-usage-status/codex-provider.ts";
+import { getNewApiCachePath } from "../newapi-usage-status/cache.ts";
 
 export interface SubscriptionQuota {
 	remaining: number | null;
+	unlimited?: boolean;
 	/** Unix timestamp in seconds. */
 	resetsAt?: number;
+	deadlineLabel?: "RESET" | "EXPIRES";
+	updatedAt?: number;
 }
 
 export interface SubscriptionProvider {
 	label: string;
+	kind?: "codex" | "newapi";
 	cacheFile: (agentDir: string) => string;
 }
 
@@ -37,6 +42,16 @@ export const SUBSCRIPTION_PROVIDERS: Record<string, SubscriptionProvider> = {
 	"openai-codex-second": {
 		label: "CODEX WEEK",
 		cacheFile: (agentDir) => getCodexCachePath(agentDir, "openai-codex-second"),
+	},
+	"cambricon-codex": {
+		label: "NEW API",
+		kind: "newapi",
+		cacheFile: (agentDir) => getNewApiCachePath(agentDir),
+	},
+	"claude-cambricon": {
+		label: "NEW API",
+		kind: "newapi",
+		cacheFile: (agentDir) => getNewApiCachePath(agentDir),
 	},
 };
 
@@ -52,9 +67,28 @@ export function readSubscriptionQuota(agentDir: string, provider: unknown): Subs
 	if (!entry) return undefined;
 	try {
 		const data = JSON.parse(readFileSync(entry.cacheFile(agentDir), "utf8")) as {
+			version?: unknown;
+			account?: unknown;
 			remainingPercent?: unknown;
 			resetsAt?: unknown;
+			expiresAt?: unknown;
+			unlimited?: unknown;
+			updatedAt?: unknown;
 		};
+		if (entry.kind === "newapi") {
+			if (data.version !== 1 || data.account !== "newapi-cambricon" || typeof data.unlimited !== "boolean") return { remaining: null };
+			return {
+				remaining: data.unlimited
+					? null
+					: typeof data.remainingPercent === "number" && Number.isFinite(data.remainingPercent)
+						? Math.max(0, Math.min(100, data.remainingPercent))
+						: null,
+				unlimited: data.unlimited,
+				resetsAt: typeof data.expiresAt === "number" && Number.isFinite(data.expiresAt) ? data.expiresAt : undefined,
+				deadlineLabel: "EXPIRES",
+				updatedAt: typeof data.updatedAt === "number" && Number.isFinite(data.updatedAt) ? data.updatedAt : undefined,
+			};
+		}
 		return {
 			remaining: typeof data.remainingPercent === "number" && Number.isFinite(data.remainingPercent)
 				? Math.max(0, Math.min(100, data.remainingPercent))
@@ -62,6 +96,7 @@ export function readSubscriptionQuota(agentDir: string, provider: unknown): Subs
 			resetsAt: typeof data.resetsAt === "number" && Number.isFinite(data.resetsAt)
 				? data.resetsAt
 				: undefined,
+			deadlineLabel: "RESET",
 		};
 	} catch {
 		return { remaining: null };

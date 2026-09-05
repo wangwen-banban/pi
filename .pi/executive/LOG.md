@@ -19,3 +19,5 @@
 2026-08-30 | PI WEB fork session移动Safari诊断与修复 | PASS：确认5.5MB首屏触发Load failed；分页20补丁gate 65/65，用户实测恢复。
 2026-08-30 | Exit Plan Mode审批抖动修复 | PASS：working/Activity presentation freeze与width cache修复；独立QA 168/168。
 2026-08-31 | Smart Subagent shutdown replay（PR #2） | PASS：RED测试转绿；strict20/smart73/background75及独立真实Pi探针通过。
+2026-09-05 | 同步远端provider重构 | 成功：rebase 9cab926；claude-custom与本地两Cambricon aliases共存，auth hash/mode不变。
+2026-09-05 | Codex/NewAPI catalog与共享status | PASS：second/Astra、NewAPI Astra、k3真实调用成功；Astra 1M、共享48%缓存与171+29回归通过。
