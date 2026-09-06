@@ -12,6 +12,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { registerContextSnapshot } from "../shared/context-snapshot.ts";
 import {
 	Editor,
 	type EditorTheme,
@@ -310,26 +311,30 @@ export default function planMode(pi: ExtensionAPI) {
 		}
 	}
 
-	// --- Inject plan-mode status into system prompt ---
-	pi.on("before_agent_start", async () => {
-		if (!inPlanMode) return {};
-		return {
-			systemPrompt:
-				"[PLAN MODE ACTIVE]\n" +
-				"You are currently in PLAN MODE. `edit`, `write`, and `run_background_task` are fully BLOCKED.\n" +
-				"`bash` IS available for read-only commands — ls, cat, head, tail, grep, rg, find, fd, wc, " +
-				"jq, sed (without -i), awk, stat, tree, file, du, git log/diff/show/status/blame/ls-files, " +
-				"npm ls, docker ps, and similar inspection commands all run normally. Pipes and " +
-				"`>/dev/null` are fine. USE THEM to explore the codebase properly.\n" +
-				"Blocked in bash: anything that mutates — file writes (`>`/`>>`/tee), rm/mv/cp/mkdir/touch/chmod, " +
-				"git commit/add/push/checkout, package installs, inline eval (`node -e`, `python -c`), sudo, " +
-				"and process/system control.\n" +
-				"Sub-agents you dispatch are forced to read-only while plan mode is active.\n" +
-				"Your job: explore and prepare a plan. Use `ask_user` only for a genuine unresolved ambiguity or " +
-				"consequential tradeoff; if the plan is clear, call `exit_plan_mode` directly. Rejection or feedback " +
-				"keeps this same Plan Mode active — revise and call `exit_plan_mode` again without another `enter_plan_mode`.\n" +
-				`Plan reason: ${planModeReason || "planning approval"}\n`,
-		};
+	// --- Keep dynamic plan-mode status out of the system prefix ---
+	registerContextSnapshot(pi, "plan-mode:context:v1", () => {
+		if (!inPlanMode) {
+			return "[PLAN MODE INACTIVE]\n" +
+				"The Plan Mode gate is inactive. Continue within the approved user scope, " +
+				"subject to all other permissions and safeguards. This current state " +
+				"supersedes older Plan Mode snapshots; it does not grant additional permission.";
+		}
+		return (
+			"[PLAN MODE ACTIVE]\n" +
+			"You are currently in PLAN MODE. `edit`, `write`, and `run_background_task` are fully BLOCKED.\n" +
+			"`bash` IS available for read-only commands — ls, cat, head, tail, grep, rg, find, fd, wc, " +
+			"jq, sed (without -i), awk, stat, tree, file, du, git log/diff/show/status/blame/ls-files, " +
+			"npm ls, docker ps, and similar inspection commands all run normally. Pipes and " +
+			"`>/dev/null` are fine. USE THEM to explore the codebase properly.\n" +
+			"Blocked in bash: anything that mutates — file writes (`>`/`>>`/tee), rm/mv/cp/mkdir/touch/chmod, " +
+			"git commit/add/push/checkout, package installs, inline eval (`node -e`, `python -c`), sudo, " +
+			"and process/system control.\n" +
+			"Sub-agents you dispatch are forced to read-only while plan mode is active.\n" +
+			"Your job: explore and prepare a plan. Use `ask_user` only for a genuine unresolved ambiguity or " +
+			"consequential tradeoff; if the plan is clear, call `exit_plan_mode` directly. Rejection or feedback " +
+			"keeps this same Plan Mode active — revise and call `exit_plan_mode` again without another `enter_plan_mode`.\n" +
+			`Plan reason: ${planModeReason || "planning approval"}\n`
+		);
 	});
 
 	// --- Block write tools when in plan mode ---

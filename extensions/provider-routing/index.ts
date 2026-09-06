@@ -668,16 +668,9 @@ export function registerProviderRouting(
     publishFastMode(ctx);
   });
 
-  // Codex defaults to xhigh whenever either account is selected. Fast mode is
-  // session-scoped and becomes active again when the user returns to a
-  // supported Codex model.
-  pi.on("model_select", async (event, ctx) => {
-    if (
-      (event.model.provider === "openai-codex" || event.model.provider === "openai-codex-second") &&
-      pi.getThinkingLevel() !== "xhigh"
-    ) {
-      pi.setThinkingLevel("xhigh");
-    }
+  // Preserve the user's thinking level when switching providers/models.
+  // Fast mode remains session-scoped; only refresh its availability/status.
+  pi.on("model_select", (_event, ctx) => {
     publishFastMode(ctx);
   });
 

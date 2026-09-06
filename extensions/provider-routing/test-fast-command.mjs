@@ -48,6 +48,7 @@ async function harness() {
 		fire,
 		fast: extension.commands.get("fast").handler,
 		getThinking: () => thinking,
+		setThinking: (level) => { thinking = level; },
 	};
 }
 
@@ -84,7 +85,7 @@ test("session_start restores an enabled marker and immediately updates the statu
 	await h.fire("session_shutdown", { reason: "quit" });
 });
 
-test("unsupported models cannot enable Fast, while model_select keeps Codex xhigh", async () => {
+test("unsupported models cannot enable Fast, while model_select preserves user effort", async () => {
 	const h = await harness();
 	await h.fire("session_start", { reason: "startup" });
 	h.ctx.model = { provider: "openai-codex", id: "gpt-5.4-mini" };
@@ -95,9 +96,21 @@ test("unsupported models cannot enable Fast, while model_select keeps Codex xhig
 
 	h.ctx.model = { provider: "openai-codex-second", id: "gpt-5.6-terra" };
 	await h.fire("model_select", { model: h.ctx.model, previousModel: undefined, source: "set" });
-	assert.equal(h.getThinking(), "xhigh");
+	assert.equal(h.getThinking(), "low");
 	await h.fast("on", h.ctx);
 	assert.equal(h.events.at(-1).provider, "openai-codex-second");
 	assert.equal(h.events.at(-1).active, true);
+	for (const provider of ["openai-codex", "openai-codex-second"]) {
+		for (const level of ["low", "medium", "high", "xhigh"]) {
+			h.setThinking(level);
+			h.ctx.model = { provider, id: "gpt-5.6-terra" };
+			const count = h.events.length;
+			await h.fire("model_select", { model: h.ctx.model, source: "set" });
+			assert.equal(h.getThinking(), level);
+			assert.equal(h.events.length, count + 1);
+			assert.equal(h.events.at(-1).provider, provider);
+			assert.equal(h.events.at(-1).active, true);
+		}
+	}
 	await h.fire("session_shutdown", { reason: "quit" });
 });

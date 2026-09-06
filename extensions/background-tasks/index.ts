@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { registerContextSnapshot } from "../shared/context-snapshot.ts";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -990,7 +991,7 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		promptGuidelines: [
 			"For multi-step work, call update_task_plan with concise ordered tasks and keep it current as user prompts add, remove, reprioritize, complete, fail, or retry work.",
 			"Treat the task plan as the current user's goal, not permanent history. Omit terminal or obsolete tasks once they no longer materially affect the next analysis, retry, verification, or decision; keep them explicitly only while still relevant.",
-			"Use the task-plan revision shown in the system prompt/tool result as baseRevision (use 0 for the initial empty plan). If a revision conflict occurs, reconcile against the returned latest plan rather than overwriting it.",
+			"Use the task-plan revision in the latest task-plan snapshot or subsequent tool/lifecycle result as baseRevision (use 0 for the initial empty plan). If a revision conflict occurs, reconcile against the returned latest plan rather than overwriting it.",
 			"Keep at most one task in_progress. Do not mark a managed background task complete yourself; its lifecycle hook owns the terminal transition.",
 		],
 		parameters: UpdateTaskPlanParams,
@@ -1192,17 +1193,13 @@ function registerBackgroundTasks(pi: ExtensionAPI, extensionOptions: ResolvedBac
 		},
 	});
 
-	pi.on("before_agent_start", (event) => {
-		return {
-			systemPrompt: [
-				event.systemPrompt,
-				"",
-				"[DYNAMIC MAIN-AGENT TASK PLAN]",
-				taskPlanText(plan),
-				"User prompts may change scope or priority while a background command runs. Reconcile the plan with update_task_plan using the exact revision above. This is a current-goal view, not permanent history: omit terminal or obsolete tasks when they no longer materially affect next work, but retain outcomes still needed for analysis, retry, verification, or decisions. Keep an active managed task unless the user explicitly asks to stop or replace it. Completion hooks use the latest revision and wake you automatically; never poll managed runs.",
-			].join("\n"),
-		};
-	});
+	// Keep dynamic revisions out of the system prefix.
+	registerContextSnapshot(pi, "background-tasks:context:v1", () => [
+		"[DYNAMIC MAIN-AGENT TASK PLAN]",
+		taskPlanText(plan),
+		"This snapshot and subsequent task-plan/tool/lifecycle updates supersede older snapshots.",
+		"User prompts may change scope or priority while a background command runs. Reconcile the plan with update_task_plan using the exact revision above. This is a current-goal view, not permanent history: omit terminal or obsolete tasks when they no longer materially affect next work, but retain outcomes still needed for analysis, retry, verification, or decisions. Keep an active managed task unless the user explicitly asks to stop or replace it. Completion hooks use the latest revision and wake you automatically; never poll managed runs.",
+	].join("\n"));
 
 	const blockBranchChange = (ctx: ExtensionContext, action: string) => {
 		const active = activeRuns().length;
