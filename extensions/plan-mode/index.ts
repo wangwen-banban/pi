@@ -315,7 +315,7 @@ export default function planMode(pi: ExtensionAPI) {
 	registerContextSnapshot(pi, "plan-mode:context:v1", () => {
 		if (!inPlanMode) {
 			return "[PLAN MODE INACTIVE]\n" +
-				"The Plan Mode gate is inactive. Continue within the approved user scope, " +
+				"The Plan Mode gate is inactive. Continue the requested task without routine approval prompts, " +
 				"subject to all other permissions and safeguards. This current state " +
 				"supersedes older Plan Mode snapshots; it does not grant additional permission.";
 		}
@@ -330,9 +330,11 @@ export default function planMode(pi: ExtensionAPI) {
 			"git commit/add/push/checkout, package installs, inline eval (`node -e`, `python -c`), sudo, " +
 			"and process/system control.\n" +
 			"Sub-agents you dispatch are forced to read-only while plan mode is active.\n" +
-			"Your job: explore and prepare a plan. Use `ask_user` only for a genuine unresolved ambiguity or " +
-			"consequential tradeoff; if the plan is clear, call `exit_plan_mode` directly. Rejection or feedback " +
-			"keeps this same Plan Mode active — revise and call `exit_plan_mode` again without another `enter_plan_mode`.\n" +
+			"Explore and prepare the plan autonomously. Investigate factual uncertainty and choose safe, reversible " +
+			"research methods yourself. Use `ask_user` only when an unresolved material decision has no safe default " +
+			"and prevents a useful proposal; otherwise include your recommendation in `exit_plan_mode` directly. " +
+			"Do not ask for the same decision in both dialogs. Rejection or feedback keeps this same Plan Mode active; " +
+			"revise without another `enter_plan_mode`. After cancellation, do not immediately reopen the dialog.\n" +
 			`Plan reason: ${planModeReason || "planning approval"}\n`
 		);
 	});
@@ -420,18 +422,19 @@ export default function planMode(pi: ExtensionAPI) {
 		name: "enter_plan_mode",
 		label: "Enter Plan Mode",
 		description:
-			"Enter read-only Plan Mode only when the user explicitly requests planning, an irreversible or " +
-			"high-risk operation needs whole-plan approval, or an unresolved material objective/architecture " +
-			"fork requires the user to choose. Do not enter for ordinary complexity, multi-file work, " +
-			"implementation-detail choices, failures, or follow-ups within an approved goal.",
-		promptSnippet: "Enter read-only approval planning for an explicit request, high risk, or a strategic fork",
+			"Enter read-only Plan Mode only for an explicit request to approve an implementation plan before changes, " +
+			"or a consequential unapproved commitment that needs whole-plan approval. Research, comparing methods, " +
+			"writing a plan as a deliverable, and reversible implementation choices do not require this tool.",
+		promptSnippet: "Enter a required whole-plan approval gate, not routine research planning",
 		promptGuidelines: [
-			"Call enter_plan_mode only when the user explicitly asks to plan first, an irreversible/high-risk operation needs whole-plan approval, or an unresolved material goal/architecture fork requires the user's direction.",
-			"Multiple files, ordinary complex or multi-step work, several pure implementation-detail choices, and test/build failures are NOT reasons to enter Plan Mode.",
-			"Approval covers implementation, tests, fixes, and validation for the same top-level goal. Do not re-enter for follow-ups within that goal; re-enter only if the goal materially changes or the approved approach is invalid and the user must choose a new direction.",
-			"In Plan Mode, explore with read/grep/find and read-only bash. Use ask_user only for a genuine unresolved ambiguity or consequential tradeoff.",
-			"If the plan is clear, call exit_plan_mode directly; ask_user is optional, so normally there is only one final approval prompt.",
-			"After rejection or feedback, remain in the current Plan Mode, revise, and call exit_plan_mode again without another enter_plan_mode.",
+			"Default to autonomous completion within the requested scope and existing permissions. Routine research normally needs zero decision prompts; do not stop after each phase to ask whether to continue.",
+			"Before asking, inspect available context, sources, and conventions. Resolve factual uncertainty with evidence; choose a safe, reversible default for non-critical details and state material assumptions briefly.",
+			"Ask only when the decision is material to outcome, scope, commitment, cost, or risk; reasonable investigation cannot resolve it; and no safe, reversible default exists within the authorized scope. Explicit ask-first instructions and mandatory approvals take precedence.",
+			"Call enter_plan_mode only for an explicit implementation approval request or an unapproved high-risk/irreversible action or material objective/architecture commitment that needs whole-plan approval. Researching alternatives is not committing to them; an ask_user decision alone does not require Plan Mode.",
+			"Multiple files, ordinary complex or multi-step work, literature review, reversible method choices, and test/build failures are NOT reasons to enter Plan Mode.",
+			"Approval covers implementation, tests, fixes, and validation for the same top-level goal within the approved scope. Do not re-enter for each phase or follow-up; a material change outside that scope may require fresh approval.",
+			"In active Plan Mode, use read-only exploration and present the recommendation via exit_plan_mode when ready; ask_user is optional and needed only if a blocking decision prevents a useful proposal. Do not ask for the same choice twice.",
+			"Rejection, cancellation, or silence never grants approval. Stay in active Plan Mode; do not immediately reopen a cancelled question. Incorporate feedback before requesting approval for a materially revised proposal, and continue only unaffected authorized work.",
 		],
 		parameters: Type.Object({
 			reason: Type.Optional(Type.String({ description: "Brief reason for entering plan mode (optional)" })),
@@ -463,7 +466,7 @@ export default function planMode(pi: ExtensionAPI) {
 							"",
 							"Available actions:",
 							"• Read/grep/find — explore the codebase",
-							"• ask_user — only when a genuine ambiguity or tradeoff requires input",
+							"• ask_user — only for a blocking material decision with no safe default",
 							"• exit_plan_mode — present a clear final plan directly for approval",
 							"",
 							"Blocked: mutating bash, edit, write, run_background_task (until plan is approved)",
@@ -486,12 +489,20 @@ export default function planMode(pi: ExtensionAPI) {
 		name: "ask_user",
 		label: "Ask User",
 		description:
-			"Ask the user only when a genuine unresolved ambiguity, consequential tradeoff, or user preference " +
-			"blocks a responsible choice. Include meaningful numbered options; an 'Other' free-form input is " +
-			"automatically appended. Do not use this as routine confirmation before exit_plan_mode.",
-		promptSnippet: "Ask about a genuine unresolved choice (Other option auto-added)",
+			"Ask for a blocking user decision only after checking available context and evidence: the choice must " +
+			"materially affect the outcome, scope, commitment, cost, or risk and have no safe, reversible default. " +
+			"Honor explicit ask-first instructions and required approvals. Do not ask about routine research methods, " +
+			"formatting, recoverable errors, or permission to continue an already requested task. Works outside Plan Mode.",
+		promptSnippet: "Resolve a necessary user decision, not routine confirmation (Other auto-added)",
+		promptGuidelines: [
+			"Choose search terms, source order, paper-reading depth, report layout, implementation details, and bounded local checks yourself within the task scope and resource limits; compare hypotheses before asking the user to pick one.",
+			"Unspecified budgets are not permission for expensive or unbounded experiments. Ask before an unapproved significant spend, destructive or production change, publication, or disclosure of private data; never use a default to bypass a required permission.",
+			"When asking, explain what is blocked and why available evidence cannot settle it, recommend a path, and offer 2-5 meaningful alternatives with tradeoffs. Batch related decisions when practical and defer questions until the choice is actually necessary.",
+			"Do not ask again about an answered question or approved action without a material change. Do not immediately repeat a cancelled dialog or treat cancellation as consent. Continue independent authorized work and report only the blocked part.",
+			"Do not enter Plan Mode just to ask a question. If Plan Mode is already active, combine a recommendation and alternatives in exit_plan_mode when possible instead of a selection followed by the same approval. Progress updates must not become approval requests.",
+		],
 		parameters: Type.Object({
-			question: Type.String({ description: "The question to ask" }),
+			question: Type.String({ description: "Necessary decision: what is blocked, why evidence/defaults are insufficient, and your recommendation" }),
 			options: Type.Array(
 				Type.Object({
 					label: Type.String({ description: "Option label" }),
@@ -635,7 +646,7 @@ export default function planMode(pi: ExtensionAPI) {
 			));
 
 			if (!result) {
-				return { content: [{ type: "text", text: "用户取消了选择" }] };
+				return { content: [{ type: "text", text: "用户取消了选择。不要立即重复提问，也不要把取消当作授权；继续不依赖此决策的已授权工作，并说明被阻塞的部分。" }] };
 			}
 			if (result.wasCustom) {
 				return { content: [{ type: "text", text: `用户回复: ${result.answer}` }] };
@@ -663,9 +674,10 @@ export default function planMode(pi: ExtensionAPI) {
 		name: "exit_plan_mode",
 		label: "Exit Plan Mode",
 		description:
-			"Present your plan to the user for approval and exit plan mode. " +
-			"Call this when your implementation plan is ready. The user can approve, reject, or provide feedback.",
-		promptSnippet: "Present plan for user approval → unblock write tools",
+			"Request approval of a ready implementation plan only when Plan Mode is already active. " +
+			"Include your recommended approach and important tradeoffs instead of a redundant ask_user call. " +
+			"Do not enter Plan Mode merely to use this tool; ordinary research needs no approval round.",
+		promptSnippet: "Approve an already-active plan gate; not a routine research checkpoint",
 		parameters: Type.Object({
 			plan: Type.String({ description: "Complete implementation plan in markdown format" }),
 		}),
@@ -860,7 +872,7 @@ export default function planMode(pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: "User APPROVED the plan. Write tools are now unblocked. Proceed with implementation.",
+							text: "User APPROVED the plan. Write tools are now unblocked. Proceed with implementation, tests, fixes, and validation within this approved scope without re-asking at each phase. New consequential actions outside this scope still require permission.",
 						},
 					],
 				};
@@ -892,7 +904,7 @@ export default function planMode(pi: ExtensionAPI) {
 
 			// Cancelled — stay in plan mode
 			return {
-				content: [{ type: "text", text: "User cancelled. You are still in plan mode. Continue planning or ask_user for clarification." }],
+				content: [{ type: "text", text: "User cancelled. You are still in plan mode; no approval was granted. Do not immediately reopen this dialog or ask the same question. Continue only independent read-only work; report the blocked action if no such work remains." }],
 			};
 		},
 		renderCall(args, theme) {
