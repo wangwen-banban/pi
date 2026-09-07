@@ -1,0 +1,68 @@
+name: Validate research autonomy prompts
+on:
+  push:
+    branches: [fix/research-autonomy]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BASE: 42975c735f8f9a9f6f15875152f5b269659a09ae
+      PI_WEB_SESSION: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.19.0'
+      - name: Install pinned runtime
+        run: npm install --global @earendil-works/pi-coding-agent@0.84.1
+      - name: Check patch boundaries and syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$BASE" HEAD
+          git diff --check "$BASE" HEAD
+          node --experimental-strip-types --check extensions/plan-mode/index.ts
+          node --check extensions/plan-mode/test-autonomy.mjs
+          python - <<'PY'
+          import subprocess
+          from pathlib import Path
+          before = subprocess.check_output(['git', 'show', '42975c735f8f9a9f6f15875152f5b269659a09ae:extensions/plan-mode/index.ts'], text=True)
+          after = Path('extensions/plan-mode/index.ts').read_text()
+          start = '\t// --- Block write tools when in plan mode ---'
+          end = '\t// --- enter_plan_mode tool ---'
+          assert before[before.index(start):before.index(end)] == after[after.index(start):after.index(end)], 'tool guards changed'
+          start = '\t// --- /plan command to manually enter plan mode ---'
+          assert before[before.index(start):] == after[after.index(start):], 'manual commands or lifecycle changed'
+          allowed = {'AGENTS.md','extensions/plan-mode/index.ts','extensions/plan-mode/test-autonomy.mjs','docs/research-autonomy.md','.github/workflows/research-autonomy-validation.yml'}
+          changed = set(subprocess.check_output(['git','diff','--name-only','42975c735f8f9a9f6f15875152f5b269659a09ae','HEAD'],text=True).splitlines())
+          assert changed == allowed, f'unexpected changes: {changed ^ allowed}'
+          PY
+      - name: Run existing Plan Mode and cache baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/autonomy-logs"
+          git worktree add --detach "$RUNNER_TEMP/autonomy-base" "$BASE"
+          cd "$RUNNER_TEMP/autonomy-base"
+          node --experimental-strip-types --test --test-concurrency=1 extensions/plan-mode/test-*.mjs scripts/test-cache-prefix*.mjs > "$RUNNER_TEMP/autonomy-logs/baseline.tap" 2>&1 || { cat "$RUNNER_TEMP/autonomy-logs/baseline.tap"; exit 1; }
+          tail -n 12 "$RUNNER_TEMP/autonomy-logs/baseline.tap"
+      - name: Run changed Plan Mode and new autonomy regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --experimental-strip-types --test --test-concurrency=1 extensions/plan-mode/test-*.mjs scripts/test-cache-prefix*.mjs > "$RUNNER_TEMP/autonomy-logs/patched.tap" 2>&1 || { cat "$RUNNER_TEMP/autonomy-logs/patched.tap"; exit 1; }
+          tail -n 12 "$RUNNER_TEMP/autonomy-logs/patched.tap"
+      - name: Preserve validation reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: research-autonomy-validation
+          path: ${{ runner.temp }}/autonomy-logs/*.tap
+          retention-days: 7
