@@ -1,0 +1,41 @@
+name: Validate incremental subagent efficiency
+on:
+  push:
+    branches: [fix/subagent-context-efficiency]
+permissions:
+  contents: read
+jobs:
+  validate:
+    if: github.repository == 'wangwen-banban/pi'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BASE: 145f5605209253cbcfdfd55b26bc17d6b1cb2982
+      PI_WEB_SESSION: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.19.0'
+      - name: Install pinned runtime
+        run: npm install --global @earendil-works/pi-coding-agent@0.84.1
+      - name: Export immutable baseline and validate current sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$BASE" HEAD
+          git diff --check "$BASE" HEAD
+          mkdir -p "$RUNNER_TEMP/efficiency"
+          git archive --format=tar.gz "$BASE" > "$RUNNER_TEMP/efficiency/baseline-source.tar.gz"
+          node --experimental-strip-types --test --test-concurrency=1 --test-name-pattern='^(?!offline smoke: installed pi --list-models)' extensions/smart-subagents/test-*.mjs extensions/plan-mode/test-*.mjs scripts/test-cache-prefix*.mjs > "$RUNNER_TEMP/efficiency/current.tap" 2>&1 || { cat "$RUNNER_TEMP/efficiency/current.tap"; exit 1; }
+          tail -n 12 "$RUNNER_TEMP/efficiency/current.tap"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: subagent-efficiency-validation
+          path: ${{ runner.temp }}/efficiency/
+          retention-days: 7
