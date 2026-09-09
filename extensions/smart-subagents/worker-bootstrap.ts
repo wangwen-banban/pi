@@ -47,6 +47,12 @@ export const WORKER_EXTENSIONS = {
 		order: 2,
 		providers: [],
 	},
+	"subagent-context": {
+		key: "subagent-context",
+		rel: "smart-subagents/worker-context.ts",
+		order: 3,
+		providers: [],
+	},
 } as const satisfies Record<string, WorkerExtensionDescriptor>;
 
 export type WorkerExtensionKey = keyof typeof WORKER_EXTENSIONS;
@@ -193,6 +199,10 @@ export interface WorkerArgsInput {
 	effort: string;
 	tools: string;
 	contextPath: string;
+	/** Native private fork seed. Omitted for isolated/legacy invocations. */
+	sessionPath?: string;
+	/** Full forks can preserve the original system text without changing tool permissions. */
+	replaceSystemPrompt?: boolean;
 	prompt: string;
 	extensions: readonly ResolvedWorkerExtension[];
 }
@@ -201,7 +211,7 @@ export function buildWorkerArgs(input: WorkerArgsInput): string[] {
 	const args: string[] = [
 		"--mode", "json",
 		"-p",
-		"--no-session",
+		...(input.sessionPath ? ["--session", input.sessionPath] : ["--no-session"]),
 		"--no-extensions",
 	];
 	for (const extension of input.extensions) {
@@ -211,7 +221,7 @@ export function buildWorkerArgs(input: WorkerArgsInput): string[] {
 		"--model", input.modelRef,
 		"--thinking", input.effort,
 		"--tools", input.tools,
-		"--append-system-prompt", input.contextPath,
+		input.replaceSystemPrompt ? "--system-prompt" : "--append-system-prompt", input.contextPath,
 		input.prompt,
 	);
 	return args;
