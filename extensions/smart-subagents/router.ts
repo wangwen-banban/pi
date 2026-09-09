@@ -34,12 +34,19 @@ export interface SmartSubagentConfig {
 		model: string;
 		effort: ThinkingLevel;
 		maxConversationChars: number;
-		maxSummaryChars: number;
+		maxSummaryChars: number; // deprecated; the router no longer summarizes
+		maxTaskChars: number;
+		maxOutputTokens: number;
+		timeoutMs: number;
 	};
 	context: {
 		maxFullChars: number;
 		maxSelectedChars: number;
-		selectedMessages: number;
+		selectedMessages: number; // legacy contextMode alias only
+		forkRecentTurns: number;
+		maxForkTokens: number;
+		maxForkBytes: number;
+		shareCompatibleCache: boolean;
 	};
 	execution: {
 		hardTimeoutMs: number;
@@ -64,15 +71,22 @@ export const DEFAULT_CONFIG: SmartSubagentConfig = {
 	maxRecentJobs: 8,
 	router: {
 		enabled: true,
-		model: "openai-codex/gpt-5.4-mini",
+		model: "openai-codex/gpt-5.3-codex-spark",
 		effort: "low",
 		maxConversationChars: 24000,
 		maxSummaryChars: 6000,
+		maxTaskChars: 6000,
+		maxOutputTokens: 512,
+		timeoutMs: 15000,
 	},
 	context: {
 		maxFullChars: 40000,
 		maxSelectedChars: 12000,
 		selectedMessages: 6,
+		forkRecentTurns: 3,
+		maxForkTokens: 128000,
+		maxForkBytes: 8 * 1024 * 1024,
+		shareCompatibleCache: true,
 	},
 	// A 30-minute wall-clock cap contains orphaned/stuck workers while leaving
 	// substantial headroom for max-thinking tasks. Shutdown escalates after 5s.
@@ -82,7 +96,7 @@ export const DEFAULT_CONFIG: SmartSubagentConfig = {
 		// Trusted worker bootstrap, loaded in this fixed order after
 		// --no-extensions: codex-multi-account, provider-routing, then
 		// codex-web-search (gives workers the web_search tool).
-		workerExtensions: ["codex-multi-account", "provider-routing", "codex-web-search"],
+		workerExtensions: ["codex-multi-account", "provider-routing", "codex-web-search", "subagent-context"],
 	},
 	modelProfiles: {
 		defaultTier: "B",
@@ -185,6 +199,13 @@ export function mergeConfig(raw: unknown): SmartSubagentConfig {
 	if (typeof router.maxSummaryChars === "number") {
 		merged.router.maxSummaryChars = Math.max(500, Math.min(20000, router.maxSummaryChars));
 	}
+	for (const [key, lo, hi] of [["maxTaskChars", 1000, 16000], ["maxOutputTokens", 128, 2048], ["timeoutMs", 1000, 60000]] as const) {
+		if (typeof router[key] === "number" && Number.isFinite(router[key])) merged.router[key] = Math.max(lo, Math.min(hi, Math.floor(router[key])));
+	}
+	for (const [key, lo, hi] of [["forkRecentTurns", 1, 50], ["maxForkTokens", 1000, 1000000], ["maxForkBytes", 65536, 33554432]] as const) {
+		if (typeof context[key] === "number" && Number.isFinite(context[key])) merged.context[key] = Math.max(lo, Math.min(hi, Math.floor(context[key])));
+	}
+	if (typeof context.shareCompatibleCache === "boolean") merged.context.shareCompatibleCache = context.shareCompatibleCache;
 	if (typeof context.maxFullChars === "number") {
 		merged.context.maxFullChars = Math.max(4000, Math.min(120000, context.maxFullChars));
 	}
@@ -203,7 +224,7 @@ export function mergeConfig(raw: unknown): SmartSubagentConfig {
 	// Symbolic keys only; unknown/traversal-like entries are dropped and the
 	// fixed order is enforced here so config can never reorder the bootstrap.
 	if (Array.isArray(execution.workerExtensions)) {
-		merged.execution.workerExtensions = sanitizeWorkerExtensionKeys(execution.workerExtensions);
+		merged.execution.workerExtensions = sanitizeWorkerExtensionKeys([...execution.workerExtensions, "subagent-context"]);
 	}
 
 	const profiles = isRecord(raw.modelProfiles) ? raw.modelProfiles : {};

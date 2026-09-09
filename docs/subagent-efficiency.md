@@ -1,5 +1,10 @@
 # Incremental subagent efficiency
 
+> Current native-fork behavior is documented in [native-subagent-forks.md](native-subagent-forks.md).
+> The older text-summary modes and routing description below are retained as
+> historical background; native `fork_turns` and the lightweight Spark selector now supersede them.
+
+
 Workers keep Pi's independent process, in-memory session, provider and cache
 behavior. No parent session ID, connection, KV state or full native conversation
 fork is shared. Model choices, thinking levels, concurrency and limits are unchanged.

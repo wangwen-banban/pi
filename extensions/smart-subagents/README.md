@@ -1,16 +1,19 @@
 # Smart Sub Agents
 
+> Native history forks, Spark routing and cache compatibility are described in
+> [native-subagent-forks.md](../../docs/native-subagent-forks.md).
+
 Global pi extension for asynchronous, automatically routed sub-agents.
 
 ## What it does
 
 - Classifies each delegated task as `simple`, `medium`, `complex`, or `critical`.
 - Selects an authenticated model and supported thinking level from `~/.pi/agent/subagents.json`.
-- Chooses `isolated`, `selected`, `summary`, or `full` parent-context inheritance.
-- Runs each worker in an isolated `pi --mode json --no-session --no-extensions` process with a trusted provider bootstrap (see below).
+- Chooses `fork_turns`: `all`, `none`, recent N user turns, or `auto`; old context modes are compatibility aliases.
+- Runs each worker in an independent Pi process with a private native session seed for inherited context, or `--no-session` for no inheritance, and a trusted bootstrap.
 - Works identically from native Pi and PI WEB sessions: embedded PI WEB runtimes resolve the standalone `pi` CLI instead of accidentally re-executing the hosting `sessiond.js`.
 - Shares the parent's working directory while keeping conversation context isolated.
-- Delivers completion immediately through lifecycle events and a visible `steer` message instead of polling. It enters at the next safe agent-loop boundary without aborting an in-flight response or tool call.
+- Delivers completion through lifecycle events and a visible follow-up message instead of polling, without aborting an in-flight response or tool call.
 - Shows the effective model, thinking level, context mode, permission, status, and a live duration in the TUI; active rows refresh once per second and completed rows disappear after 60 seconds.
 - Shares one stable editor-above activity stack with Background Tasks. Tasks is always above
   Sub Agents (with independent 10-line truncation), so timer refreshes cannot swap the two
@@ -22,10 +25,13 @@ Global pi extension for asynchronous, automatically routed sub-agents.
 
 ## Routing: main agent decides, the system backs it up
 
-The router is advisory, not prescriptive. The main agent is told to inspect the
-available model catalogue and route explicitly; `auto` fields are filled by the
-background advisor (a lightweight classifier) and, failing that, deterministic
-rules — dispatching never blocks.
+The lightweight `openai-codex/gpt-5.3-codex-spark` selector sees bounded task data,
+model descriptors and parent context metadata, not raw parent history. It selects
+model, supported thinking effort and fork scope. Fully explicit execution choices
+skip the selector. Unavailable Spark, invalid output or timeout uses deterministic
+rules with a recorded reason, never a silent main-model classification call.
+Permissions remain independent of the selector. Invalid explicit context or model
+requests can fail dispatch rather than silently discarding required evidence.
 
 ### `list_subagent_models`
 
@@ -69,15 +75,17 @@ the model registry — never copied into the config.
 
 ### Context inheritance
 
-| Mode | Meaning |
+| `fork_turns` | Meaning |
 |---|---|
-| `isolated` | No parent conversation inherited (task/notes/files still pass) |
-| `selected` | The most recent `context.selectedMessages` parent messages (default 6) |
-| `summary` | Distilled parent context from the advisor; falls back to `selected` when distillation is unavailable |
-| `full` | The parent's full effective conversation, capped by `context.maxFullChars` |
+| `none` | No parent history; explicit task, notes and file paths still pass |
+| positive integer string | Recent user-message turns, preserving a current compaction summary |
+| `all` | Frozen native effective history with complete historical tool call/result pairs |
+| `auto` | Router suggestion checked against model, modality and context budgets |
 
-`contextFiles` no longer forces `isolated` up to `selected`; explicit files are
-passed in every mode.
+Old `contextMode` aliases remain accepted: isolated=none, selected=recent turns,
+summary/full=all. No summarizer runs. Explicit oversized all/N requests fail;
+auto can narrow at turn boundaries. Imported history is reference, not authority.
+See the native-fork guide for budget migration and cache-hit limitations.
 
 ## Agent tool
 
@@ -86,7 +94,7 @@ The parent model receives `delegate_subagent` automatically. Its routing fields 
 - `model`
 - `effort`
 - `complexity`
-- `contextMode`
+- `fork_turns` (`contextMode` is deprecated)
 - `permission`
 
 Useful context fields:
@@ -96,10 +104,10 @@ Useful context fields:
 - `writeScope`: files/directories the worker may modify
 - `expectedOutput`: acceptance criteria
 
-The tool returns after routing and process creation. The parent should not wait or poll. A terminal completion message is injected automatically when the child exits. If the parent is busy, it enters the steering queue and is consumed after the current model response/tool batch, before the next model call.
+The tool returns after routing and dispatch. The parent should not poll. A terminal completion message is queued automatically when the child exits; while the parent is active, delivery is deferred until its `agent_end` boundary and uses the follow-up queue.
 
 Guidance to the main agent: consult `list_subagent_models` before quality- or
-cost-sensitive dispatches, pass `model`/`effort`/`contextMode`/`permission`
+cost-sensitive dispatches, pass `model`/`effort`/`fork_turns`/`permission`
 explicitly when the catalogue makes a clear fit, and pick the least costly
 model that safely meets the task — the highest tier is not the default choice.
 Fields left `auto` are still filled fail-open by the advisor and rules.
@@ -133,7 +141,7 @@ cleared during session shutdown or extension reload.
 
 Session shutdown finalizes every routing, queued, and running job as durable
 `stopped` state before teardown. It writes `result.json` even when routing had
-not yet produced `context.md`, and intentionally uses a persistence-only path:
+not yet produced a private fork seed, and intentionally uses a persistence-only path:
 no stale UI, completion message, or lifecycle hook is required to save it.
 Running children receive `SIGTERM` and then `SIGKILL` after the configured grace
 if needed.
@@ -176,15 +184,19 @@ audited bootstrap:
 ```json
 {
   "execution": {
-    "workerExtensions": ["codex-multi-account", "provider-routing", "codex-web-search"]
+    "workerExtensions": ["codex-multi-account", "provider-routing", "codex-web-search", "subagent-context"]
   }
 }
 ```
 
 - Values are **symbolic keys only** — never paths. The table maps them to
   `extensions/codex-multi-account/index.ts` (order 0),
-  `extensions/provider-routing/index.ts` (order 1), and
-  `extensions/codex-web-search/index.ts` (order 2) under the agent directory.
+  `extensions/provider-routing/index.ts` (order 1),
+  `extensions/codex-web-search/index.ts` (order 2), and
+  `extensions/smart-subagents/worker-context.ts` (order 3) under the agent directory.
+- `subagent-context` is mandatory for native-fork workers. It adds no tools,
+  enforces the delegated tool boundary and conditionally sets only the cache key.
+  It never shares the main connection/session or treats history as new permission.
 - The provider pair is required in this order for the secondary account:
   `provider-routing` alone leaves `openai-codex-second` without oauth/models.
 - `codex-web-search` gives every worker the `web_search` tool (Codex search
@@ -206,9 +218,9 @@ audited bootstrap:
 - Global `models.json` overrides give GPT-5.6 Sol/Terra/Luna and GPT-6 Astra a
   1M context window for both OAuth accounts. Workers inherit those overrides
   even under `--no-extensions`; the trusted bootstrap only restores provider
-  and transport registration. Routing uses Luna for simple work, Terra for
-  normal work, and Sol for complex/critical work unless the caller explicitly
-  selects another catalog model.
+  and transport registration. The lightweight selector chooses among the eligible catalogue; deterministic
+  model routes remain configured fallbacks, not a guarantee that every provider
+  or requested model is available on a given account.
 
 ## Commands
 
@@ -258,15 +270,18 @@ Hooks are observational: failures and timeouts do not block completion delivery.
 
 ## Run records
 
-Context packets and full results are stored with user-only permissions under:
+Run results are stored with user-only permissions under:
 
 ```text
 ~/.pi/agent/subagent-runs/<parent-session-id>/<subagent-id>/
 ```
 
-A started run contains `context.md` and `result.json`. If the parent shuts down
-while a job is still routing, `result.json` is still written with
-`status: "stopped"`; `context.md` may legitimately not exist yet.
+`result.json` records separate router/worker usage and effective fork selection.
+During execution, exclusive `0600` files hold the native seed, system prompt and
+metadata. They are removed on child close/startup failure; abrupt parent/OS death
+can leave private ignored artifacts. The parent's live JSONL is never opened for
+writing. Cache diagnostics count grouping decisions, not measured cache hits.
+Routing/queued shutdown still writes stopped state even if no seed was created.
 
 ## Inspecting a running agent
 

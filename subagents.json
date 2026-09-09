@@ -3,15 +3,22 @@
   "maxRecentJobs": 8,
   "router": {
     "enabled": true,
-    "model": "openai-codex/gpt-5.6-luna",
+    "model": "openai-codex/gpt-5.3-codex-spark",
     "effort": "low",
     "maxConversationChars": 24000,
-    "maxSummaryChars": 6000
+    "maxSummaryChars": 6000,
+    "maxTaskChars": 6000,
+    "maxOutputTokens": 512,
+    "timeoutMs": 15000
   },
   "context": {
     "maxFullChars": 40000,
     "maxSelectedChars": 12000,
-    "selectedMessages": 6
+    "selectedMessages": 6,
+    "forkRecentTurns": 3,
+    "maxForkTokens": 128000,
+    "maxForkBytes": 8388608,
+    "shareCompatibleCache": true
   },
   "execution": {
     "hardTimeoutMs": 21600000,
@@ -19,7 +26,8 @@
     "workerExtensions": [
       "codex-multi-account",
       "provider-routing",
-      "codex-web-search"
+      "codex-web-search",
+      "subagent-context"
     ]
   },
   "modelProfiles": {

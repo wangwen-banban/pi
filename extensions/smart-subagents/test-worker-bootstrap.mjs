@@ -30,8 +30,8 @@ import {
 // ---------------------------------------------------------------------------
 
 test("default config carries the trusted worker extensions in fixed order", () => {
-	assert.deepEqual(DEFAULT_CONFIG.execution.workerExtensions, ["codex-multi-account", "provider-routing", "codex-web-search"]);
-	assert.deepEqual(WORKER_EXTENSION_KEYS, ["codex-multi-account", "provider-routing", "codex-web-search"]);
+	assert.deepEqual(DEFAULT_CONFIG.execution.workerExtensions, ["codex-multi-account", "provider-routing", "codex-web-search", "subagent-context"]);
+	assert.deepEqual(WORKER_EXTENSION_KEYS, ["codex-multi-account", "provider-routing", "codex-web-search", "subagent-context"]);
 	assert.equal(WORKER_EXTENSIONS["codex-multi-account"].order, 0);
 	assert.equal(WORKER_EXTENSIONS["provider-routing"].order, 1);
 	assert.deepEqual(WORKER_EXTENSIONS["provider-routing"].providers, [
@@ -59,11 +59,11 @@ test("mergeConfig dedupes, sorts into fixed order, and drops unknown/traversal-l
 			],
 		},
 	});
-	assert.deepEqual(merged.execution.workerExtensions, ["codex-multi-account", "provider-routing", "codex-web-search"]);
+	assert.deepEqual(merged.execution.workerExtensions, ["codex-multi-account", "provider-routing", "codex-web-search", "subagent-context"]);
 	// Missing config keeps the default.
-	assert.deepEqual(mergeConfig({}).execution.workerExtensions, ["codex-multi-account", "provider-routing", "codex-web-search"]);
-	// An explicit empty list disables the bootstrap (preflight still gates routed providers).
-	assert.deepEqual(mergeConfig({ execution: { workerExtensions: [] } }).execution.workerExtensions, []);
+	assert.deepEqual(mergeConfig({}).execution.workerExtensions, ["codex-multi-account", "provider-routing", "codex-web-search", "subagent-context"]);
+	// Empty config disables provider bootstraps, but keeps the mandatory native-fork boundary.
+	assert.deepEqual(mergeConfig({ execution: { workerExtensions: [] } }).execution.workerExtensions, ["subagent-context"]);
 });
 
 test("sanitizeWorkerExtensionKeys never lets a path-shaped string through", () => {

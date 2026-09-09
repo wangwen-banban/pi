@@ -151,9 +151,10 @@ test("smart-subagents index wires informed model routing and removes context-fil
 	const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
 	assert.match(source, /list_subagent_models/);
 	assert.match(source, /getEligibleModels/);
-	assert.match(source, /selectedMessages/);
-	assert.match(source, /background advisor skipped/);
-	assert.match(source, /recentMessages\(messages/);
+	assert.match(source, /forkRecentTurns/);
+	assert.match(source, /routeTask/);
+	assert.match(source, /captureFork/);
+	assert.doesNotMatch(source, /context_summary.*focused facts/);
 	assert.match(source, /createActivityRefreshLoop/);
 	assert.match(source, /resolveAgentBrowserInput/);
 	assert.match(source, /new AgentBrowser\(getVisibleJobs, theme, keybindings/);

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
@@ -17,9 +17,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Markdown, Spacer, Text, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { captureFork, estimateForkTokens, hasImages, requestedFork, selectFork, serializeFork, privateFile, requestEvidence, type ForkSnapshot, type RequestEvidence } from "./native-fork.ts";
+import { routeTask, type RoutingOutcome } from "./fork-advisor.ts";
 import { resolveAgentBrowserInput, type AgentBrowserKeybindings } from "./agent-browser-input.ts";
 import { getPiInvocation } from "./pi-invocation.ts";
-import { boundedConversation, canSkipRoutingAdvisor, collectParentMessages, textFromContent } from "./context.ts";
+import { textFromContent } from "./context.ts";
 import {
 	buildWorkerArgs,
 	fetchFailureHint,
@@ -63,23 +65,15 @@ import {
 	THINKING_LEVELS,
 	buildModelListText,
 	clampThinkingLevel,
-	fallbackComplexity,
-	fallbackPermission,
 	mergeConfig,
 	paginateModels,
-	parseClassifierDecision,
-	recentMessages,
 	resolveModelProfile,
 	scopesOverlap,
 	selectModelCandidates,
 	type ClassifierDecision,
-	type Complexity,
-	type ContextMode,
 	type EligibleModelDescriptor,
 	type ModelListOptions,
 	type ModelProfilesConfig,
-	type ParentMessage,
-	type PermissionMode,
 	type SmartSubagentConfig,
 	type ThinkingLevel,
 } from "./router.ts";
@@ -113,6 +107,9 @@ interface RouteDecision extends ClassifierDecision {
 	modelName: string;
 	providerName: string;
 	effort: ThinkingLevel;
+	baseUrl?: string;
+	contextWindow: number;
+	input: string[];
 }
 
 interface JobSnapshot {
@@ -140,6 +137,9 @@ interface JobSnapshot {
 	usage: UsageStats;
 	logPath?: string;
 	progress: string[];
+	routerUsage?: Usage;
+	router?: RoutingOutcome["advisor"];
+	fork?: { requested: string; effective: string; estimatedTokens: number; reason: string; cache?: unknown };
 }
 
 interface Job extends JobSnapshot {
@@ -159,7 +159,12 @@ interface Job extends JobSnapshot {
 	lastProgressAt?: number;
 	timeoutAt?: number;
 	fallbackRoutes: RouteDecision[];
-	parentMessages: ParentMessage[];
+	parentSnapshot?: ForkSnapshot;
+	advice?: RoutingOutcome;
+	runtimePaths?: string[];
+	forkMetadataPath?: string;
+	sessionPath?: string;
+	replaceSystemPrompt?: boolean;
 	contextNotes: string;
 	/** True once the worker emits any tool activity; disables automatic fallback. */
 	toolActivitySeen: boolean;
@@ -205,7 +210,8 @@ interface ModelListDetails {
 interface RouterResult {
 	decision: ClassifierDecision;
 	usage?: Usage;
-	messages: ParentMessage[];
+	advice: RoutingOutcome;
+	source: ForkSnapshot;
 }
 
 function loadConfig(): SmartSubagentConfig {
@@ -254,179 +260,101 @@ function describeEligibleModel(
 	};
 }
 
-function resolveRouterModel(
-	models: Model<any>[],
-	configuredRef: string,
-	currentModel: Model<any> | undefined,
-): Model<any> | undefined {
-	return (
-		resolveAvailableModel(models, configuredRef) ??
-		models.find((model) => model.id === configuredRef) ??
-		currentModel ??
-		models[0]
-	);
-}
-
-function fallbackDecision(
-	task: string,
-	expectedOutput: string,
-	contextNotes: string,
-	config: SmartSubagentConfig,
-): ClassifierDecision {
-	const complexity = fallbackComplexity(task, expectedOutput, contextNotes);
-	return {
-		complexity,
-		contextMode: config.routes[complexity].context,
-		permission: fallbackPermission(task),
-		reason: `Rule-based fallback classified this as a ${complexity} task.`,
-		contextSummary: "",
-	};
-}
-
-async function classifyAndSummarize(
+async function prepareDelegation(
 	ctx: ExtensionContext,
-	params: {
-		task: string;
-		expectedOutput?: string;
-		contextNotes?: string;
-		contextFiles?: string[];
-		complexity?: string;
-		contextMode?: string;
-		permission?: string;
-		model?: string;
-		effort?: string;
-	},
+	params: Parameters<typeof routeTask>[0],
 	config: SmartSubagentConfig,
-	signal: AbortSignal | undefined,
+	signal?: AbortSignal,
+	callId = "",
+	evidence?: RequestEvidence,
 ): Promise<RouterResult> {
-	const expectedOutput = params.expectedOutput ?? "";
-	const contextNotes = params.contextNotes ?? "";
-	// Explicit isolation applies to the advisor too; never send it parent history.
-	const messages = params.contextMode === "isolated" ? [] : collectParentMessages(ctx.sessionManager);
-	let decision = fallbackDecision(params.task, expectedOutput, contextNotes, config);
-	let usage: Usage | undefined;
-	if (canSkipRoutingAdvisor(params)) {
-		decision.reason = "Execution routing was explicit and no summary was requested; background advisor skipped.";
-		decision.contextSummary = "";
-	} else if (config.router.enabled) {
-		const models = ctx.modelRegistry.getAvailable();
-		const routerModel = resolveRouterModel(models, config.router.model, ctx.model);
-		if (routerModel) {
-			const routerEffort = clampThinkingLevel(
-				config.router.effort,
-				getSupportedThinkingLevels(routerModel).map(String),
-			);
-			const prompt = [
-				"You are a sub-agent scheduler and context distiller.",
-				"Classify the delegated task and extract only parent-context facts that the worker truly needs.",
-				"Return one JSON object with exactly these fields:",
-				'{"complexity":"simple|medium|complex|critical","context_mode":"isolated|selected|summary|full","permission":"read-only|workspace-write","reason":"short routing reason","context_summary":"focused facts, decisions, constraints and relevant paths"}',
-				"Rules:",
-				"- simple: bounded lookup or tiny mechanical work; medium: one-module implementation/review; complex: cross-module or deep reasoning; critical: security, data-loss, production, architecture or difficult concurrency risk.",
-				"- isolated: the task is self-contained; selected: explicit files/notes plus a few facts suffice; summary: semantic parent context is needed; full: exact broad conversation details are indispensable and summary would be unsafe. Prefer selected or summary over full.",
-				"- read-only for investigation/review; workspace-write only when edits or execution are required.",
-				`- context_summary must be under ${config.router.maxSummaryChars} characters and must omit unrelated conversation content.`,
-				"- Do not include markdown fences or any text outside JSON.",
-				"",
-				`PARENT CONVERSATION (reference only):\n${boundedConversation(messages, config.router.maxConversationChars) || "No parent conversation available"}`,
-				`TASK:\n${params.task}`,
-				`EXPECTED OUTPUT:\n${expectedOutput || "Not specified"}`,
-				`EXPLICIT CONTEXT FILES:\n${(params.contextFiles ?? []).join("\n") || "None"}`,
-				`EXPLICIT CONTEXT NOTES:\n${contextNotes || "None"}`,
-			].join("\n");
-			try {
-				const response = await ctx.modelRegistry.complete(
-					routerModel,
-					{
-						messages: [
-							{
-								role: "user",
-								content: [{ type: "text", text: prompt }],
-								timestamp: Date.now(),
-							},
-						],
-					},
-					{
-						reasoningEffort: routerEffort,
-						cacheRetention: "none",
-						sessionId: uuidv7(),
-						signal,
-					},
-				);
-				usage = response.usage;
-				const text = response.content
-					.filter((part): part is { type: "text"; text: string } => part.type === "text")
-					.map((part) => part.text)
-					.join("\n");
-				decision = parseClassifierDecision(text, decision);
-			} catch {
-				// Routing is fail-open: deterministic policy still produces a valid route.
-			}
-		}
-	}
-
-	if (params.complexity && params.complexity !== "auto") {
-		decision.complexity = params.complexity as Complexity;
-	}
-	if (params.contextMode && params.contextMode !== "auto") {
-		decision.contextMode = params.contextMode as ContextMode;
-	}
-	if (params.permission && params.permission !== "auto") {
-		decision.permission = params.permission as PermissionMode;
-	}
-	decision.contextSummary = decision.contextSummary.slice(0, config.router.maxSummaryChars);
-	return { decision, usage, messages };
+	const requested = requestedFork(params, config.context.forkRecentTurns);
+	// Freeze once before routing/queueing; workers never follow the live parent file.
+	const source: ForkSnapshot = requested === "none" ? {
+		entries: [], systemPrompt: "", parentSessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd,
+		provider: ctx.model?.provider ?? "", model: ctx.model?.id ?? "", baseUrl: ctx.model?.baseUrl ?? "", effort: ctx.thinkingLevel ?? "unknown",
+	} : captureFork(ctx, callId, evidence);
+	const models = getEligibleModels(ctx);
+	const descriptors = models.map(model => ({
+		ref: `${model.provider}/${model.id}`, name: model.name,
+		tier: resolveModelProfile(config.modelProfiles, `${model.provider}/${model.id}`).tier,
+		thinkingLevels: getSupportedThinkingLevels(model).map(String), contextWindow: model.contextWindow,
+		input: [...model.input], costInput: model.cost.input, costOutput: model.cost.output,
+	}));
+	const routerModel = resolveAvailableModel(ctx.modelRegistry.getAvailable(), config.router.model);
+	const parent = {
+		sessionId: source.parentSessionId, model: `${source.provider}/${source.model}`, effort: source.effort,
+		turns: source.entries.filter(entry => entry.type === "message" && entry.message?.role === "user").length,
+		estimatedTokens: estimateForkTokens(source.entries),
+		hasImages: hasImages(source.entries),
+	};
+	const advice = await routeTask(params, config, descriptors, parent,
+		routerModel ? async (_ref, prompt, options) => ctx.modelRegistry.complete(routerModel, {
+			messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
+		}, { ...options, reasoningEffort: clampThinkingLevel(config.router.effort, getSupportedThinkingLevels(routerModel).map(String)) }) : undefined,
+		signal,
+	);
+	const contextMode = advice.suggestedFork === "none" ? "isolated" : advice.suggestedFork === "all" ? "full" : "selected";
+	return { source, advice, usage: advice.usage, decision: {
+		complexity: advice.complexity, permission: advice.permission, contextMode, reason: advice.reason, contextSummary: "",
+	} };
 }
 
-function buildContextPacket(
-	job: Job,
-	messages: ParentMessage[],
-	contextNotes: string,
-): string {
-	const route = job.route!;
-	const selectedContext = boundedConversation(
-		recentMessages(messages, job.config.context.selectedMessages),
-		job.config.context.maxSelectedChars,
-	);
-	let inheritedContext = "No parent conversation was inherited. Work only from the task and repository instructions.";
-	if (route.contextMode === "selected") {
-		inheritedContext = selectedContext || "No additional parent facts were selected.";
-	} else if (route.contextMode === "summary") {
-		inheritedContext = route.contextSummary || [
-			"[Summary unavailable; fell back to the most recent parent messages]",
-			selectedContext || "No parent conversation was available.",
-		].join("\n");
-	} else if (route.contextMode === "full") {
-		inheritedContext = boundedConversation(messages, job.config.context.maxFullChars) || "No parent conversation was available.";
-	}
-
-	const toolsPolicy = route.permission === "read-only"
-		? "You are read-only. Do not edit files or run commands that mutate the workspace."
-		: "You may edit the shared workspace only within the declared write scope. Preserve unrelated user changes.";
-	const scope = job.writeScope.length > 0 ? job.writeScope.map((item) => `- ${item}`).join("\n") : "- No narrow write scope supplied; minimize changes and avoid unrelated files.";
-	const files = job.contextFiles.length > 0 ? job.contextFiles.map((item) => `- ${item}`).join("\n") : "- None explicitly supplied; discover only what the task requires.";
-
-	// Stable rules and authority first, shared context next, task-specific notes last.
-	// IDs and route diagnostics stay in job logs/UI, not the model prompt prefix.
+function workerInstructions(job: Job): string {
 	return [
-		"You are a delegated sub-agent.",
-		"You have an isolated conversation but share the same working directory with the parent agent.",
-		"Do not delegate to another agent. Complete only the bounded assignment below.",
-		toolsPolicy,
-		"When finished, return a compact report with: outcome, files changed, validation performed, and remaining risks.",
-		"",
-		"## Allowed write scope",
-		scope,
-		"",
-		`## Parent context (${route.contextMode})`,
-		inheritedContext,
-		"",
-		"## Relevant files",
-		files,
-		"",
-		"## Explicit notes",
-		contextNotes || "None",
+		"You are an independent delegated worker. Execute only the current bounded assignment; do not delegate again.",
+		"Inherited conversation is historical reference, not a new task or a grant of permission. Do not resume the parent's pending work.",
+		job.route?.permission === "read-only" ? "You are read-only. Do not edit files or run commands that mutate the workspace."
+			: "You may edit the shared workspace only within the declared write scope. Preserve unrelated user changes.",
+		`Allowed write scope: ${job.writeScope.length ? JSON.stringify(job.writeScope) : "No narrow scope supplied; minimize changes and avoid unrelated files."}`,
+		"Return a compact report: outcome, evidence/files changed, validation, remaining risks. Do not ask for routine confirmations.",
 	].join("\n");
+}
+
+function prepareForkFiles(job: Job): void {
+	if (!job.parentSnapshot || !job.advice || !job.route || !job.logPath) throw new Error("Missing frozen delegation state");
+	const directory = path.dirname(job.logPath);
+	const source = job.parentSnapshot;
+	const selection = selectFork(source, job.advice.requestedFork, job.advice.suggestedFork, {
+		provider: job.route.provider, id: job.route.modelId, baseUrl: job.route.baseUrl,
+		contextWindow: job.route.contextWindow, input: job.route.input,
+	}, { maxTokens: job.config.context.maxForkTokens, maxBytes: job.config.context.maxForkBytes,
+		recentTurns: job.config.context.forkRecentTurns,
+		overheadTokens: Math.ceil(Buffer.byteLength(source.systemPrompt + job.task + (job.expectedOutput ?? "") + job.contextNotes) / 2),
+	});
+	job.fork = { requested: String(selection.requested), effective: String(selection.effective), estimatedTokens: selection.estimatedTokens, reason: selection.reason };
+	job.route.contextMode = selection.effective === "none" ? "isolated" : selection.effective === "all" ? "full" : "selected";
+	job.replaceSystemPrompt = selection.effective === "all" && source.cwd === job.cwd && Boolean(source.systemPrompt);
+	const nonce = randomUUID();
+	job.runtimePaths = [];
+	const create = (name: string, content: string) => { const file = privateFile(directory, name, content); job.runtimePaths!.push(file); return file; };
+	try {
+		job.contextPath = create(`system-${nonce}.txt`, job.replaceSystemPrompt ? source.systemPrompt : workerInstructions(job));
+		job.sessionPath = selection.effective === "none" ? undefined : create(`fork-${nonce}.jsonl`, serializeFork(selection.entries, job.cwd));
+		job.forkMetadataPath = create(`fork-${nonce}.meta.json`, JSON.stringify({
+			version: 1, parentSessionId: source.parentSessionId, evidence: source.evidence,
+			prefixIntact: selection.prefixIntact && job.replaceSystemPrompt,
+			shareCompatibleCache: job.config.context.shareCompatibleCache,
+			permission: job.route.permission, writeScope: job.writeScope,
+		}));
+		job.runtimePaths.push(`${job.forkMetadataPath}.report`);
+	} catch (error) { cleanupForkFiles(job); throw error; }
+}
+
+function cleanupForkFiles(job: Job): void {
+	if (job.forkMetadataPath && job.fork) {
+		try {
+			const fd = fs.openSync(`${job.forkMetadataPath}.report`, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+			try {
+				if (fs.fstatSync(fd).size <= 8192) {
+					const report = JSON.parse(fs.readFileSync(fd, "utf8"));
+					if (["parent", "siblings", "independent"].includes(report.lastMode)) job.fork.cache = report;
+				}
+			} finally { fs.closeSync(fd); }
+		} catch { /* Request diagnostics are optional. */ }
+	}
+	for (const file of job.runtimePaths ?? []) { try { fs.unlinkSync(file); } catch { /* Already gone or unavailable. */ } }
+	job.runtimePaths = [];
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {
@@ -460,6 +388,9 @@ function snapshot(job: Job): JobSnapshot {
 		changedFiles: [...job.changedFiles],
 		attemptedModels: [...job.attemptedModels],
 		usage: { ...job.usage },
+		routerUsage: job.routerUsage,
+		router: job.router,
+		fork: job.fork ? { ...job.fork } : undefined,
 		logPath: job.logPath,
 		progress: [...job.progress],
 	};
@@ -596,7 +527,7 @@ const EffortSchema = StringEnum(["auto", ...THINKING_LEVELS] as const, {
 	default: "auto",
 });
 const ContextModeSchema = StringEnum(["auto", "isolated", "selected", "summary", "full"] as const, {
-	description: "Parent-context inheritance strategy. Default auto.",
+	description: "Deprecated alias: isolated=none, selected=recent turns, summary/full=all. Prefer fork_turns; no summarizer is called.",
 	default: "auto",
 });
 const PermissionSchema = StringEnum(["auto", "read-only", "workspace-write"] as const, {
@@ -622,6 +553,7 @@ const DelegateParams = Type.Object({
 	effort: Type.Optional(EffortSchema),
 	complexity: Type.Optional(ComplexitySchema),
 	contextMode: Type.Optional(ContextModeSchema),
+	fork_turns: Type.Optional(Type.String({ description: "Native frozen history: all, none, a positive integer number of recent user turns, or auto. Explicit requests are never silently truncated.", default: "auto" })),
 	permission: Type.Optional(PermissionSchema),
 	cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the parent cwd." })),
 });
@@ -629,6 +561,12 @@ const DelegateParams = Type.Object({
 export default function smartSubagents(pi: ExtensionAPI) {
 	const activityWidgetOwner = createActivityWidgetOwner("subagents");
 	const jobs = new Map<string, Job>();
+	const requestEvidenceBySession = new Map<string, RequestEvidence>();
+	pi.on("before_provider_request", (event, ctx) => {
+		const evidence = requestEvidence(event.payload, ctx.model);
+		if (evidence) requestEvidenceBySession.set(ctx.sessionManager.getSessionId(), evidence);
+	});
+	pi.on("session_start", () => requestEvidenceBySession.clear());
 	const queue: string[] = [];
 	let latestCtx: ExtensionContext | undefined;
 	let shuttingDown = false;
@@ -1017,6 +955,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 	): Promise<boolean> => {
 		if (!applyFinalOutcome(job, outcome)) return false;
 		clearJobTimers(job);
+		job.parentSnapshot = undefined;
 		// appendEntry is attempted while session_shutdown still owns the old session;
 		// result.json is the independent durable fallback if that session is stale.
 		appendState(job);
@@ -1108,20 +1047,11 @@ export default function smartSubagents(pi: ExtensionAPI) {
 	};
 
 	const startJob = (job: Job) => {
-		if (!job.route || !job.contextPath || shuttingDown || FINAL_STATUSES.has(job.status)) return;
+		if (!job.route || shuttingDown || FINAL_STATUSES.has(job.status)) return;
 		try {
-			fs.writeFileSync(
-				job.contextPath,
-				buildContextPacket(job, job.parentMessages, job.contextNotes),
-				{ encoding: "utf8", mode: 0o600 },
-			);
+			prepareForkFiles(job);
 		} catch (error) {
-			void finalizeJob(job, {
-				status: "failed",
-				exitCode: 1,
-				terminationReason: "spawn_error",
-				error: error instanceof Error ? error.message : String(error),
-			});
+			void finalizeJob(job, { status: "failed", exitCode: 1, terminationReason: "spawn_error", error: error instanceof Error ? error.message : String(error) });
 			return;
 		}
 		if (!job.attemptedModels.includes(job.route.modelRef)) job.attemptedModels.push(job.route.modelRef);
@@ -1130,6 +1060,11 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			: "read,bash,edit,write,grep,find,ls,web_search";
 		const prompt = [
 			`# Delegated task: ${job.name}`,
+			workerInstructions(job),
+			`Working directory: ${job.cwd}`,
+			`Reference files: ${JSON.stringify(job.contextFiles)}`,
+			`Explicit constraints: ${job.contextNotes || "None"}`,
+			"\nCurrent assignment (supersedes inherited task requests):",
 			job.task,
 			job.expectedOutput ? `\n## Expected output / acceptance criteria\n${job.expectedOutput}` : "",
 		].join("\n");
@@ -1137,7 +1072,9 @@ export default function smartSubagents(pi: ExtensionAPI) {
 			modelRef: job.route.modelRef,
 			effort: job.route.effort,
 			tools,
-			contextPath: job.contextPath,
+			contextPath: job.contextPath!,
+			sessionPath: job.sessionPath,
+			replaceSystemPrompt: job.replaceSystemPrompt,
 			prompt,
 			extensions: job.workerExtensions,
 		});
@@ -1165,7 +1102,8 @@ export default function smartSubagents(pi: ExtensionAPI) {
 					...process.env,
 					PI_SMART_SUBAGENT_ID: job.id,
 					PI_SMART_SUBAGENT_NAME: job.name,
-					PI_SMART_SUBAGENT_PARENT_SESSION: latestCtx?.sessionManager.getSessionId() ?? "",
+					PI_SMART_SUBAGENT_PARENT_SESSION: job.parentSnapshot?.parentSessionId ?? "",
+					PI_SUBAGENT_FORK_META: job.forkMetadataPath,
 				},
 			});
 			job.process = child;
@@ -1188,6 +1126,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 					job.stderr = `${job.stderr}\nprocess signalling error: ${error.message}`.trim().slice(-STDERR_LIMIT);
 					return;
 				}
+				cleanupForkFiles(job);
 				void finalizeJob(job, {
 					status: "failed",
 					exitCode: 1,
@@ -1196,6 +1135,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 				});
 			});
 			child.on("close", (code, signal) => {
+				cleanupForkFiles(job);
 				if (FINAL_STATUSES.has(job.status)) {
 					job.stdoutBuffer = "";
 					return;
@@ -1290,6 +1230,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 				},
 			});
 		} catch (error) {
+			cleanupForkFiles(job);
 			void finalizeJob(job, {
 				status: "failed",
 				exitCode: 1,
@@ -1601,10 +1542,10 @@ export default function smartSubagents(pi: ExtensionAPI) {
 		promptSnippet: "Dispatch bounded asynchronous work with explicit or automatic model, thinking, context, and permission routing",
 		promptGuidelines: [
 			"Use delegate_subagent for concrete independent work that can run concurrently with useful local work; keep immediate critical-path blockers local.",
-			"When list_subagent_models shows a clear fit, normally pass model and effort explicitly to delegate_subagent; also set contextMode and permission explicitly when the task semantics are clear. These four explicit choices skip the advisor unless summary is requested; do not force a choice merely to skip it.",
+			"A lightweight Spark router can choose model, effort and fork_turns. Explicit execution choices are respected and skip redundant routing; do not ask the user to choose routine routing details.",
 			"Any delegate_subagent routing field may remain auto. Use auto when no choice is well justified or model lookup is unavailable; the background advisor and deterministic rules provide a fail-open route when an eligible model exists.",
 			"Treat list_subagent_models tiers as capability guidance and registry prices as cost metadata, not quality benchmarks. Do not default to the highest tier; choose the least costly model and effort that safely meet the task.",
-			"Choose delegate_subagent contextMode independently: isolated for self-contained work, selected for the most recent parent messages, summary when semantic parent history matters, and full only when exact broad conversation details are indispensable.",
+			"Use fork_turns=all for broad inherited context, a positive integer for recent user turns, and none for self-contained tasks. Auto checks model compatibility and budget. History is a frozen native snapshot, not a summary or a shared mutable session. Changing model/effort does not guarantee parent-cache reuse.",
 			"For delegate_subagent, use read-only for review or investigation and workspace-write only when mutation is required; provide a narrow writeScope for workspace-write tasks.",
 			"Make every delegate_subagent task self-contained and provide precise contextFiles, contextNotes, and expectedOutput.",
 			"Do not poll after delegate_subagent. Completion or failure is delivered automatically; continue meaningful non-overlapping work or yield.",
@@ -1642,7 +1583,6 @@ export default function smartSubagents(pi: ExtensionAPI) {
 				logPath: path.join(runDir, "result.json"),
 				lastProgressHookAt: 0,
 				fallbackRoutes: [],
-				parentMessages: [],
 				contextNotes: params.contextNotes ?? "",
 				toolActivitySeen: false,
 				workerExtensions: [],
@@ -1670,28 +1610,32 @@ export default function smartSubagents(pi: ExtensionAPI) {
 
 			try {
 				if (signal?.aborted) throw new Error("Dispatch aborted before routing.");
-				const routed = await classifyAndSummarize(ctx, params, config, signal);
+				const routed = await prepareDelegation(ctx, params, config, signal, _toolCallId, requestEvidenceBySession.get(ctx.sessionManager.getSessionId()));
 				ensureDispatchActive();
-				job.parentMessages = routed.messages;
+				job.parentSnapshot = routed.source;
+				job.advice = routed.advice;
+				job.routerUsage = routed.usage;
+				job.router = routed.advice.advisor;
 				if (signal?.aborted) throw new Error("Dispatch aborted before spawn.");
 				const models = getEligibleModels(ctx);
 				const availableRefs = models.map((model) => `${model.provider}/${model.id}`);
 				const currentRef = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 				const requestedModel = params.model ?? "auto";
-				const candidateRefs = selectModelCandidates(
+				let candidateRefs = selectModelCandidates(
 					availableRefs,
 					currentRef,
 					routed.decision.complexity,
 					config,
 					requestedModel,
 				);
+				if (requestedModel === "auto" && availableRefs.includes(routed.advice.model)) candidateRefs = [...new Set([routed.advice.model, ...candidateRefs])];
 				if (candidateRefs.length === 0 && requestedModel !== "auto") {
 					throw new Error(`Requested sub-agent model is not available: ${requestedModel}`);
 				}
 				if (candidateRefs.length === 0) throw new Error("No authenticated model is available for sub-agent routing.");
 				const requestedEffort = (params.effort && params.effort !== "auto"
 					? params.effort
-					: config.routes[routed.decision.complexity].effort) as ThinkingLevel;
+					: routed.advice.effort) as ThinkingLevel;
 				const routeCandidates = candidateRefs.map((modelRef) => {
 					const model = resolveAvailableModel(models, modelRef);
 					if (!model) throw new Error(`Could not resolve routed model: ${modelRef}`);
@@ -1703,6 +1647,9 @@ export default function smartSubagents(pi: ExtensionAPI) {
 						provider,
 						modelId: modelParts.join("/"),
 						modelName: model.name,
+						baseUrl: model.baseUrl,
+						contextWindow: model.contextWindow,
+						input: [...model.input],
 						providerName: ctx.modelRegistry.getProviderDisplayName(provider),
 						effort,
 					} satisfies RouteDecision;
@@ -1752,7 +1699,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
 								`Dispatched ${job.name} (${job.id}); status: ${job.status}.`,
 								`Effective model: ${effectiveRoute.provider}/${effectiveRoute.modelId}`,
 								`Thinking: ${effectiveRoute.effort}`,
-								`Context: ${effectiveRoute.contextMode}`,
+								`Context: native fork ${job.fork?.effective ?? routed.advice.suggestedFork} (${effectiveRoute.contextMode})`,
 								`Permission: ${effectiveRoute.permission}`,
 								`Reason: ${effectiveRoute.reason}`,
 								"Completion will be delivered automatically. Do not poll.",
