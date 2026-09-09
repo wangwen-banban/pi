@@ -23,16 +23,52 @@ jobs:
           node-version: '22.19.0'
       - name: Install pinned runtime
         run: npm install --global @earendil-works/pi-coding-agent@0.84.1
-      - name: Export immutable baseline and validate current sources
+      - name: Run immutable baseline
         shell: bash
         run: |
           set -euo pipefail
-          git merge-base --is-ancestor "$BASE" HEAD
-          git diff --check "$BASE" HEAD
           mkdir -p "$RUNNER_TEMP/efficiency"
-          git archive --format=tar.gz "$BASE" > "$RUNNER_TEMP/efficiency/baseline-source.tar.gz"
-          node --experimental-strip-types --test --test-concurrency=1 --test-name-pattern='^(?!offline smoke: installed pi --list-models)' extensions/smart-subagents/test-*.mjs extensions/plan-mode/test-*.mjs scripts/test-cache-prefix*.mjs > "$RUNNER_TEMP/efficiency/current.tap" 2>&1 || { cat "$RUNNER_TEMP/efficiency/current.tap"; exit 1; }
-          tail -n 12 "$RUNNER_TEMP/efficiency/current.tap"
+          git worktree add --detach "$RUNNER_TEMP/efficiency-base" "$BASE"
+          cd "$RUNNER_TEMP/efficiency-base"
+          node --experimental-strip-types --test --test-concurrency=1 --test-skip-pattern='^offline smoke: installed pi --list-models' extensions/smart-subagents/test-*.mjs extensions/plan-mode/test-*.mjs scripts/test-cache-prefix*.mjs > "$RUNNER_TEMP/efficiency/baseline.tap" 2>&1 || { cat "$RUNNER_TEMP/efficiency/baseline.tap"; exit 1; }
+          tail -n 12 "$RUNNER_TEMP/efficiency/baseline.tap"
+      - name: Apply and validate bounded candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object extensions/smart-subagents/index.ts)" = '4cf0940678d098af10751223df5beb3d3900b969'
+          git apply --check .github/subagent-efficiency.patch
+          git apply .github/subagent-efficiency.patch
+          git diff --check
+          node --experimental-strip-types --check extensions/smart-subagents/index.ts
+          node --experimental-strip-types --check extensions/smart-subagents/context.ts
+          python - <<'PY'
+          import os, subprocess
+          from pathlib import Path
+          base = os.environ['BASE']
+          old = subprocess.check_output(['git','show',base+':extensions/smart-subagents/index.ts'],text=True)
+          new = Path('extensions/smart-subagents/index.ts').read_text()
+          start, stop = '\tconst startJob =', '\tconst canStart ='
+          old_spawn = old[old.index(start):old.index(stop)].replace('job.parentMessages, job.parentConversation, job.contextNotes','job.parentMessages, job.contextNotes')
+          assert old_spawn == new[new.index(start):new.index(stop)], 'worker session, transport, permission or lifecycle changed'
+          for start, stop in [('\tconst canStart =','\t// --- PI WEB'), ('\tconst parseChildEvent =','\tconst startJob =')]:
+              assert old[old.index(start):old.index(stop)] == new[new.index(start):new.index(stop)], start
+          assert old[old.index('\tconst deliveryObjectId ='):] == new[new.index('\tconst deliveryObjectId ='):], 'shutdown replay changed'
+          PY
+      - name: Test actual Pi context and production preparation functions
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --experimental-strip-types --test --test-concurrency=1 --test-skip-pattern='^offline smoke: installed pi --list-models' extensions/smart-subagents/test-*.mjs extensions/plan-mode/test-*.mjs scripts/test-cache-prefix*.mjs > "$RUNNER_TEMP/efficiency/patched.tap" 2>&1 || { cat "$RUNNER_TEMP/efficiency/patched.tap"; exit 1; }
+          tail -n 12 "$RUNNER_TEMP/efficiency/patched.tap"
+      - name: Export exact tested candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(extensions/smart-subagents/index.ts extensions/smart-subagents/context.ts extensions/smart-subagents/test-context.mjs extensions/smart-subagents/test-context-integration.mjs docs/subagent-efficiency.md)
+          tar -czf "$RUNNER_TEMP/efficiency/candidate-source.tar.gz" "${files[@]}"
+          for file in "${files[@]}"; do printf '%s\t%s\n' "$(git hash-object "$file")" "$file"; done > "$RUNNER_TEMP/efficiency/blobs.tsv"
+          git diff --binary -- extensions/smart-subagents/index.ts > "$RUNNER_TEMP/efficiency/index.patch"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

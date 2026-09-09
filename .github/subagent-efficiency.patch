@@ -1,0 +1,221 @@
+diff --git a/extensions/smart-subagents/index.ts b/extensions/smart-subagents/index.ts
+index 4cf0940..d360a7d 100644
+--- a/extensions/smart-subagents/index.ts
++++ b/extensions/smart-subagents/index.ts
+@@ -19,6 +19,7 @@ import { Box, Container, Markdown, Spacer, Text, matchesKey, truncateToWidth, vi
+ import { Type } from "typebox";
+ import { resolveAgentBrowserInput, type AgentBrowserKeybindings } from "./agent-browser-input.ts";
+ import { getPiInvocation } from "./pi-invocation.ts";
++import { boundedConversation, canSkipRoutingAdvisor, collectParentMessages, textFromContent } from "./context.ts";
+ import {
+ 	buildWorkerArgs,
+ 	fetchFailureHint,
+@@ -159,7 +160,6 @@ interface Job extends JobSnapshot {
+ 	timeoutAt?: number;
+ 	fallbackRoutes: RouteDecision[];
+ 	parentMessages: ParentMessage[];
+-	parentConversation: string;
+ 	contextNotes: string;
+ 	/** True once the worker emits any tool activity; disables automatic fallback. */
+ 	toolActivitySeen: boolean;
+@@ -206,7 +206,6 @@ interface RouterResult {
+ 	decision: ClassifierDecision;
+ 	usage?: Usage;
+ 	messages: ParentMessage[];
+-	conversation: string;
+ }
+ 
+ function loadConfig(): SmartSubagentConfig {
+@@ -217,39 +216,6 @@ function loadConfig(): SmartSubagentConfig {
+ 	}
+ }
+ 
+-function textFromContent(content: unknown): string {
+-	if (typeof content === "string") return content;
+-	if (!Array.isArray(content)) return "";
+-	return content
+-		.filter((part): part is { type: string; text: string } => {
+-			return Boolean(part) && typeof part === "object" && (part as any).type === "text" && typeof (part as any).text === "string";
+-		})
+-		.map((part) => part.text)
+-		.join("\n");
+-}
+-
+-function collectParentMessages(ctx: ExtensionContext): ParentMessage[] {
+-	const messages: ParentMessage[] = [];
+-	for (const entry of ctx.sessionManager.getBranch() as any[]) {
+-		if (entry.type === "compaction" && typeof entry.summary === "string") {
+-			messages.push({ role: "assistant", text: `[Compaction summary]\n${entry.summary}` });
+-			continue;
+-		}
+-		if (entry.type !== "message" || !entry.message) continue;
+-		const role = entry.message.role;
+-		if (role !== "user" && role !== "assistant") continue;
+-		const text = textFromContent(entry.message.content).trim();
+-		if (text) messages.push({ role, text });
+-	}
+-	return messages;
+-}
+-
+-function serializeMessages(messages: ParentMessage[]): string {
+-	return messages
+-		.map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${message.text}`)
+-		.join("\n\n");
+-}
+-
+ function resolveAvailableModel(models: Model<any>[], reference: string): Model<any> | undefined {
+ 	return models.find((model) => `${model.provider}/${model.id}` === reference);
+ }
+@@ -327,21 +293,20 @@ async function classifyAndSummarize(
+ 		complexity?: string;
+ 		contextMode?: string;
+ 		permission?: string;
++		model?: string;
++		effort?: string;
+ 	},
+ 	config: SmartSubagentConfig,
+ 	signal: AbortSignal | undefined,
+ ): Promise<RouterResult> {
+ 	const expectedOutput = params.expectedOutput ?? "";
+ 	const contextNotes = params.contextNotes ?? "";
+-	const messages = collectParentMessages(ctx);
+-	const conversation = serializeMessages(messages);
++	// Explicit isolation applies to the advisor too; never send it parent history.
++	const messages = params.contextMode === "isolated" ? [] : collectParentMessages(ctx.sessionManager);
+ 	let decision = fallbackDecision(params.task, expectedOutput, contextNotes, config);
+ 	let usage: Usage | undefined;
+-	const allRoutingFieldsExplicit = [params.complexity, params.contextMode, params.permission]
+-		.every((value) => Boolean(value) && value !== "auto");
+-
+-	if (allRoutingFieldsExplicit && params.contextMode !== "summary") {
+-		decision.reason = "All routing fields were explicit; background advisor skipped.";
++	if (canSkipRoutingAdvisor(params)) {
++		decision.reason = "Execution routing was explicit and no summary was requested; background advisor skipped.";
+ 		decision.contextSummary = "";
+ 	} else if (config.router.enabled) {
+ 		const models = ctx.modelRegistry.getAvailable();
+@@ -363,11 +328,11 @@ async function classifyAndSummarize(
+ 				`- context_summary must be under ${config.router.maxSummaryChars} characters and must omit unrelated conversation content.`,
+ 				"- Do not include markdown fences or any text outside JSON.",
+ 				"",
++				`PARENT CONVERSATION (reference only):\n${boundedConversation(messages, config.router.maxConversationChars) || "No parent conversation available"}`,
+ 				`TASK:\n${params.task}`,
+ 				`EXPECTED OUTPUT:\n${expectedOutput || "Not specified"}`,
+ 				`EXPLICIT CONTEXT FILES:\n${(params.contextFiles ?? []).join("\n") || "None"}`,
+ 				`EXPLICIT CONTEXT NOTES:\n${contextNotes || "None"}`,
+-				`PARENT CONVERSATION:\n${conversation.slice(0, config.router.maxConversationChars) || "No parent conversation available"}`,
+ 			].join("\n");
+ 			try {
+ 				const response = await ctx.modelRegistry.complete(
+@@ -410,20 +375,19 @@ async function classifyAndSummarize(
+ 		decision.permission = params.permission as PermissionMode;
+ 	}
+ 	decision.contextSummary = decision.contextSummary.slice(0, config.router.maxSummaryChars);
+-	return { decision, usage, messages, conversation };
++	return { decision, usage, messages };
+ }
+ 
+ function buildContextPacket(
+ 	job: Job,
+ 	messages: ParentMessage[],
+-	conversation: string,
+ 	contextNotes: string,
+ ): string {
+ 	const route = job.route!;
+-	const selectedMessages = serializeMessages(recentMessages(messages, job.config.context.selectedMessages));
+-	const selectedContext = selectedMessages.length > job.config.context.maxSelectedChars
+-		? `[Earlier messages omitted]\n${selectedMessages.slice(-job.config.context.maxSelectedChars)}`
+-		: selectedMessages;
++	const selectedContext = boundedConversation(
++		recentMessages(messages, job.config.context.selectedMessages),
++		job.config.context.maxSelectedChars,
++	);
+ 	let inheritedContext = "No parent conversation was inherited. Work only from the task and repository instructions.";
+ 	if (route.contextMode === "selected") {
+ 		inheritedContext = selectedContext || "No additional parent facts were selected.";
+@@ -433,9 +397,7 @@ function buildContextPacket(
+ 			selectedContext || "No parent conversation was available.",
+ 		].join("\n");
+ 	} else if (route.contextMode === "full") {
+-		inheritedContext = conversation.length > job.config.context.maxFullChars
+-			? `[Earlier content omitted]\n${conversation.slice(-job.config.context.maxFullChars)}`
+-			: conversation || "No parent conversation was available.";
++		inheritedContext = boundedConversation(messages, job.config.context.maxFullChars) || "No parent conversation was available.";
+ 	}
+ 
+ 	const toolsPolicy = route.permission === "read-only"
+@@ -444,32 +406,26 @@ function buildContextPacket(
+ 	const scope = job.writeScope.length > 0 ? job.writeScope.map((item) => `- ${item}`).join("\n") : "- No narrow write scope supplied; minimize changes and avoid unrelated files.";
+ 	const files = job.contextFiles.length > 0 ? job.contextFiles.map((item) => `- ${item}`).join("\n") : "- None explicitly supplied; discover only what the task requires.";
+ 
++	// Stable rules and authority first, shared context next, task-specific notes last.
++	// IDs and route diagnostics stay in job logs/UI, not the model prompt prefix.
+ 	return [
+-		`You are Sub Agent ${job.name} (${job.id}).`,
++		"You are a delegated sub-agent.",
+ 		"You have an isolated conversation but share the same working directory with the parent agent.",
+ 		"Do not delegate to another agent. Complete only the bounded assignment below.",
+ 		toolsPolicy,
+ 		"When finished, return a compact report with: outcome, files changed, validation performed, and remaining risks.",
+ 		"",
+-		"## Effective route",
+-		`- Model: ${route.provider}/${route.modelId}`,
+-		`- Thinking: ${route.effort}`,
+-		`- Complexity: ${route.complexity}`,
+-		`- Context mode: ${route.contextMode}`,
+-		`- Permission: ${route.permission}`,
+-		`- Routing reason: ${route.reason}`,
++		"## Allowed write scope",
++		scope,
++		"",
++		`## Parent context (${route.contextMode})`,
++		inheritedContext,
+ 		"",
+ 		"## Relevant files",
+ 		files,
+ 		"",
+-		"## Allowed write scope",
+-		scope,
+-		"",
+ 		"## Explicit notes",
+ 		contextNotes || "None",
+-		"",
+-		`## Parent context (${route.contextMode})`,
+-		inheritedContext,
+ 	].join("\n");
+ }
+ 
+@@ -1156,7 +1112,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
+ 		try {
+ 			fs.writeFileSync(
+ 				job.contextPath,
+-				buildContextPacket(job, job.parentMessages, job.parentConversation, job.contextNotes),
++				buildContextPacket(job, job.parentMessages, job.contextNotes),
+ 				{ encoding: "utf8", mode: 0o600 },
+ 			);
+ 		} catch (error) {
+@@ -1645,7 +1601,7 @@ export default function smartSubagents(pi: ExtensionAPI) {
+ 		promptSnippet: "Dispatch bounded asynchronous work with explicit or automatic model, thinking, context, and permission routing",
+ 		promptGuidelines: [
+ 			"Use delegate_subagent for concrete independent work that can run concurrently with useful local work; keep immediate critical-path blockers local.",
+-			"When list_subagent_models shows a clear fit, normally pass model and effort explicitly to delegate_subagent; also set contextMode and permission explicitly when the task semantics are clear.",
++			"When list_subagent_models shows a clear fit, normally pass model and effort explicitly to delegate_subagent; also set contextMode and permission explicitly when the task semantics are clear. These four explicit choices skip the advisor unless summary is requested; do not force a choice merely to skip it.",
+ 			"Any delegate_subagent routing field may remain auto. Use auto when no choice is well justified or model lookup is unavailable; the background advisor and deterministic rules provide a fail-open route when an eligible model exists.",
+ 			"Treat list_subagent_models tiers as capability guidance and registry prices as cost metadata, not quality benchmarks. Do not default to the highest tier; choose the least costly model and effort that safely meet the task.",
+ 			"Choose delegate_subagent contextMode independently: isolated for self-contained work, selected for the most recent parent messages, summary when semantic parent history matters, and full only when exact broad conversation details are indispensable.",
+@@ -1687,7 +1643,6 @@ export default function smartSubagents(pi: ExtensionAPI) {
+ 				lastProgressHookAt: 0,
+ 				fallbackRoutes: [],
+ 				parentMessages: [],
+-				parentConversation: "",
+ 				contextNotes: params.contextNotes ?? "",
+ 				toolActivitySeen: false,
+ 				workerExtensions: [],
+@@ -1718,7 +1673,6 @@ export default function smartSubagents(pi: ExtensionAPI) {
+ 				const routed = await classifyAndSummarize(ctx, params, config, signal);
+ 				ensureDispatchActive();
+ 				job.parentMessages = routed.messages;
+-				job.parentConversation = routed.conversation;
+ 				if (signal?.aborted) throw new Error("Dispatch aborted before spawn.");
+ 				const models = getEligibleModels(ctx);
+ 				const availableRefs = models.map((model) => `${model.provider}/${model.id}`);
