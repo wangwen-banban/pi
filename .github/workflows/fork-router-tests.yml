@@ -1,0 +1,30 @@
+name: Native fork and router regression tests
+on:
+  push:
+    branches: [fix/native-fork-router]
+permissions:
+  contents: read
+concurrency:
+  group: native-fork-router-tests
+  cancel-in-progress: false
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PI_WEB_SESSION: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.19.0'
+      - name: Install pinned Pi for offline integration
+        run: npm install --global @earendil-works/pi-coding-agent@0.84.1
+      - name: Validate source and run targeted regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          node --experimental-strip-types --test --test-concurrency=1 --test-skip-pattern='offline smoke: installed pi --list-models' extensions/smart-subagents/test-*.mjs extensions/plan-mode/test-*.mjs scripts/test-cache-prefix*.mjs
